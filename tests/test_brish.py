@@ -20,6 +20,8 @@ def test1():
     test -n {f:bool} && echo 'false!'
     (exit 12)
     ''')
+    os.path.commonpath(z('realpath "${{(@f)$(exa)}}"'))
+    list(z('''rpargs {iter(z('exa'))}''').iter0())
     # assert False
     return res
 

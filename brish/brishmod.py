@@ -1,13 +1,21 @@
 __version__ = '0.1.5'
+try:
+    # Dev imports
+    from IPython import embed
+except ImportError:
+    def embed(*args, **kwargs):
+        print("IPython not available.")
+    pass
+
 
 import sys
+from collections.abc import Iterable
 import ast
 from string import Formatter
 import uuid
 import random
 from subprocess import Popen, PIPE, STDOUT
 from plumbum import local
-from IPython import embed
 import pathlib
 from dataclasses import dataclass
 
@@ -25,25 +33,38 @@ class CmdResult:
     retcode: int
     out: str
     err: str
+    cmd: str
+    cmd_stdin: str
 
-    def toTuple(self):
+    @property
+    def outrs(self):
+        """ out.rstrip('\\n') """
+        return self.out.rstrip('\n')
+
+    @property
+    def summary(self):
         return self.retcode, self.out, self.err
 
     def __iter__(self):
-        return iter(self.toTuple())
+        # return iter(self.toTuple())
+        return iter(self.outrs.split('\n'))
 
-    def __getitem__(self, index):
-        return self.toTuple()[index]
+    def iter0(self):
+        return iter(self.out.rstrip('\x00').split('\x00'))
+
+    # def __getitem__(self, index):
+    #     return self.toTuple()[index]
 
     def __str__(self):
-        return self.out
+        return self.outrs
+    
+    def __bool__(self):
+        return self.retcode == 0
 
 
 class Brish:
 
-    # self.MARKER = str(uuid.uuid4())
     MARKER = '\x00'
-    MLEN = len(MARKER)
 
     def __init__(self, defaultShell=None):
         self.defaultShell = defaultShell or str(pathlib.Path(__file__).parent / 'brish.zsh')
@@ -55,9 +76,20 @@ class Brish:
         self.p = Popen(shell, stdin=PIPE, stdout=PIPE, stderr=PIPE,
                 universal_newlines=True) # decode output as utf-8, newline is '\n'
 
-    def zsh_quote(self, str):
-        e, out, err = self.send_cmd('print -rn -- "${(q+@)brish_stdin}"', cmd_stdin=str)
-        return out
+    def zsh_quote(self, obj):
+        if obj is None:
+            return ''
+        typ = type(obj)
+        if typ is CmdResult:
+            return self.zsh_quote(obj.outrs)
+        elif not isinstance(obj, str) and isinstance(obj, Iterable):
+            result = []
+            for i in iter(obj):
+                # zsh doesn't support nested arrays, so we str the inner object.
+                result.append(self.zsh_quote(str(i)))
+            return ' '.join(result)
+        else:
+            return self.send_cmd('print -rn -- "${(q+@)brish_stdin}"', cmd_stdin=str(obj)).out
 
     def send_cmd(self, cmd, cmd_stdin="", fork=False):
         delim = self.MARKER + '\n'
@@ -67,18 +99,14 @@ class Brish:
         stdout = ""
         # embed()
         for line in iter(self.p.stdout.readline, delim):
-            # if line.endswith(delim):
-                # line = line[:-self.MLEN-1]
             stdout += line
         stdout = stdout[:-1]
         return_code = int(self.p.stdout.readline())
         stderr = ""
         for line in iter(self.p.stderr.readline, delim):
-            # if line.endswith(delim):
-                # line = line[:-self.MLEN-1]
             stderr += line
         stderr = stderr[:-1]
-        return CmdResult(return_code, stdout, stderr)
+        return CmdResult(return_code, stdout, stderr, cmd, cmd_stdin)
 
     def cleanup(self):
         if self.p is None:
@@ -178,9 +206,9 @@ class Brish:
                 if fmt_bool:
                     value = boolsh(value)
 
-                value = str(value)
                 if not fmt_eval:
                     value = self.zsh_quote(value)
+                value = str(value)
                 result.append(value)
         cmd = ''.join(result)
         return cmd
