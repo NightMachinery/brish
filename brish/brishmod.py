@@ -1,4 +1,4 @@
-__version__ = '0.1.5'
+__version__ = '0.2.0'
 try:
     # Dev imports
     from IPython import embed
@@ -216,8 +216,8 @@ class Brish:
 
 
 
-    def z(self, template, locals_=None):
-        return self.send_cmd(self.zstring(template, locals_=locals_, getframe=2))
+    def z(self, template, locals_=None, *args, **kwargs):
+        return self.send_cmd(self.zstring(template, locals_=locals_, getframe=2), *args, **kwargs)
     ## Aliases
     c = send_cmd
     q = zsh_quote
