@@ -1,4 +1,4 @@
-__version__ = '0.1.5'
+__version__ = '0.2.0'
 try:
     # Dev imports
     from IPython import embed
@@ -18,6 +18,7 @@ from subprocess import Popen, PIPE, STDOUT
 from plumbum import local
 import pathlib
 from dataclasses import dataclass
+import inspect
 
 def idem(x):
     return x
@@ -44,6 +45,23 @@ class CmdResult:
     @property
     def summary(self):
         return self.retcode, self.out, self.err
+
+    @property
+    def longstr(self):
+        r = ''
+        if self.cmd_stdin:
+            r += f"""\ncmd_stdin:\n{self.cmd_stdin}"""
+        r += f"""\ncmd: {self.cmd}"""
+        if True or self.out:
+            r += f"""\nstdout:\n{self.out}"""
+        if self.err:
+            r += f"""\nstderr:\n{self.err}"""
+        if not self:
+            r += f"""\nreturn code: {self.retcode}"""
+        return r + "\n"
+
+    def print(self, *args, **kwargs):
+        print(self.longstr, *args, **kwargs)
 
     def __iter__(self):
         # return iter(self.toTuple())
@@ -216,8 +234,9 @@ class Brish:
 
 
 
-    def z(self, template, locals_=None):
-        return self.send_cmd(self.zstring(template, locals_=locals_, getframe=2))
+    def z(self, template, locals_=None, *args, **kwargs):
+        return self.send_cmd(self.zstring(template, locals_=locals_, getframe=2), *args, **kwargs)
+
     ## Aliases
     c = send_cmd
     q = zsh_quote

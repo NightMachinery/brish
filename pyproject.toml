@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "brish"
-version = "0.1.5"
+version = "0.2.0"
 description = "A bridge between zsh and Python."
 authors = ["NightMachinary <rudiwillalwaysloveyou@gmail.com>"]
 exclude = ["__pycache__"]
@@ -11,6 +11,7 @@ python = "^3.7"
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"
 IPython = ">6" # Dev
+ipydex = "^0.10.5"
 
 
 [build-system]
