@@ -47,6 +47,10 @@ class CmdResult:
         return self.retcode, self.out, self.err
 
     @property
+    def outerr(self):
+        return self.out + self.err
+
+    @property
     def longstr(self):
         r = ''
         if self.cmd_stdin:
@@ -234,8 +238,11 @@ class Brish:
 
 
 
-    def z(self, template, locals_=None, *args, **kwargs):
-        return self.send_cmd(self.zstring(template, locals_=locals_, getframe=2), *args, **kwargs)
+    def z(self, template, locals_=None, getframe=2, *args, **kwargs):
+        return self.send_cmd(self.zstring(template, locals_=locals_, getframe=getframe), *args, **kwargs)
+
+    def zp(self, *args, getframe=3, **kwargs):
+        print(self.z(*args, getframe=getframe, **kwargs).outerr, end='')
 
     ## Aliases
     c = send_cmd
