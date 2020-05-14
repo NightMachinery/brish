@@ -2,6 +2,10 @@
 
 `pip install -U brish`
 
+Or to install the latest version:
+
+`pip install git+https://github.com/NightMachinary/brish`
+
 
 # Usage
 
