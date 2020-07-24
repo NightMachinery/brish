@@ -242,8 +242,8 @@ class Brish:
         return self.send_cmd(self.zstring(template, locals_=locals_, getframe=getframe), *args, **kwargs)
 
     def zp(self, *args, getframe=3, **kwargs):
-        res = self.z(*args, getframe=getframe, **kwargs).outerr, end=''
-        print(res.out, end='')
+        res = self.z(*args, getframe=getframe, **kwargs)
+        print(res.outerr, end='')
         return res
 
     ## Aliases
