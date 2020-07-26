@@ -65,7 +65,7 @@ class CmdResult:
         return r + "\n"
 
     def print(self, *args, **kwargs):
-        print(self.longstr, *args, **kwargs)
+        print(self.longstr, *args, **kwargs, flush=True)
 
     def __iter__(self):
         # return iter(self.toTuple())
@@ -91,6 +91,7 @@ class Brish:
     def __init__(self, defaultShell=None):
         self.defaultShell = defaultShell or str(pathlib.Path(__file__).parent / 'brish.zsh')
         self.p = None
+        self.init()
 
     def init(self, shell=None):
         if shell is None:
@@ -175,9 +176,13 @@ class Brish:
 
     def zstring(self, template, locals_=None, getframe=1):
         if locals_ is None:
-            previous_frame = sys._getframe(getframe)
-            previous_frame_locals = previous_frame.f_locals
-            locals_ = previous_frame_locals
+            try:
+                previous_frame = sys._getframe(getframe)
+                previous_frame_locals = previous_frame.f_locals
+                locals_ = previous_frame_locals
+            except:
+                # Julia runs Python in an embedded mode with no stack frame.
+                pass
 
         def asteval(astNode):
             if astNode is not None:
@@ -243,7 +248,7 @@ class Brish:
 
     def zp(self, *args, getframe=3, **kwargs):
         res = self.z(*args, getframe=getframe, **kwargs)
-        print(res.outerr, end='')
+        print(res.outerr, end='', flush=True)
         return res
 
     ## Aliases
