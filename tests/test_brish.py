@@ -1,3 +1,13 @@
+def test2():
+    import threading
+
+    def worker(c):
+        zp('sleep {c} ; ec {c}')
+
+    for i in range(10):
+        t = threading.Thread(target=worker, args=(i,))
+        t.start()
+
 def test1():
     from brishmod import Brish
     bsh = Brish()
