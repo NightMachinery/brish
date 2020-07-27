@@ -19,6 +19,7 @@ from plumbum import local
 import pathlib
 from dataclasses import dataclass
 import inspect
+from threading import Lock
 
 def idem(x):
     return x
@@ -85,19 +86,22 @@ class CmdResult:
 
 
 class Brish:
+    """Brish is a bridge between Python and an interpreter. The interpreter needs to adhere to the Brish protocol. A zsh interpreter is provided, and is the default. Threadsafe."""
 
     MARKER = '\x00'
 
     def __init__(self, defaultShell=None):
+        self.lock = Lock()
         self.defaultShell = defaultShell or str(pathlib.Path(__file__).parent / 'brish.zsh')
         self.p = None
         self.init()
 
     def init(self, shell=None):
-        if shell is None:
-            shell = self.defaultShell
-        self.p = Popen(shell, stdin=PIPE, stdout=PIPE, stderr=PIPE,
-                universal_newlines=True) # decode output as utf-8, newline is '\n'
+        with self.lock:
+            if shell is None:
+                shell = self.defaultShell
+            self.p = Popen(shell, stdin=PIPE, stdout=PIPE, stderr=PIPE,
+                    universal_newlines=True) # decode output as utf-8, newline is '\n'
 
     def zsh_quote(self, obj):
         if obj is None:
@@ -115,33 +119,35 @@ class Brish:
             return self.send_cmd('print -rn -- "${(q+@)brish_stdin}"', cmd_stdin=str(obj)).out
 
     def send_cmd(self, cmd, cmd_stdin="", fork=False):
-        delim = self.MARKER + '\n'
-        if self.p is None:
-            self.init()
-        print(cmd + self.MARKER + cmd_stdin + self.MARKER + boolsh(fork) + self.MARKER, file=self.p.stdin, flush=True)
-        stdout = ""
-        # embed()
-        for line in iter(self.p.stdout.readline, delim):
-            stdout += line
-        stdout = stdout[:-1]
-        return_code = int(self.p.stdout.readline())
-        stderr = ""
-        for line in iter(self.p.stderr.readline, delim):
-            stderr += line
-        stderr = stderr[:-1]
-        return CmdResult(return_code, stdout, stderr, cmd, cmd_stdin)
+        with self.lock:
+            delim = self.MARKER + '\n'
+            if self.p is None:
+                self.init()
+            print(cmd + self.MARKER + cmd_stdin + self.MARKER + boolsh(fork) + self.MARKER, file=self.p.stdin, flush=True)
+            stdout = ""
+            # embed()
+            for line in iter(self.p.stdout.readline, delim):
+                stdout += line
+            stdout = stdout[:-1]
+            return_code = int(self.p.stdout.readline())
+            stderr = ""
+            for line in iter(self.p.stderr.readline, delim):
+                stderr += line
+            stderr = stderr[:-1]
+            return CmdResult(return_code, stdout, stderr, cmd, cmd_stdin)
 
     def cleanup(self):
-        if self.p is None:
-            return
-        self.p.stdout.close()
-        if self.p.stderr:
-            self.p.stderr.close()
-        self.p.stdin.close()
-        self.p.wait()
-        self.p = None
+        with self.lock:
+            if self.p is None:
+                return
+            self.p.stdout.close()
+            if self.p.stderr:
+                self.p.stderr.close()
+            self.p.stdin.close()
+            self.p.wait()
+            self.p = None
 
-    
+
 
     _conversions = {'a': ascii, 'r': repr, 's': str, 'e': idem, 'b': boolsh}
 
