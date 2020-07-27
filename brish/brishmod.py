@@ -150,8 +150,9 @@ class Brish:
         if locals_ is None:
             previous_frame = sys._getframe(1)
             previous_frame_locals = previous_frame.f_locals
-            locals_ = previous_frame_locals
-            # locals_ = globals()
+            locals_ = dict(previous_frame.f_globals, **previous_frame_locals)
+            # https://stackoverflow.com/questions/1041639/get-a-dict-of-all-variables-currently-in-scope-and-their-values
+            # We will still miss the closure variables.
         result = []
         parts = Formatter().parse(template)
         for part in parts:
@@ -179,7 +180,9 @@ class Brish:
             try:
                 previous_frame = sys._getframe(getframe)
                 previous_frame_locals = previous_frame.f_locals
-                locals_ = previous_frame_locals
+                locals_ = dict(previous_frame.f_globals, **previous_frame_locals)
+                # https://stackoverflow.com/questions/1041639/get-a-dict-of-all-variables-currently-in-scope-and-their-values
+                # We will still miss the closure variables.
             except:
                 # Julia runs Python in an embedded mode with no stack frame.
                 pass
