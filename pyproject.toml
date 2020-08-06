@@ -9,7 +9,7 @@ exclude = ["__pycache__"]
 python = "==3.*,>=3.7.0"
 
 [tool.poetry.dev-dependencies]
-pytest = "==5.*,>=5.2.0"
+pytest = "==6.*,>=5.2.0"
 IPython = ">6" # Dev
 ipydex = "==0.*,>=0.10.5"
 
