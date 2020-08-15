@@ -90,8 +90,9 @@ class Brish:
 
     MARKER = '\x00'
 
-    def __init__(self, defaultShell=None):
+    def __init__(self, defaultShell=None, boot_cmd=None):
         self.lock = RLock()
+        self.boot_cmd = boot_cmd
         self.defaultShell = defaultShell or str(pathlib.Path(__file__).parent / 'brish.zsh')
         self.lastShell = self.defaultShell
         self.p = None
@@ -104,6 +105,8 @@ class Brish:
             self.lastShell = shell
             self.p = Popen(shell, stdin=PIPE, stdout=PIPE, stderr=PIPE,
                     universal_newlines=True) # decode output as utf-8, newline is '\n'
+            if self.boot_cmd is not None:
+                return self.send_cmd(self.boot_cmd, fork=False)
 
     def restart(self):
         with self.lock:
