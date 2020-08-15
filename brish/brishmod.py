@@ -19,7 +19,7 @@ from plumbum import local
 import pathlib
 from dataclasses import dataclass
 import inspect
-from threading import Lock
+from threading import RLock # http://docs.python.org/library/threading.html#rlock-objects
 
 def idem(x):
     return x
@@ -91,8 +91,9 @@ class Brish:
     MARKER = '\x00'
 
     def __init__(self, defaultShell=None):
-        self.lock = Lock()
+        self.lock = RLock()
         self.defaultShell = defaultShell or str(pathlib.Path(__file__).parent / 'brish.zsh')
+        self.lastShell = self.defaultShell
         self.p = None
         self.init()
 
@@ -100,8 +101,15 @@ class Brish:
         with self.lock:
             if shell is None:
                 shell = self.defaultShell
+            self.lastShell = shell
             self.p = Popen(shell, stdin=PIPE, stdout=PIPE, stderr=PIPE,
                     universal_newlines=True) # decode output as utf-8, newline is '\n'
+
+    def restart(self):
+        with self.lock:
+            self.cleanup()
+            self.init(shell=self.lastShell)
+
 
     def zsh_quote(self, obj):
         if obj is None:
@@ -120,6 +128,9 @@ class Brish:
 
     def send_cmd(self, cmd, cmd_stdin="", fork=False):
         with self.lock:
+            if cmd == "%BRISH_RESTART":
+                self.restart()
+                return CmdResult(0, "Restarted succesfully.", "", cmd, cmd_stdin)
             delim = self.MARKER + '\n'
             if self.p is None:
                 self.init()
