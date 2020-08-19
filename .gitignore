@@ -2,3 +2,5 @@ __pycache__/
 dist
 setup.py
 brish.egg-info
+tmp.py
+readme.html

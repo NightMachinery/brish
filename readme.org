@@ -1,0 +1,402 @@
+#+TITLE: Brish
+* Guide
+** Installation
+
+~pip install -U brish~
+
+Or install the latest master (recommended, as I might have forgotten to push a new versioned update):
+
+~pip install git+https://github.com/NightMachinary/brish~
+
+** Quickstart
+
+#+begin_src python :session p1 :results silent :tangle tests/test_tangled1.py
+from brish import z, zp, Brish
+#+end_src
+
+#+begin_src python :session p1 :results silent :exports none :tangle tests/test_tangled1.py
+NI = True
+#+end_src
+
+#+begin_src python :session p1 :results silent :exports none
+NI = False
+#+end_src
+
+#+name: t1
+#+begin_src python :session p1 :results value :exports both :tangle tests/test_tangled1.py
+name="A$ron"
+z("echo Hello {name}")
+#+end_src
+
+#+RESULTS: t1
+: Hello A$ron
+
+#+begin_src python :session p1 :var t1=t1 :results value :exports none :tangle tests/test_tangled1.py
+def test1():
+    assert t1 == "Hello A$ron"
+    return True
+NI or test1()
+#+end_src
+
+#+RESULTS:
+: True
+
+~z~ automatically converts Python lists to shell lists:
+#+name: t2
+#+begin_src python :session p1 :results value :exports both :tangle tests/test_tangled1.py
+alist = ["# Fruits", "1. Orange", "2. Rambutan", "3. Strawberry"]
+z("for i in {alist} ; do echo $i ; done")
+#+end_src
+
+#+RESULTS: t2
+: # Fruits
+: 1. Orange
+: 2. Rambutan
+: 3. Strawberry
+
+#+begin_src python :session p1 :var t2=t2 :results value :exports none :tangle tests/test_tangled1.py
+def test2():
+    assert t2 == """# Fruits
+1. Orange
+2. Rambutan
+3. Strawberry"""
+NI or test2()
+#+end_src
+
+#+RESULTS:
+: None
+
+~z~ returns a ~CmdResult~ (more about which later):
+
+#+begin_src python :session p1 :results value :exports both
+res = z("date +%Y")
+repr(res)
+#+end_src
+
+#+RESULTS:
+: CmdResult(retcode=0, out='2020\n', err='', cmd=' date +%Y ', cmd_stdin='')
+
+You can use ~zp~ as a shorthand for ~print(z(...))~:
+
+#+begin_src python :session p1 :results output :exports both
+for i in range(10):
+    cmd = "(( {i} % 2 == 0 )) && echo {i} || echo Bad Odds'!'"
+    zp(cmd)
+    print(f"Same thing: {z(cmd)}")
+#+end_src
+
+#+RESULTS:
+#+begin_example
+0
+Same thing: 0
+Bad Odds!
+Same thing: Bad Odds!
+2
+Same thing: 2
+Bad Odds!
+Same thing: Bad Odds!
+4
+Same thing: 4
+Bad Odds!
+Same thing: Bad Odds!
+6
+Same thing: 6
+Bad Odds!
+Same thing: Bad Odds!
+8
+Same thing: 8
+Bad Odds!
+Same thing: Bad Odds!
+#+end_example
+
+~CmdResult~ is true if its return code is zero:
+#+name: t3
+#+begin_src python :session p1 :results output :exports both :tangle tests/test_tangled1.py
+if z("test -e ~/"):
+    print("HOME exists!")
+else:
+    print("We're homeless :(")
+#+end_src
+
+#+RESULTS: t3
+: HOME exists!
+
+#+begin_src python :session p1 :var t3=t3 :results value :exports none :tangle tests/test_tangled1.py
+assert t3 == "HOME exists!"
+#+end_src
+
+#+RESULTS:
+: None
+
+~CmdResult~ is smart about iterating:
+#+name: t4
+#+begin_src python :session p1 :results output :exports both :tangle tests/test_tangled1.py
+for path in z("command ls ~/tmp/"): # `command` helps bypass potential aliases defined on `ls`
+    zp("du -h ~/tmp/{path}") # zp prints the result
+#+end_src
+
+#+RESULTS: t4
+: 260K	/Users/evar/tmp/a.png
+: 4.8M	/Users/evar/tmp/bug.mkv
+:   0B	/Users/evar/tmp/garden
+
+#+begin_src python :session p1 :results value :exports both
+res = z("""echo This is stdout
+           echo This is stderr >&2
+           (exit 6) # this is the return code""")
+repr(res.out)
+#+end_src
+
+#+RESULTS:
+: This is stdout\n
+
+~CmdResult.outrs~ strips the final newlines:
+
+#+begin_src python :session p1 :results value :exports both
+repr(res.outrs)
+#+end_src
+
+#+RESULTS:
+: This is stdout
+
+#+begin_src python :session p1 :results value :exports both
+repr(res.err)
+#+end_src
+
+#+RESULTS:
+: This is stderr\n
+
+#+begin_src python :session p1 :results value :exports both
+res.retcode
+#+end_src
+
+#+RESULTS:
+: 6
+
+#+begin_src python :session p1 :results value :exports both
+res.longstr
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+cmd:  echo This is stdout
+           echo This is stderr >&2
+           (exit 6) # this is the return code
+stdout:
+This is stdout
+
+stderr:
+This is stderr
+
+return code: 6
+#+end_example
+
+By default, ~z~ doesn't fork. So we can use it to change the state of the running zsh session:
+#+begin_src python :session p1 :results value :exports both
+z("""
+(($+commands[imdbpy])) || pip install -U imdbpy
+imdb() imdbpy search movie --first "$*"
+""")
+z("imdb Into the Woods 2014")
+#+end_src
+
+#+RESULTS:
+#+begin_example
+Movie
+=====
+Title: Into the Woods (2014)
+Genres: Adventure, Comedy, Drama, Fantasy, Musical.
+Director: Rob Marshall.
+Writer: James Lapine, James Lapine.
+Cast: Anna Kendrick (Cinderella), Daniel Huttlestone (Jack), James Corden (Baker / Narrator), Emily Blunt (Baker's Wife), Christine Baranski (Stepmother).
+Runtime: 125.
+Country: United States.
+Language: English.
+Rating: 5.9 (129612 votes).
+Plot: A witch tasks a childless baker and his wife with procuring magical items from classic fairy tales to reverse the curse put on their family tree.
+#+end_example
+
+We can force a fork. This is useful to make your scripts more robusts.
+#+begin_src python :session p1 :results output :exports both
+print(z("exit 7", fork=True).retcode)
+zp("echo 'Still alive!'")
+#+end_src
+
+#+RESULTS:
+: 7
+: Still alive!
+
+Working with stdin:
+#+begin_src python :session p1 :results value :exports both
+# the intuitive way
+a="""1
+2
+3
+4
+5
+"""
+z("<<<{a} wc -l")
+#+end_src
+
+#+RESULTS:
+: 6
+
+#+begin_src python :session p1 :results value :exports both
+z("wc -l", cmd_stdin=a)
+#+end_src
+
+#+RESULTS:
+: 5
+
+** More details
+The stdin will by default be set to the empty string:
+#+begin_src python :session p1 :results output :exports both
+zp("cat")
+zp("echo 'as you see, the previous command produced no output. It also did not block.'")
+#+end_src
+
+#+RESULTS:
+: as you see, the previous command produced no output. It also did not block.
+
+~z~ escapes your Python variables automagically:
+#+begin_src python :session p1 :results value :exports both
+python_var = "$HOME"
+z("echo {python_var}")
+#+end_src
+
+#+RESULTS:
+: $HOME
+
+Turning off the auto-escape:
+#+begin_src python :session p1 :results value :exports both
+z("echo {python_var:e}")
+#+end_src
+
+#+RESULTS:
+: /Users/evar
+
+Working with Python bools from the shell:
+#+begin_src python :session p1 :results value :exports both
+z("test -n {True:bool}").retcode
+#+end_src
+
+#+RESULTS:
+: 0
+
+#+begin_src python :session p1 :results value :exports both
+z("test -n {False:bool}").retcode
+#+end_src
+
+#+RESULTS:
+: 1
+
+Working with NUL-terminated output:
+#+begin_src python :session p1 :results output :exports both
+for f in z("fd -0 . ~/tmp").iter0():
+    zp("echo {f}")
+#+end_src
+
+#+RESULTS:
+: /Users/evar/tmp/a.png
+: /Users/evar/tmp/bug.mkv
+: /Users/evar/tmp/garden
+
+You can bypass the automatic iterable conversion by converting the iterable to a string first:
+#+begin_src python :session p1 :results value :exports both
+z("echo {'    '.join(map(str,alist))}")
+#+end_src
+
+#+RESULTS:
+: # Fruits    1. Orange    2. Rambutan    3. Strawberry
+
+Normal Python formatting syntax works as expected:
+
+#+begin_src python :session p1 :results value :exports both
+z("echo {67:f}")
+#+end_src
+
+#+RESULTS:
+: 67.0
+
+#+begin_src python :session p1 :results value :exports both
+repr(z("echo {[11, 45]!s}").outrs)
+#+end_src
+
+#+RESULTS:
+: [11, 45]
+
+
+You can obviously nest your ~z~ calls:
+#+begin_src python :session p1 :results value :exports both
+z("""echo monkey$'\n'{z("curl -s https://www.poemist.com/api/v1/randompoems | jq --raw-output '.[0].content'")}$'\n'end | sed -e 's/monkey/Random Poem:/'""")
+#+end_src
+
+#+RESULTS:
+#+begin_example
+Random Poem:
+114
+
+Good night, because we must,
+How intricate the dust!
+I would go, to know!
+Oh incognito!
+Saucy, Saucy Seraph
+To elude me so!
+Father! they won't tell me,
+Won't you tell them to?
+end
+#+end_example
+
+*** The Brish Class
+~z~ and ~zp~ are just convenience methods:
+
+#+begin_example
+bsh = Brish()
+z = bsh.z
+zp = bsh.zp
+zq = bsh.zsh_quote
+zs = bsh.zstring
+#+end_example
+
+You can use ~Brish~ instances yourself (all arguments to it are optional). The boot command ~boot_cmd~ allows you to easily initialize the zsh session:
+
+#+begin_src python :session p1 :results value :exports both
+my_own_brish = Brish(boot_cmd="mkdir -p ~/tmp ; cd ~/tmp")
+my_own_brish.z("echo $PWD")
+#+end_src
+
+#+RESULTS:
+: /Users/evar/tmp
+
+~Brish.z~ itself is sugar around ~Brish.zstring~ and ~Brish.send_cmd~:
+#+begin_src python :session p1 :results value :exports both
+cmd_str = my_own_brish.zstring("echo zstring constructs the command string that will be sent to zsh. It interpolates the Pythonic variables: {python_var} {alist}")
+cmd_str
+#+end_src
+
+#+RESULTS:
+:  echo zstring constructs the command string that will be sent to zsh. It interpolates the Pythonic variables: '$HOME' '# Fruits' '1. Orange' '2. Rambutan' '3. Strawberry'
+
+#+begin_src python :session p1 :results value :exports both
+my_own_brish.send_cmd(cmd_str)
+#+end_src
+
+#+RESULTS:
+: zstring constructs the command string that will be sent to zsh. It interpolates the Pythonic variables: $HOME # Fruits 1. Orange 2. Rambutan 3. Strawberry
+
+You can restart a Brish instance:
+#+begin_src python :session p1 :results output :exports both
+my_own_brish.z("a=56")
+my_own_brish.zp("echo Before restart: $a")
+my_own_brish.restart()
+my_own_brish.zp("echo After restart: $a")
+my_own_brish.zp("echo But the boot_cmd has run in the restarted instance, too: $PWD")
+#+end_src
+
+#+RESULTS:
+: Before restart: 56
+: After restart:
+: But the boot_cmd has run in the restarted instance, too: /Users/evar/tmp
+
+~Brish~ is threadsafe. I have built [[https://github.com/NightMachinary/BrishGarden][BrishGarden]] on top of ~Brish~ to provide an HTTP REST API for executing zsh code (if wanted, in sessions). Using ~BrishGarden~, you can embed ~zsh~ in pretty much any programming language, and pay no cost whatsoever for its startup. It can also function as a remote code executor.

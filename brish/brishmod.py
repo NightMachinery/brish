@@ -1,4 +1,3 @@
-__version__ = '0.2.0'
 try:
     # Dev imports
     from IPython import embed
@@ -15,7 +14,6 @@ from string import Formatter
 import uuid
 import random
 from subprocess import Popen, PIPE, STDOUT
-from plumbum import local
 import pathlib
 from dataclasses import dataclass
 import inspect
