@@ -8,6 +8,8 @@ Or install the latest master (recommended, as I might have forgotten to push a n
 
 ~pip install git+https://github.com/NightMachinary/brish~
 
+You need a recent Python version, as Brish uses some of the newer metaprogramming APIs. Obviously, you also need zsh installed.
+
 ** Quickstart
 
 #+begin_src python :session p1 :results silent :tangle tests/test_tangled1.py
@@ -400,3 +402,32 @@ my_own_brish.zp("echo But the boot_cmd has run in the restarted instance, too: $
 : But the boot_cmd has run in the restarted instance, too: /Users/evar/tmp
 
 ~Brish~ is threadsafe. I have built [[https://github.com/NightMachinary/BrishGarden][BrishGarden]] on top of ~Brish~ to provide an HTTP REST API for executing zsh code (if wanted, in sessions). Using ~BrishGarden~, you can embed ~zsh~ in pretty much any programming language, and pay no cost whatsoever for its startup. It can also function as a remote code executor.
+
+* Security considerations
+
+I am not a security expert, and security doesn't come by default in these situations. So I caution you not to use untrusted input in the commands fed to zsh. Nevertheless, the only threat I can envision is the input containing Brish's EOE marker, as otherwise the input gets automatically escaped. I plan to add checks for this in future versions. Feedback by security experts will be appreciated.
+
+One thing to keep in mind is that Brish purposely uses the zsh from your PATH. That zsh will load its dotfiles as usual.
+
+* Future features
+
+I like to add a mode where the zsh session inherits the stderr from the parent Python process. This allows usage of interactive programs like ~fzf~.
+
+If you have any good design ideas, create an issue!
+
+* Related projects
+
+- [[https://github.com/sharkdp/pysh][pysh]] uses comments in bash scripts to switch the interpreter to Python, allowing variable reuse between the two.
+- [[https://github.com/tomerfiliba/plumbum][plumbum]] is a small yet feature-rich library for shell script-like programs in Python. It attempts to mimic the shell syntax ("shell combinators") where it makes sense, while keeping it all Pythonic and cross-platform. I personally like this one a lot. A robust option that is also easy-to-use.
+- [[https://github.com/xonsh/xonsh][xonsh]] is a superset of Python 3.5+ with additional shell primitives.
+- [[https://github.com/terrycojones/daudin][daudin]] [[https://github.com/terrycojones/daudin#how-commands-are-interpreted][tries]] to eval your code as Python, falling back to the shell if that fails. It does not currently reuse a shell session, thus incurring large overhead. I [[https://github.com/terrycojones/daudin/issues/11][think]] it can use Brish to solve this, but someone needs to contribute the support.
+- [[https://github.com/oconnor663/duct.py][duct.py]] is a library for running child processes. It's quite low-level compared to the other projects in this list.
+- ~python -c~ can also be powerful, especially if you write yourself a helper library in Python and some wrappers in your shell dotfiles. An example:
+    #+BEGIN_EXAMPLE
+    alias x='noglob calc-raw'
+    calc-raw () {
+        python3 -c "from math import *; print($*)"
+    }
+    #+END_EXAMPLE
+- [[https://github.com/danylo-dubinin/zsh-jupyter-kernel][Z shell kernel for Jupyter Notebook]] allows you to do all sorts of stuff if you spend the time implementing your usecase; See [[https://github.com/nnicandro/emacs-jupyter#org-mode-source-blocks][emacs-jupyter]] to get a taste of what's possible. [[https://github.com/jupyter/kernel_gateway][Jupyter Kernel Gateway]] also sounds promising, but I haven't tried it out yet. Beware the completion support in this kernel though. It uses a pre-alpha proof of concept [[https://github.com/Valodim/zsh-capture-completion][thingy]] that was very buggy when I tried it.
+- Finally, if you're feeling adventurous, try Rust's [[https://github.com/rust-shell-script/rust_cmd_lib][rust_cmd_lib]]. It's quite beautiful.
