@@ -76,13 +76,13 @@ repr(res)
 #+RESULTS:
 : CmdResult(retcode=0, out='2020\n', err='', cmd=' date +%Y ', cmd_stdin='')
 
-You can use ~zp~ as a shorthand for ~print(z(...))~:
+You can use ~zp~ as a shorthand for ~print(z(...).outerr, end='')~:
 
 #+begin_src python :session p1 :results output :exports both
 for i in range(10):
-    cmd = "(( {i} % 2 == 0 )) && echo {i} || echo Bad Odds'!'"
+    cmd = "(( {i} % 2 == 0 )) && echo {i} || {{ echo Bad Odds'!' >&2 }}" # Using {{ and }} as escapes for { and }
     zp(cmd)
-    print(f"Same thing: {z(cmd)}")
+    print(f"Same thing: {z(cmd).outerr}", end='')
 #+end_src
 
 #+RESULTS:
