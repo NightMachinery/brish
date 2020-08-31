@@ -419,6 +419,7 @@ If you have any good design ideas, create an issue!
 
 - [[https://github.com/sharkdp/pysh][pysh]] uses comments in bash scripts to switch the interpreter to Python, allowing variable reuse between the two.
 - [[https://github.com/tomerfiliba/plumbum][plumbum]] is a small yet feature-rich library for shell script-like programs in Python. It attempts to mimic the shell syntax ("shell combinators") where it makes sense, while keeping it all Pythonic and cross-platform. I personally like this one a lot. A robust option that is also easy-to-use.
+- [[https://github.com/timofurrer/shellfuncs][shellfuncs]]: Python API to execute shell functions as they would be Python functions. (Last commit is in 2017.)
 - [[https://github.com/xonsh/xonsh][xonsh]] is a superset of Python 3.5+ with additional shell primitives.
 - [[https://github.com/terrycojones/daudin][daudin]] [[https://github.com/terrycojones/daudin#how-commands-are-interpreted][tries]] to eval your code as Python, falling back to the shell if that fails. It does not currently reuse a shell session, thus incurring large overhead. I [[https://github.com/terrycojones/daudin/issues/11][think]] it can use Brish to solve this, but someone needs to contribute the support.
 - [[https://github.com/oconnor663/duct.py][duct.py]] is a library for running child processes. It's quite low-level compared to the other projects in this list.
