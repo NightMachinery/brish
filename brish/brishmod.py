@@ -86,7 +86,9 @@ class CmdResult:
 class Brish:
     """Brish is a bridge between Python and an interpreter. The interpreter needs to adhere to the Brish protocol. A zsh interpreter is provided, and is the default. Threadsafe."""
 
+    # MARKER = '\x00BRISH_MARKER'
     MARKER = '\x00'
+
 
     def __init__(self, defaultShell=None, boot_cmd=None):
         self.lock = RLock()
@@ -127,11 +129,15 @@ class Brish:
         else:
             return self.send_cmd('print -rn -- "${(q+@)brish_stdin}"', cmd_stdin=str(obj)).out
 
-    def send_cmd(self, cmd, cmd_stdin="", fork=False):
+    def send_cmd(self, cmd: str, cmd_stdin="", fork=False):
         with self.lock:
+            cmd_stdin = str(cmd_stdin)
+            # assert  isinstance(cmd, str)
             if cmd == "%BRISH_RESTART":
                 self.restart()
                 return CmdResult(0, "Restarted succesfully.", "", cmd, cmd_stdin)
+            if any(self.MARKER in input for input in (cmd, cmd_stdin)):
+                return CmdResult(9000, "", "Illegal input: Input contained the Brish marker (currently the NUL character).", cmd, cmd_stdin)
             delim = self.MARKER + '\n'
             if self.p is None:
                 self.init()

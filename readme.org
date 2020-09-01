@@ -405,9 +405,26 @@ my_own_brish.zp("echo But the boot_cmd has run in the restarted instance, too: $
 
 * Security considerations
 
-I am not a security expert, and security doesn't come by default in these situations. So I caution you not to use untrusted input in the commands fed to zsh. Nevertheless, the only threat I can envision is the input containing Brish's EOE marker, as otherwise the input gets automatically escaped. I plan to add checks for this in future versions. Feedback by security experts will be appreciated.
+I am not a security expert, and security doesn't come by default in these situations. So be careful if you use untrusted input in the commands fed to zsh. Nevertheless, I can't imagine any (non-obvious) attack vectors, as the input gets automatically escaped by default. Feedback by security experts will be appreciated.
 
-One thing to keep in mind is that Brish purposely uses the zsh from your PATH. That zsh will load its dotfiles as usual.
+Note that you can create security holes for yourself, by, e.g., `eval`ing user input:
+
+#+begin_src python :session p1 :results value :exports both
+untrusted_input = " ; echo do evil | cat"
+z("eval {untrusted_input}") # unsafe
+#+end_src
+
+#+RESULTS:
+: do evil
+
+#+begin_src python :session p1 :results value :exports both
+z("echo {untrusted_input}") # safe
+#+end_src
+
+#+RESULTS:
+:  ; echo do evil | cat
+
+# One thing to keep in mind is that Brish purposely uses the zsh from your PATH. That zsh will load its dotfiles as usual.
 
 * Future features
 

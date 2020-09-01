@@ -1,8 +1,10 @@
 #!/usr/bin/env zsh
-while IFS= read -d "" -r cmd
+# MARKER=$'\0'"BRISH_MARKER"
+MARKER=$'\0'
+while IFS= read -d "$MARKER" -r cmd
 do
-    IFS= read -d "" -r brish_stdin
-    IFS= read -d "" -r brish_fork
+    IFS= read -d "$MARKER" -r brish_stdin
+    IFS= read -d "$MARKER" -r brish_fork
     if test -n "$brish_fork" ; then
         (print -nr -- "$brish_stdin" | eval "$cmd")
     else
@@ -10,7 +12,7 @@ do
     fi
     # Note that exiting the shell can fail brish.py if not in the subshell.
     local ret=$?
-    print -n $'\n\0\n'
+    print -nr -- $'\n'"$MARKER"$'\n'
     print -r -- $ret
-    print -n $'\n\0\n' >&2
+    print -nr -- $'\n'"$MARKER"$'\n' >&2
 done
