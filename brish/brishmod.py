@@ -93,7 +93,7 @@ class Brish:
     def __init__(self, defaultShell=None, boot_cmd=None):
         self.lock = RLock()
         self.boot_cmd = boot_cmd
-        self.defaultShell = defaultShell or str(pathlib.Path(__file__).parent / 'brish.zsh')
+        self.defaultShell = defaultShell or [str(pathlib.Path(__file__).parent / 'brish.zsh'), "--", "BR" + "I"*2048 + "SH"] # Reserve big argv for `insubshell`
         self.lastShell = self.defaultShell
         self.p = None
         self.init()
