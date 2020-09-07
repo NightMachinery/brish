@@ -17,16 +17,20 @@ from subprocess import Popen, PIPE, STDOUT
 import pathlib
 from dataclasses import dataclass
 import inspect
-from threading import RLock # http://docs.python.org/library/threading.html#rlock-objects
+# http://docs.python.org/library/threading.html#rlock-objects
+from threading import RLock
+
 
 def idem(x):
     return x
+
 
 def boolsh(some_bool):
     if some_bool:
         return 'y'
     else:
         return ''
+
 
 @dataclass(frozen=True)
 class CmdResult:
@@ -78,7 +82,7 @@ class CmdResult:
 
     def __str__(self):
         return self.outrs
-    
+
     def __bool__(self):
         return self.retcode == 0
 
@@ -89,11 +93,11 @@ class Brish:
     # MARKER = '\x00BRISH_MARKER'
     MARKER = '\x00'
 
-
     def __init__(self, defaultShell=None, boot_cmd=None):
         self.lock = RLock()
         self.boot_cmd = boot_cmd
-        self.defaultShell = defaultShell or [str(pathlib.Path(__file__).parent / 'brish.zsh'), "--", "BR" + "I"*2048 + "SH"] # Reserve big argv for `insubshell`
+        self.defaultShell = defaultShell or [str(pathlib.Path(
+            __file__).parent / 'brish.zsh'), "--", "BR" + "I"*2048 + "SH"]  # Reserve big argv for `insubshell`
         self.lastShell = self.defaultShell
         self.p = None
         self.init()
@@ -104,7 +108,7 @@ class Brish:
                 shell = self.defaultShell
             self.lastShell = shell
             self.p = Popen(shell, stdin=PIPE, stdout=PIPE, stderr=PIPE,
-                    universal_newlines=True) # decode output as utf-8, newline is '\n'
+                           universal_newlines=True)  # decode output as utf-8, newline is '\n'
             if self.boot_cmd is not None:
                 return self.send_cmd(self.boot_cmd, fork=False)
 
@@ -112,7 +116,6 @@ class Brish:
         with self.lock:
             self.cleanup()
             self.init(shell=self.lastShell)
-
 
     def zsh_quote(self, obj):
         if obj is None:
@@ -141,7 +144,8 @@ class Brish:
             delim = self.MARKER + '\n'
             if self.p is None:
                 self.init()
-            print(cmd + self.MARKER + cmd_stdin + self.MARKER + boolsh(fork) + self.MARKER, file=self.p.stdin, flush=True)
+            print(cmd + self.MARKER + cmd_stdin + self.MARKER +
+                  boolsh(fork) + self.MARKER, file=self.p.stdin, flush=True)
             stdout = ""
             # embed()
             for line in iter(self.p.stdout.readline, delim):
@@ -165,8 +169,6 @@ class Brish:
             self.p.wait()
             self.p = None
 
-
-
     _conversions = {'a': ascii, 'r': repr, 's': str, 'e': idem, 'b': boolsh}
 
     def zstring_old(self, template, locals_=None):
@@ -186,7 +188,7 @@ class Brish:
                 result.append(literal_text)
             if not field_name:
                 continue
-            value = eval(field_name, locals_) #.__format__()
+            value = eval(field_name, locals_)  # .__format__()
             if conversion:
                 value = self._conversions[conversion](value)
             if format_spec:
@@ -204,7 +206,8 @@ class Brish:
             try:
                 previous_frame = sys._getframe(getframe)
                 previous_frame_locals = previous_frame.f_locals
-                locals_ = dict(previous_frame.f_globals, **previous_frame_locals)
+                locals_ = dict(previous_frame.f_globals,
+                               **previous_frame_locals)
                 # https://stackoverflow.com/questions/1041639/get-a-dict-of-all-variables-currently-in-scope-and-their-values
                 # We will still miss the closure variables.
             except:
@@ -222,17 +225,16 @@ class Brish:
             if format_spec:
                 flags = format_spec.split(':')
                 res = code in flags
-                format_spec = list(filter(lambda a: a != code,flags))
+                format_spec = list(filter(lambda a: a != code, flags))
             return ':'.join(format_spec), res
 
-
-        p = ast.parse(f"f''' {template} '''")
+        p = ast.parse(f"f''' {template} '''")  # The whitespace is necessary
         result = []
         parts = p.body[0].value.values
         for part in parts:
             typ = type(part)
-            if typ is ast.Str:
-                result.append(part.s)
+            if typ is ast.Constant or typ is ast.Str:
+                result.append(part.s)  # part.value can also work in Py3.8
             elif typ is ast.FormattedValue:
                 # print(part.__dict__)
 
@@ -249,7 +251,7 @@ class Brish:
                 # if conversion != 'e':
                 #     value = self.zsh_quote(value)
                 # embed()
-                
+
                 format_spec = asteval(part.format_spec) or ''
                 # print(f"orig format: {format_spec}")
                 format_spec, fmt_eval = eatFormat(format_spec, 'e')
@@ -267,9 +269,6 @@ class Brish:
         cmd = ''.join(result)
         return cmd
 
-
-
-
     def z(self, template, locals_=None, getframe=2, *args, **kwargs):
         return self.send_cmd(self.zstring(template, locals_=locals_, getframe=getframe), *args, **kwargs)
 
@@ -278,8 +277,6 @@ class Brish:
         print(res.outerr, end='', flush=True)
         return res
 
-    ## Aliases
+    # Aliases
     c = send_cmd
     q = zsh_quote
-
-
