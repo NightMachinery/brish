@@ -426,6 +426,9 @@ z("echo {untrusted_input}") # safe
 
 # One thing to keep in mind is that Brish purposely uses the zsh from your PATH. That zsh will load its dotfiles as usual.
 
+* Known issues
+** Piping binary (non-text) output from zsh to Python does not work
+
 * Future features
 
 I like to add a mode where the zsh session inherits the stderr from the parent Python process. This allows usage of interactive programs like ~fzf~.

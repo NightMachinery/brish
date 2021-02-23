@@ -33,7 +33,7 @@ else:
 
 t3="""Traceback (most recent call last):
   File \"<stdin>\", line 1, in <module>
-  File \"/var/folders/5v/g3zxt_7d64g3sd_56bzpqbvh0000gn/T/babel-bARGTe/python-6a1EpL\", line 1, in <module>
+  File \"/var/folders/5v/g3zxt_7d64g3sd_56bzpqbvh0000gn/T/babel-JVsAap/python-BtgRvV\", line 1, in <module>
     if z(\"test -e ~/\"):
 NameError: name 'z' is not defined"""
 assert t3 == "HOME exists!"
