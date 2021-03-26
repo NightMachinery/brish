@@ -122,6 +122,7 @@ class Brish:
             return ''
 
         if use_shared_instance: # protects against accidentally reading output from previously running processes (background jobs)
+            # @perf perhaps using a specialized routine might be faster, or just calling =zsh -f=
             self = _shared_brish
 
         typ = type(obj)
