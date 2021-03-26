@@ -117,7 +117,7 @@ class Brish:
             self.cleanup()
             self.init(shell=self.lastShell)
 
-    def zsh_quote(self, obj, use_shared_instance=True):
+    def zsh_quote(self, obj, use_shared_instance=True, retry_count=0, retry_limit=10):
         if obj is None:
             return ''
 
@@ -137,8 +137,10 @@ class Brish:
             res = self.send_cmd('print -rn -- "${(q+@)brish_stdin}"', cmd_stdin=str(obj))
             if res:
                 return res.out
+            elif retry_count < retry_limit:
+                return self.zsh_quote(obj, use_shared_instance=use_shared_instance, retry_count=(retry_count + 1), retry_limit=retry_limit)
             else:
-                raise Exception(f"@impossible Quoting object {repr(obj)} failed")
+                raise Exception(f"Quoting object {repr(obj)} failed; CmdResult:\n{res.longstr}")
 
     def send_cmd(self, cmd: str, cmd_stdin="", fork=False):
         with self.lock:
