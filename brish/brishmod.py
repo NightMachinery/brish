@@ -117,9 +117,13 @@ class Brish:
             self.cleanup()
             self.init(shell=self.lastShell)
 
-    def zsh_quote(self, obj):
+    def zsh_quote(self, obj, use_shared_instance=True):
         if obj is None:
             return ''
+
+        if use_shared_instance: # protects against accidentally reading output from previously running processes (background jobs)
+            self = _shared_brish
+
         typ = type(obj)
         if typ is CmdResult:
             return self.zsh_quote(obj.outrs)
@@ -130,7 +134,11 @@ class Brish:
                 result.append(self.zsh_quote(str(i)))
             return ' '.join(result)
         else:
-            return self.send_cmd('print -rn -- "${(q+@)brish_stdin}"', cmd_stdin=str(obj)).out
+            res = self.send_cmd('print -rn -- "${(q+@)brish_stdin}"', cmd_stdin=str(obj))
+            if res:
+                return res.out
+            else:
+                raise Exception(f"@impossible Quoting object {repr(obj)} failed")
 
     def send_cmd(self, cmd: str, cmd_stdin="", fork=False):
         with self.lock:
@@ -279,4 +287,6 @@ class Brish:
 
     # Aliases
     c = send_cmd
-    q = zsh_quote
+    zq = zsh_quote
+
+_shared_brish = Brish() # Any identifier of the form __spam (at least two leading underscores, at most one trailing underscore) is textually replaced with _classname__spam, so we can't use it in Brish if we use two underscores.
