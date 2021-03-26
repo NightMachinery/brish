@@ -6,9 +6,9 @@ do
     IFS= read -d "$MARKER" -r brish_stdin
     IFS= read -d "$MARKER" -r brish_fork
     if test -n "$brish_fork" ; then
-        (print -nr -- "$brish_stdin" | eval "$cmd")
+        ( { ( print -nr -- "$brish_stdin" ) || true }  | eval "$cmd" )
     else
-        print -nr -- "$brish_stdin" | eval "$cmd"
+        { ( print -nr -- "$brish_stdin" ) || true } | eval "$cmd"
     fi
     # Note that exiting the shell can fail brish.py if not in the subshell.
     local ret=$?
