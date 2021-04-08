@@ -1,6 +1,10 @@
 #!/usr/bin/env zsh
 # MARKER=$'\0'"BRISH_MARKER"
 MARKER=$'\0'
+
+IFS= read -d "$MARKER" -r BRISH_STDIN
+IFS= read -d "$MARKER" -r BRISH_STDOUT
+IFS= read -d "$MARKER" -r BRISH_STDERR
 stdins=(${(@f)BRISH_STDIN})
 stdouts=(${(@f)BRISH_STDOUT})
 stderrs=(${(@f)BRISH_STDERR})

@@ -10,6 +10,7 @@ except ImportError:
 
 
 import sys
+import time
 import os
 import shutil
 import tempfile
@@ -135,7 +136,6 @@ class Brish:
             brish_stdouts = [os.mkfifo(p) for p in brish_stdout_paths]
             brish_stderrs = [os.mkfifo(p) for p in brish_stderr_paths]
 
-            # @todo1 do not use the env vars for settings the pipe paths
             self.p = Popen(
                 shell,
                 stdin=PIPE,
@@ -143,14 +143,26 @@ class Brish:
                 stderr=PIPE,
                 env=dict(
                     os.environ,
-                    BRISH_STDIN="\n".join(brish_stdin_paths),
-                    BRISH_STDOUT="\n".join(brish_stdout_paths),
-                    BRISH_STDERR="\n".join(brish_stderr_paths),
                 ),
                 universal_newlines=True,
             )  # decode output as utf-8, newline is '\n'
+            BRISH_STDIN="\n".join(brish_stdin_paths)
+            BRISH_STDOUT="\n".join(brish_stdout_paths)
+            BRISH_STDERR="\n".join(brish_stderr_paths)
+            print(
+                BRISH_STDIN
+                + self.MARKER
+                + BRISH_STDOUT
+                + self.MARKER
+                + BRISH_STDERR
+                + self.MARKER
+                ,
+                file=self.p.stdin,
+                flush=True,
+            )
             self.p.tmpdir = tmpdir
             self.p.server_count = server_count
+            self.p.free_server_count = server_count
             self.p.brish_stdin_paths = brish_stdin_paths
             self.p.brish_stdout_paths = brish_stdout_paths
             self.p.brish_stderr_paths = brish_stderr_paths
@@ -206,18 +218,26 @@ class Brish:
                     f"Quoting object {repr(obj)} failed; CmdResult:\n{res.longstr}"
                 )
 
-    def send_cmd(self, cmd: str, cmd_stdin="", fork=False, server_index=None):
+    def send_cmd(self, cmd: str, cmd_stdin="", fork=False, server_index=None, lock_sleep=1):
         lock = None
         if server_index == None:
             acquired = False
-            for i, c_lock in enumerate(self.locks):
-                acquired = c_lock.acquire(blocking=False)
-                # https://docs.python.org/3/library/threading.html#threading.Lock.acquire
+            while acquired == False:
+                for i, c_lock in enumerate(self.locks):
+                    acquired = c_lock.acquire(blocking=False)
+                    # https://docs.python.org/3/library/threading.html#threading.Lock.acquire
 
-                if acquired == True:
-                    lock = c_lock
-                    server_index = i
-                    break
+                    if acquired == True:
+                        lock = c_lock
+                        server_index = i
+                        break
+
+                if acquired == False:
+                    if lock_sleep != None:
+                        time.sleep(lock_sleep)
+                    else:
+                        break
+
             if acquired == False:
                 server_index = random.randrange(self.p.server_count)
 
@@ -226,6 +246,7 @@ class Brish:
             lock.acquire()
 
         try:
+            self.p.free_server_count -= 1
             cmd_stdin = str(cmd_stdin)
             # assert  isinstance(cmd, str)
             if cmd == "%BRISH_RESTART":
@@ -264,6 +285,7 @@ class Brish:
             stderr = stderr[:-1]
             return CmdResult(return_code, stdout, stderr, cmd, cmd_stdin)
         finally:
+            self.p.free_server_count += 1
             lock.release()
 
     def cleanup(self):
