@@ -297,12 +297,12 @@ class Brish:
 
     def cleanup(self):
         with self.lock:
+            if self.p is None:
+                return
             locks = self.locks
             for lock in locks:
                 lock.acquire()
             try:
-                if self.p is None:
-                    return
                 self.p.stdout.close()
                 if self.p.stderr:
                     self.p.stderr.close()
