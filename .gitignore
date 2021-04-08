@@ -4,3 +4,5 @@ setup.py
 brish.egg-info
 tmp.py
 readme.html
+fly_check_*.py
+brish/flycheck_brishmod.py

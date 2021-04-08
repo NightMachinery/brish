@@ -2,8 +2,10 @@ try:
     # Dev imports
     from IPython import embed
 except ImportError:
+
     def embed(*args, **kwargs):
         print("IPython not available.")
+
     pass
 
 
@@ -17,6 +19,7 @@ from subprocess import Popen, PIPE, STDOUT
 import pathlib
 from dataclasses import dataclass
 import inspect
+
 # http://docs.python.org/library/threading.html#rlock-objects
 from threading import RLock
 
@@ -27,9 +30,9 @@ def idem(x):
 
 def boolsh(some_bool):
     if some_bool:
-        return 'y'
+        return "y"
     else:
-        return ''
+        return ""
 
 
 @dataclass(frozen=True)
@@ -43,7 +46,7 @@ class CmdResult:
     @property
     def outrs(self):
         """ out.rstrip('\\n') """
-        return self.out.rstrip('\n')
+        return self.out.rstrip("\n")
 
     @property
     def summary(self):
@@ -55,7 +58,7 @@ class CmdResult:
 
     @property
     def longstr(self):
-        r = ''
+        r = ""
         if self.cmd_stdin:
             r += f"""\ncmd_stdin:\n{self.cmd_stdin}"""
         r += f"""\ncmd: {self.cmd}"""
@@ -72,10 +75,10 @@ class CmdResult:
 
     def __iter__(self):
         # return iter(self.toTuple())
-        return iter(self.outrs.split('\n'))
+        return iter(self.outrs.split("\n"))
 
     def iter0(self):
-        return iter(self.out.rstrip('\x00').split('\x00'))
+        return iter(self.out.rstrip("\x00").split("\x00"))
 
     # def __getitem__(self, index):
     #     return self.toTuple()[index]
@@ -91,13 +94,16 @@ class Brish:
     """Brish is a bridge between Python and an interpreter. The interpreter needs to adhere to the Brish protocol. A zsh interpreter is provided, and is the default. Threadsafe."""
 
     # MARKER = '\x00BRISH_MARKER'
-    MARKER = '\x00'
+    MARKER = "\x00"
 
     def __init__(self, defaultShell=None, boot_cmd=None):
         self.lock = RLock()
         self.boot_cmd = boot_cmd
-        self.defaultShell = defaultShell or [str(pathlib.Path(
-            __file__).parent / 'brish.zsh'), "--", "BR" + "I"*2048 + "SH"]  # Reserve big argv for `insubshell`
+        self.defaultShell = defaultShell or [
+            str(pathlib.Path(__file__).parent / "brish.zsh"),
+            "--",
+            "BR" + "I" * 2048 + "SH",
+        ]  # Reserve big argv for `insubshell`
         self.lastShell = self.defaultShell
         self.p = None
         self.init()
@@ -107,8 +113,9 @@ class Brish:
             if shell is None:
                 shell = self.defaultShell
             self.lastShell = shell
-            self.p = Popen(shell, stdin=PIPE, stdout=PIPE, stderr=PIPE,
-                           universal_newlines=True)  # decode output as utf-8, newline is '\n'
+            self.p = Popen(
+                shell, stdin=PIPE, stdout=PIPE, stderr=PIPE, universal_newlines=True
+            )  # decode output as utf-8, newline is '\n'
             if self.boot_cmd is not None:
                 return self.send_cmd(self.boot_cmd, fork=False)
 
@@ -119,9 +126,11 @@ class Brish:
 
     def zsh_quote(self, obj, use_shared_instance=True, retry_count=0, retry_limit=10):
         if obj is None:
-            return ''
+            return ""
 
-        if use_shared_instance: # protects against accidentally reading output from previously running processes (background jobs)
+        if (
+            use_shared_instance
+        ):  # protects against accidentally reading output from previously running processes (background jobs)
             # @perf perhaps using a specialized routine might be faster, or just calling =zsh -f=
             self = _shared_brish
 
@@ -133,15 +142,24 @@ class Brish:
             for i in iter(obj):
                 # zsh doesn't support nested arrays, so we str the inner object.
                 result.append(self.zsh_quote(str(i)))
-            return ' '.join(result)
+            return " ".join(result)
         else:
-            res = self.send_cmd('print -rn -- "${(q+@)brish_stdin}"', cmd_stdin=str(obj))
+            res = self.send_cmd(
+                'print -rn -- "${(q+@)brish_stdin}"', cmd_stdin=str(obj)
+            )
             if res:
                 return res.out
             elif retry_count < retry_limit:
-                return self.zsh_quote(obj, use_shared_instance=use_shared_instance, retry_count=(retry_count + 1), retry_limit=retry_limit)
+                return self.zsh_quote(
+                    obj,
+                    use_shared_instance=use_shared_instance,
+                    retry_count=(retry_count + 1),
+                    retry_limit=retry_limit,
+                )
             else:
-                raise Exception(f"Quoting object {repr(obj)} failed; CmdResult:\n{res.longstr}")
+                raise Exception(
+                    f"Quoting object {repr(obj)} failed; CmdResult:\n{res.longstr}"
+                )
 
     def send_cmd(self, cmd: str, cmd_stdin="", fork=False):
         with self.lock:
@@ -151,12 +169,26 @@ class Brish:
                 self.restart()
                 return CmdResult(0, "Restarted succesfully.", "", cmd, cmd_stdin)
             if any(self.MARKER in input for input in (cmd, cmd_stdin)):
-                return CmdResult(9000, "", "Illegal input: Input contained the Brish marker (currently the NUL character).", cmd, cmd_stdin)
-            delim = self.MARKER + '\n'
+                return CmdResult(
+                    9000,
+                    "",
+                    "Illegal input: Input contained the Brish marker (currently the NUL character).",
+                    cmd,
+                    cmd_stdin,
+                )
+            delim = self.MARKER + "\n"
             if self.p is None:
                 self.init()
-            print(cmd + self.MARKER + cmd_stdin + self.MARKER +
-                  boolsh(fork) + self.MARKER, file=self.p.stdin, flush=True)
+            print(
+                cmd
+                + self.MARKER
+                + cmd_stdin
+                + self.MARKER
+                + boolsh(fork)
+                + self.MARKER,
+                file=self.p.stdin,
+                flush=True,
+            )
             stdout = ""
             # embed()
             for line in iter(self.p.stdout.readline, delim):
@@ -180,7 +212,7 @@ class Brish:
             self.p.wait()
             self.p = None
 
-    _conversions = {'a': ascii, 'r': repr, 's': str, 'e': idem, 'b': boolsh}
+    _conversions = {"a": ascii, "r": repr, "s": str, "e": idem, "b": boolsh}
 
     def zstring_old(self, template, locals_=None):
         # DEPRECATED
@@ -206,10 +238,10 @@ class Brish:
                 value = format(value, format_spec)
             else:
                 value = str(value)
-            if conversion != 'e':
+            if conversion != "e":
                 value = self.zsh_quote(value)
             result.append(value)
-        cmd = ''.join(result)
+        cmd = "".join(result)
         return cmd
 
     def zstring(self, template, locals_=None, getframe=1):
@@ -217,8 +249,7 @@ class Brish:
             try:
                 previous_frame = sys._getframe(getframe)
                 previous_frame_locals = previous_frame.f_locals
-                locals_ = dict(previous_frame.f_globals,
-                               **previous_frame_locals)
+                locals_ = dict(previous_frame.f_globals, **previous_frame_locals)
                 # https://stackoverflow.com/questions/1041639/get-a-dict-of-all-variables-currently-in-scope-and-their-values
                 # We will still miss the closure variables.
             except:
@@ -227,17 +258,20 @@ class Brish:
 
         def asteval(astNode):
             if astNode is not None:
-                return eval(compile(ast.Expression(astNode), filename='<string>', mode='eval'), locals_)
+                return eval(
+                    compile(ast.Expression(astNode), filename="<string>", mode="eval"),
+                    locals_,
+                )
             else:
                 return None
 
         def eatFormat(format_spec, code):
             res = False
             if format_spec:
-                flags = format_spec.split(':')
+                flags = format_spec.split(":")
                 res = code in flags
                 format_spec = list(filter(lambda a: a != code, flags))
-            return ':'.join(format_spec), res
+            return ":".join(format_spec), res
 
         p = ast.parse(f"f''' {template} '''")  # The whitespace is necessary
         result = []
@@ -263,10 +297,10 @@ class Brish:
                 #     value = self.zsh_quote(value)
                 # embed()
 
-                format_spec = asteval(part.format_spec) or ''
+                format_spec = asteval(part.format_spec) or ""
                 # print(f"orig format: {format_spec}")
-                format_spec, fmt_eval = eatFormat(format_spec, 'e')
-                format_spec, fmt_bool = eatFormat(format_spec, 'bool')
+                format_spec, fmt_eval = eatFormat(format_spec, "e")
+                format_spec, fmt_bool = eatFormat(format_spec, "bool")
                 # print(f"format: {format_spec}")
                 if format_spec:
                     value = format(value, format_spec)
@@ -277,19 +311,24 @@ class Brish:
                     value = self.zsh_quote(value)
                 value = str(value)
                 result.append(value)
-        cmd = ''.join(result)
+        cmd = "".join(result)
         return cmd
 
     def z(self, template, locals_=None, getframe=2, *args, **kwargs):
-        return self.send_cmd(self.zstring(template, locals_=locals_, getframe=getframe), *args, **kwargs)
+        return self.send_cmd(
+            self.zstring(template, locals_=locals_, getframe=getframe), *args, **kwargs
+        )
 
     def zp(self, *args, getframe=3, **kwargs):
         res = self.z(*args, getframe=getframe, **kwargs)
-        print(res.outerr, end='', flush=True)
+        print(res.outerr, end="", flush=True)
         return res
 
     # Aliases
     c = send_cmd
     zq = zsh_quote
 
-_shared_brish = Brish() # Any identifier of the form __spam (at least two leading underscores, at most one trailing underscore) is textually replaced with _classname__spam, so we can't use it in Brish if we use two underscores.
+
+_shared_brish = (
+    Brish()
+)  # Any identifier of the form __spam (at least two leading underscores, at most one trailing underscore) is textually replaced with _classname__spam, so we can't use it in Brish if we use two underscores.
