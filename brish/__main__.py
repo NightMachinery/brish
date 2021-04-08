@@ -22,5 +22,5 @@ b = "$NIGHTDIR"
 a = 12
 
 zs = bsh.zstring
-print('wow')
+print('wow hi')
 embed()

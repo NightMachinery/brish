@@ -10,6 +10,9 @@ except ImportError:
 
 
 import sys
+import os
+import shutil
+import tempfile
 from collections.abc import Iterable
 import ast
 from string import Formatter
@@ -100,7 +103,7 @@ class Brish:
         self.lock = RLock()
         self.boot_cmd = boot_cmd
         self.defaultShell = defaultShell or [
-            str(pathlib.Path(__file__).parent / "brish.zsh"),
+            str(pathlib.Path(__file__).parent / "brish2.zsh"),
             "--",
             "BR" + "I" * 2048 + "SH",
         ]  # Reserve big argv for `insubshell`
@@ -112,10 +115,41 @@ class Brish:
         with self.lock:
             if shell is None:
                 shell = self.defaultShell
+
             self.lastShell = shell
+
+            tmpdir = tempfile.mkdtemp()
+
+            brish_stdin_path = os.path.join(tmpdir, "brish_stdin")
+            brish_stdout_path = os.path.join(tmpdir, "brish_stdout")
+            brish_stderr_path = os.path.join(tmpdir, "brish_stderr")
+            os.mkfifo(brish_stdin_path)
+            os.mkfifo(brish_stdout_path)
+            os.mkfifo(brish_stderr_path)
+
             self.p = Popen(
-                shell, stdin=PIPE, stdout=PIPE, stderr=PIPE, universal_newlines=True
+                shell,
+                stdin=PIPE,
+                stdout=PIPE,
+                stderr=PIPE,
+                env=dict(
+                    os.environ,
+                    BRISH_STDIN=brish_stdin_path,
+                    BRISH_STDOUT=brish_stdout_path,
+                    BRISH_STDERR=brish_stderr_path,
+                ),
+                universal_newlines=True,
             )  # decode output as utf-8, newline is '\n'
+            self.p.tmpdir = tmpdir
+            self.p.brish_stdin_path = brish_stdin_path
+            self.p.brish_stdout_path = brish_stdout_path
+            self.p.brish_stderr_path = brish_stderr_path
+            self.p.brish_stdin = open(self.p.brish_stdin_path, "w")
+
+            self.p.brish_stdout = open(self.p.brish_stdout_path, "r")
+
+            self.p.brish_stderr = open(self.p.brish_stderr_path, "r")
+
             if self.boot_cmd is not None:
                 return self.send_cmd(self.boot_cmd, fork=False)
 
@@ -186,17 +220,17 @@ class Brish:
                 + self.MARKER
                 + boolsh(fork)
                 + self.MARKER,
-                file=self.p.stdin,
+                file=self.p.brish_stdin,
                 flush=True,
             )
             stdout = ""
             # embed()
-            for line in iter(self.p.stdout.readline, delim):
+            for line in iter(self.p.brish_stdout.readline, delim):
                 stdout += line
             stdout = stdout[:-1]
-            return_code = int(self.p.stdout.readline())
+            return_code = int(self.p.brish_stdout.readline())
             stderr = ""
-            for line in iter(self.p.stderr.readline, delim):
+            for line in iter(self.p.brish_stderr.readline, delim):
                 stderr += line
             stderr = stderr[:-1]
             return CmdResult(return_code, stdout, stderr, cmd, cmd_stdin)
@@ -209,6 +243,12 @@ class Brish:
             if self.p.stderr:
                 self.p.stderr.close()
             self.p.stdin.close()
+
+            self.p.brish_stdin.close()
+            self.p.brish_stdout.close()
+            self.p.brish_stderr.close()
+            shutil.rmtree(self.p.tmpdir)
+
             self.p.wait()
             self.p = None
 
