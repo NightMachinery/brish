@@ -118,6 +118,7 @@ class Brish:
                 shell = self.defaultShell
 
             self.lastShell = shell
+            self.last_server_count = server_count
 
             tmpdir = tempfile.mkdtemp()
 
@@ -179,7 +180,7 @@ class Brish:
     def restart(self):
         with self.lock:
             self.cleanup()
-            self.init(shell=self.lastShell)
+            self.init(shell=self.lastShell, server_count=self.last_server_count)
 
     def zsh_quote(self, obj, use_shared_instance=True, retry_count=0, retry_limit=10):
         if obj is None:
@@ -218,7 +219,8 @@ class Brish:
                     f"Quoting object {repr(obj)} failed; CmdResult:\n{res.longstr}"
                 )
 
-    def send_cmd(self, cmd: str, cmd_stdin="", fork=False, server_index=None, lock_sleep=1):
+
+    def acquire_lock(self, server_index=None, lock_sleep=1):
         lock = None
         if server_index == None:
             acquired = False
@@ -245,6 +247,11 @@ class Brish:
             lock = self.locks[server_index]
             lock.acquire()
 
+        return lock, server_index
+
+
+    def send_cmd(self, cmd: str, cmd_stdin="", fork=False, server_index=None, lock_sleep=1):
+        lock, server_index = self.acquire_lock(server_index=server_index, lock_sleep=lock_sleep)
         try:
             self.p.free_server_count -= 1
             cmd_stdin = str(cmd_stdin)

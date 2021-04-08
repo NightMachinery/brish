@@ -1,0 +1,33 @@
+#+TITLE: Private
+
+* eva
+** brish-0.2.9
+#+begin_example
+❯ hfd 'brishz.dash "ec hi"'
+
+Benchmark #1: brishz.dash "ec hi"
+  Time (mean ± σ):      46.4 ms ±  31.2 ms    [User: 5.9 ms, System: 7.9 ms]
+  Range (min … max):    17.4 ms … 207.5 ms    78 runs
+#+end_example
+** brish-0.3.1
+#+begin_example
+❯ hfd 'brishz.dash "ec hi"'
+Benchmark #1: brishz.dash "ec hi"
+  Time (mean ± σ):      24.3 ms ±  10.6 ms    [User: 6.1 ms, System: 7.5 ms]
+  Range (min … max):    16.8 ms …  87.5 ms    148 runs
+#+end_example
+* zii
+** brish-0.2.9
+#+begin_example
+❯ hfd 'brishz.dash "ec hi"'
+Benchmark #1: brishz.dash "ec hi"
+  Time (mean ± σ):      25.5 ms ±  11.6 ms    [User: 5.2 ms, System: 6.3 ms]
+  Range (min … max):    13.6 ms …  90.4 ms    134 runs
+#+end_example
+** brish-0.3.1
+#+begin_example
+❯ hfd 'brishz.dash "ec hi"'
+Benchmark #1: brishz.dash "ec hi"
+  Time (mean ± σ):      20.6 ms ±   9.5 ms    [User: 5.2 ms, System: 5.3 ms]
+  Range (min … max):    12.7 ms …  71.2 ms    82 runs
+#+end_example
