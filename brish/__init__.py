@@ -1,5 +1,5 @@
 from .brishmod import *
-bsh = Brish()
+bsh = Brish(server_count=4)
 z = bsh.z
 zp = bsh.zp
 zq = bsh.zsh_quote

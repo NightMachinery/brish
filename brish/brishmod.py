@@ -99,7 +99,7 @@ class Brish:
     # MARKER = '\x00BRISH_MARKER'
     MARKER = "\x00"
 
-    def __init__(self, defaultShell=None, boot_cmd=None):
+    def __init__(self, defaultShell=None, boot_cmd=None, **kwargs):
         self.lock = RLock()
         self.boot_cmd = boot_cmd
         self.defaultShell = defaultShell or [
@@ -109,9 +109,9 @@ class Brish:
         ]  # Reserve big argv for `insubshell`
         self.lastShell = self.defaultShell
         self.p = None
-        self.init()
+        self.init(**kwargs)
 
-    def init(self, shell=None, server_count=4):
+    def init(self, shell=None, server_count=1):
         with self.lock:
             if shell is None:
                 shell = self.defaultShell
@@ -120,13 +120,22 @@ class Brish:
 
             tmpdir = tempfile.mkdtemp()
 
-            brish_stdin_paths = [os.path.join(tmpdir, f"brish_{i}_stdin") for i in range(server_count)]
-            brish_stdout_paths = [os.path.join(tmpdir, f"brish_{i}_stdout") for i in range(server_count)]
-            brish_stderr_paths = [os.path.join(tmpdir, f"brish_{i}_stderr") for i in range(server_count)]
+            assert server_count >= 1
+            self.locks = [RLock() for i in range(server_count)]
+            brish_stdin_paths = [
+                os.path.join(tmpdir, f"brish_{i}_stdin") for i in range(server_count)
+            ]
+            brish_stdout_paths = [
+                os.path.join(tmpdir, f"brish_{i}_stdout") for i in range(server_count)
+            ]
+            brish_stderr_paths = [
+                os.path.join(tmpdir, f"brish_{i}_stderr") for i in range(server_count)
+            ]
             brish_stdins = [os.mkfifo(p) for p in brish_stdin_paths]
             brish_stdouts = [os.mkfifo(p) for p in brish_stdout_paths]
             brish_stderrs = [os.mkfifo(p) for p in brish_stderr_paths]
 
+            # @todo1 do not use the env vars for settings the pipe paths
             self.p = Popen(
                 shell,
                 stdin=PIPE,
@@ -134,9 +143,9 @@ class Brish:
                 stderr=PIPE,
                 env=dict(
                     os.environ,
-                    BRISH_STDIN='\n'.join(brish_stdin_paths),
-                    BRISH_STDOUT='\n'.join(brish_stdout_paths),
-                    BRISH_STDERR='\n'.join(brish_stderr_paths),
+                    BRISH_STDIN="\n".join(brish_stdin_paths),
+                    BRISH_STDOUT="\n".join(brish_stdout_paths),
+                    BRISH_STDERR="\n".join(brish_stderr_paths),
                 ),
                 universal_newlines=True,
             )  # decode output as utf-8, newline is '\n'
@@ -150,7 +159,10 @@ class Brish:
             self.p.brish_stderrs = [open(p, "r") for p in self.p.brish_stderr_paths]
 
             if self.boot_cmd is not None:
-                return [self.send_cmd(self.boot_cmd, fork=False, server_index=i) for i in range(server_count)]
+                return [
+                    self.send_cmd(self.boot_cmd, fork=False, server_index=i)
+                    for i in range(server_count)
+                ]
 
     def restart(self):
         with self.lock:
@@ -194,8 +206,26 @@ class Brish:
                     f"Quoting object {repr(obj)} failed; CmdResult:\n{res.longstr}"
                 )
 
-    def send_cmd(self, cmd: str, cmd_stdin="", fork=False, server_index=0):
-        with self.lock:
+    def send_cmd(self, cmd: str, cmd_stdin="", fork=False, server_index=None):
+        lock = None
+        if server_index == None:
+            acquired = False
+            for i, c_lock in enumerate(self.locks):
+                acquired = c_lock.acquire(blocking=False)
+                # https://docs.python.org/3/library/threading.html#threading.Lock.acquire
+
+                if acquired == True:
+                    lock = c_lock
+                    server_index = i
+                    break
+            if acquired == False:
+                server_index = random.randrange(self.p.server_count)
+
+        if lock == None:
+            lock = self.locks[server_index]
+            lock.acquire()
+
+        try:
             cmd_stdin = str(cmd_stdin)
             # assert  isinstance(cmd, str)
             if cmd == "%BRISH_RESTART":
@@ -233,29 +263,39 @@ class Brish:
                 stderr += line
             stderr = stderr[:-1]
             return CmdResult(return_code, stdout, stderr, cmd, cmd_stdin)
+        finally:
+            lock.release()
 
     def cleanup(self):
         with self.lock:
-            if self.p is None:
-                return
-            self.p.stdout.close()
-            if self.p.stderr:
-                self.p.stderr.close()
-            self.p.stdin.close()
+            locks = self.locks
+            for lock in locks:
+                lock.acquire()
+            try:
+                if self.p is None:
+                    return
+                self.p.stdout.close()
+                if self.p.stderr:
+                    self.p.stderr.close()
+                self.p.stdin.close()
 
-            for p in self.p.brish_stdins:
-                p.close()
+                for p in self.p.brish_stdins:
+                    p.close()
 
-            for p in self.p.brish_stdouts:
-                p.close()
+                for p in self.p.brish_stdouts:
+                    p.close()
 
-            for p in self.p.brish_stderrs:
-                p.close()
+                for p in self.p.brish_stderrs:
+                    p.close()
 
-            shutil.rmtree(self.p.tmpdir)
+                shutil.rmtree(self.p.tmpdir)
 
-            self.p.wait()
-            self.p = None
+                self.p.wait()
+                self.p = None
+                self.locks = []
+            finally:
+                for lock in locks:
+                    lock.release()
 
     _conversions = {"a": ascii, "r": repr, "s": str, "e": idem, "b": boolsh}
 
