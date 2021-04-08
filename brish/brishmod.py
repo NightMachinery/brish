@@ -111,7 +111,7 @@ class Brish:
         self.p = None
         self.init()
 
-    def init(self, shell=None):
+    def init(self, shell=None, server_count=4):
         with self.lock:
             if shell is None:
                 shell = self.defaultShell
@@ -120,12 +120,12 @@ class Brish:
 
             tmpdir = tempfile.mkdtemp()
 
-            brish_stdin_path = os.path.join(tmpdir, "brish_stdin")
-            brish_stdout_path = os.path.join(tmpdir, "brish_stdout")
-            brish_stderr_path = os.path.join(tmpdir, "brish_stderr")
-            os.mkfifo(brish_stdin_path)
-            os.mkfifo(brish_stdout_path)
-            os.mkfifo(brish_stderr_path)
+            brish_stdin_paths = [os.path.join(tmpdir, f"brish_{i}_stdin") for i in range(server_count)]
+            brish_stdout_paths = [os.path.join(tmpdir, f"brish_{i}_stdout") for i in range(server_count)]
+            brish_stderr_paths = [os.path.join(tmpdir, f"brish_{i}_stderr") for i in range(server_count)]
+            brish_stdins = [os.mkfifo(p) for p in brish_stdin_paths]
+            brish_stdouts = [os.mkfifo(p) for p in brish_stdout_paths]
+            brish_stderrs = [os.mkfifo(p) for p in brish_stderr_paths]
 
             self.p = Popen(
                 shell,
@@ -134,24 +134,23 @@ class Brish:
                 stderr=PIPE,
                 env=dict(
                     os.environ,
-                    BRISH_STDIN=brish_stdin_path,
-                    BRISH_STDOUT=brish_stdout_path,
-                    BRISH_STDERR=brish_stderr_path,
+                    BRISH_STDIN='\n'.join(brish_stdin_paths),
+                    BRISH_STDOUT='\n'.join(brish_stdout_paths),
+                    BRISH_STDERR='\n'.join(brish_stderr_paths),
                 ),
                 universal_newlines=True,
             )  # decode output as utf-8, newline is '\n'
             self.p.tmpdir = tmpdir
-            self.p.brish_stdin_path = brish_stdin_path
-            self.p.brish_stdout_path = brish_stdout_path
-            self.p.brish_stderr_path = brish_stderr_path
-            self.p.brish_stdin = open(self.p.brish_stdin_path, "w")
-
-            self.p.brish_stdout = open(self.p.brish_stdout_path, "r")
-
-            self.p.brish_stderr = open(self.p.brish_stderr_path, "r")
+            self.p.server_count = server_count
+            self.p.brish_stdin_paths = brish_stdin_paths
+            self.p.brish_stdout_paths = brish_stdout_paths
+            self.p.brish_stderr_paths = brish_stderr_paths
+            self.p.brish_stdins = [open(p, "w") for p in self.p.brish_stdin_paths]
+            self.p.brish_stdouts = [open(p, "r") for p in self.p.brish_stdout_paths]
+            self.p.brish_stderrs = [open(p, "r") for p in self.p.brish_stderr_paths]
 
             if self.boot_cmd is not None:
-                return self.send_cmd(self.boot_cmd, fork=False)
+                return [self.send_cmd(self.boot_cmd, fork=False, server_index=i) for i in range(server_count)]
 
     def restart(self):
         with self.lock:
@@ -195,7 +194,7 @@ class Brish:
                     f"Quoting object {repr(obj)} failed; CmdResult:\n{res.longstr}"
                 )
 
-    def send_cmd(self, cmd: str, cmd_stdin="", fork=False):
+    def send_cmd(self, cmd: str, cmd_stdin="", fork=False, server_index=0):
         with self.lock:
             cmd_stdin = str(cmd_stdin)
             # assert  isinstance(cmd, str)
@@ -220,17 +219,17 @@ class Brish:
                 + self.MARKER
                 + boolsh(fork)
                 + self.MARKER,
-                file=self.p.brish_stdin,
+                file=self.p.brish_stdins[server_index],
                 flush=True,
             )
             stdout = ""
             # embed()
-            for line in iter(self.p.brish_stdout.readline, delim):
+            for line in iter(self.p.brish_stdouts[server_index].readline, delim):
                 stdout += line
             stdout = stdout[:-1]
-            return_code = int(self.p.brish_stdout.readline())
+            return_code = int(self.p.brish_stdouts[server_index].readline())
             stderr = ""
-            for line in iter(self.p.brish_stderr.readline, delim):
+            for line in iter(self.p.brish_stderrs[server_index].readline, delim):
                 stderr += line
             stderr = stderr[:-1]
             return CmdResult(return_code, stdout, stderr, cmd, cmd_stdin)
@@ -244,9 +243,15 @@ class Brish:
                 self.p.stderr.close()
             self.p.stdin.close()
 
-            self.p.brish_stdin.close()
-            self.p.brish_stdout.close()
-            self.p.brish_stderr.close()
+            for p in self.p.brish_stdins:
+                p.close()
+
+            for p in self.p.brish_stdouts:
+                p.close()
+
+            for p in self.p.brish_stderrs:
+                p.close()
+
             shutil.rmtree(self.p.tmpdir)
 
             self.p.wait()
