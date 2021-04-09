@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "brish"
-version = "0.3.2"
+version = "0.3.3"
 description = "A bridge between zsh and Python."
 authors = ["NightMachinary <rudiwillalwaysloveyou@gmail.com>"]
 exclude = ["__pycache__"]
@@ -13,6 +13,7 @@ icecream = "^2.1.0"
 pytest = "==6.*,>=5.2.0"
 IPython = ">6" # Dev
 ipydex = "==0.*,>=0.10.5"
+
 
 
 
