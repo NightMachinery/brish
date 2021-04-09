@@ -23,6 +23,7 @@ from subprocess import Popen, PIPE, STDOUT
 import pathlib
 from dataclasses import dataclass
 import inspect
+from icecream import ic
 
 # http://docs.python.org/library/threading.html#rlock-objects
 from threading import RLock
@@ -94,6 +95,9 @@ class CmdResult:
         return self.retcode == 0
 
 
+class UninitializedBrishException(Exception):
+    pass
+
 class Brish:
     """Brish is a bridge between Python and an interpreter. The interpreter needs to adhere to the Brish protocol. A zsh interpreter is provided, and is the default. Threadsafe."""
 
@@ -142,22 +146,19 @@ class Brish:
                 stdin=PIPE,
                 stdout=PIPE,
                 stderr=PIPE,
-                env=dict(
-                    os.environ,
-                ),
+                env=dict(os.environ,),
                 universal_newlines=True,
             )  # decode output as utf-8, newline is '\n'
-            BRISH_STDIN="\n".join(brish_stdin_paths)
-            BRISH_STDOUT="\n".join(brish_stdout_paths)
-            BRISH_STDERR="\n".join(brish_stderr_paths)
+            BRISH_STDIN = "\n".join(brish_stdin_paths)
+            BRISH_STDOUT = "\n".join(brish_stdout_paths)
+            BRISH_STDERR = "\n".join(brish_stderr_paths)
             print(
                 BRISH_STDIN
                 + self.MARKER
                 + BRISH_STDOUT
                 + self.MARKER
                 + BRISH_STDERR
-                + self.MARKER
-                ,
+                + self.MARKER,
                 file=self.p.stdin,
                 flush=True,
             )
@@ -219,39 +220,60 @@ class Brish:
                     f"Quoting object {repr(obj)} failed; CmdResult:\n{res.longstr}"
                 )
 
-
     def acquire_lock(self, server_index=None, lock_sleep=1):
-        lock = None
-        if server_index == None:
-            acquired = False
-            while acquired == False:
-                for i, c_lock in enumerate(self.locks):
-                    acquired = c_lock.acquire(blocking=False)
-                    # https://docs.python.org/3/library/threading.html#threading.Lock.acquire
+        while True:
+            if self.p is None:
+                # self.restart()
+                raise UninitializedBrishException("acquire_lock called with an uninitialized Brish")
 
-                    if acquired == True:
-                        lock = c_lock
-                        server_index = i
-                        break
+            assert len(self.locks) >= 1
+            current_p = self.p
+            lock = None
+            if server_index == None:
+                acquired = False
+                while acquired == False:
+                    for i, c_lock in enumerate(self.locks):
+                        acquired = c_lock.acquire(blocking=False)
+                        # https://docs.python.org/3/library/threading.html#threading.Lock.acquire
+
+                        if acquired == True:
+                            lock = c_lock
+                            server_index = i
+                            break
+
+                    if acquired == False:
+                        if lock_sleep != None:
+                            time.sleep(lock_sleep)
+                        else:
+                            break
 
                 if acquired == False:
-                    if lock_sleep != None:
-                        time.sleep(lock_sleep)
-                    else:
-                        break
+                    # server_index = random.randrange(self.p.server_count)
+                    server_index = random.randrange(len(self.locks))
 
-            if acquired == False:
-                server_index = random.randrange(self.p.server_count)
+            if lock == None:
+                try:
+                    lock = self.locks[server_index]
+                except:
+                    ic(len(self.locks), server_index)
+                    time.sleep(1)
+                    continue
 
-        if lock == None:
-            lock = self.locks[server_index]
-            lock.acquire()
+                lock.acquire()
 
-        return lock, server_index
+            ##
+            # f1 is f2 checks if two references are to the same object. Under the hood, this compares the results of id(f1) == id(f2) using the id builtin function, which returns a integer that's guaranteed unique to the object (but only within the object's lifetime).
+            # Under CPython, this integer happens to be the address of the object in memory, though the docs mention you should pretend you don't know that (since other implementation may have other methods of generating the id).
+            if self.p == current_p:
+                # since we have acquired a lock, self.p can no longer change so there is no race condition anymore
+                return lock, server_index
 
-
-    def send_cmd(self, cmd: str, cmd_stdin="", fork=False, server_index=None, lock_sleep=1):
-        lock, server_index = self.acquire_lock(server_index=server_index, lock_sleep=lock_sleep)
+    def send_cmd(
+        self, cmd: str, cmd_stdin="", fork=False, server_index=None, lock_sleep=1
+    ):
+        lock, server_index = self.acquire_lock(
+            server_index=server_index, lock_sleep=lock_sleep
+        )
         try:
             self.p.free_server_count -= 1
             cmd_stdin = str(cmd_stdin)
@@ -268,8 +290,6 @@ class Brish:
                     cmd_stdin,
                 )
             delim = self.MARKER + "\n"
-            if self.p is None:
-                self.init()
             print(
                 cmd
                 + self.MARKER

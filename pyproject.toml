@@ -7,6 +7,7 @@ exclude = ["__pycache__"]
 
 [tool.poetry.dependencies]
 python = "==3.*,>=3.7.0"
+icecream = "^2.1.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "==6.*,>=5.2.0"
