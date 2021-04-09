@@ -267,6 +267,9 @@ class Brish:
             if self.p == current_p:
                 # since we have acquired a lock, self.p can no longer change so there is no race condition anymore
                 return lock, server_index
+            else:
+                lock.release()
+                continue
 
     def send_cmd(
         self, cmd: str, cmd_stdin="", fork=False, server_index=None, lock_sleep=1
