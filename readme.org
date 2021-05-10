@@ -508,11 +508,284 @@ But the boot_cmd has run in the restarted instance, too: /Users/evar/tmp
 
 ~Brish~ is threadsafe. I have built [[https://github.com/NightMachinary/BrishGarden][BrishGarden]] on top of ~Brish~ to provide an HTTP REST API for executing zsh code (if wanted, in sessions). Using ~BrishGarden~, you can embed ~zsh~ in pretty much any programming language, and pay no cost whatsoever for its startup. It can also function as a remote code executor.
 
+**** Parallel execution using =server_count=
+=server_count= allows the underlying =zsh= instance of a =Brish= object to fork that many times, and so serve that many clients in parallel. This will not increase the startup time, as the forking happens after loading the =zsh= interpreter completely.
+
+I have combined this with =GNU parallel= to easily parallelize my =zsh= functions.
+
+#+begin_src python :session p1 :results output :exports both
+n = 32
+my_parallel_brish = Brish(server_count=n)
+
+import logging
+import threading
+import time
+
+def thread_function(name):
+    logging.info("Thread %s: starting", name)
+    my_parallel_brish.zp("echo Started {name} at $EPOCHREALTIME ; sleep 10 ; echo Finished {name} at $EPOCHREALTIME")
+    logging.info("Thread %s: finishing", name)
+
+if __name__ == "__main__":
+    format = "%(asctime)s: %(message)s"
+    logging.basicConfig(format=format, level=logging.INFO,
+                        datefmt="%H:%M:%S")
+
+    threads = list()
+    now = float(z("echo $EPOCHREALTIME").outrs)
+    for index in range(32):
+        logging.info("Main    : create and start thread %d.", index)
+        x = threading.Thread(target=thread_function, args=(index,))
+        threads.append(x)
+        x.start()
+
+    for index, thread in enumerate(threads):
+        logging.info("Main    : before joining thread %d.", index)
+        thread.join()
+        logging.info("Main    : thread %d done", index)
+
+    end = float(z("echo $EPOCHREALTIME").outrs)
+    print(f"Took {(end - now)}")
+
+
+
+
+#+end_src
+
+#+RESULTS:
+#+begin_example
+17:25:26: Main    : create and start thread 0.
+17:25:26: Thread 0: starting
+17:25:26: Main    : create and start thread 1.
+17:25:26: Thread 1: starting
+17:25:26: Main    : create and start thread 2.
+17:25:26: Thread 2: starting
+17:25:26: Main    : create and start thread 3.
+17:25:26: Thread 3: starting
+17:25:26: Main    : create and start thread 4.
+17:25:26: Thread 4: starting
+17:25:26: Main    : create and start thread 5.
+17:25:26: Thread 5: starting
+17:25:26: Main    : create and start thread 6.
+17:25:26: Thread 6: starting
+17:25:26: Main    : create and start thread 7.
+17:25:26: Thread 7: starting
+17:25:26: Main    : create and start thread 8.
+17:25:26: Thread 8: starting
+17:25:26: Main    : create and start thread 9.
+17:25:26: Thread 9: starting
+17:25:26: Main    : create and start thread 10.
+17:25:26: Thread 10: starting
+17:25:26: Main    : create and start thread 11.
+17:25:26: Thread 11: starting
+17:25:26: Main    : create and start thread 12.
+17:25:26: Thread 12: starting
+17:25:26: Main    : create and start thread 13.
+17:25:26: Thread 13: starting
+17:25:26: Main    : create and start thread 14.
+17:25:26: Thread 14: starting
+17:25:26: Main    : create and start thread 15.
+17:25:26: Thread 15: starting
+17:25:26: Main    : create and start thread 16.
+17:25:26: Thread 16: starting
+17:25:26: Main    : create and start thread 17.
+17:25:26: Thread 17: starting
+17:25:26: Main    : create and start thread 18.
+17:25:26: Thread 18: starting
+17:25:26: Main    : create and start thread 19.
+17:25:26: Thread 19: starting
+17:25:26: Main    : create and start thread 20.
+17:25:26: Thread 20: starting
+17:25:26: Main    : create and start thread 21.
+17:25:26: Thread 21: starting
+17:25:26: Main    : create and start thread 22.
+17:25:26: Thread 22: starting
+17:25:26: Main    : create and start thread 23.
+17:25:26: Thread 23: starting
+17:25:26: Main    : create and start thread 24.
+17:25:26: Thread 24: starting
+17:25:26: Main    : create and start thread 25.
+17:25:26: Thread 25: starting
+17:25:26: Main    : create and start thread 26.
+17:25:26: Thread 26: starting
+17:25:26: Main    : create and start thread 27.
+17:25:26: Thread 27: starting
+17:25:26: Main    : create and start thread 28.
+17:25:26: Thread 28: starting
+17:25:26: Main    : create and start thread 29.
+17:25:26: Thread 29: starting
+17:25:26: Main    : create and start thread 30.
+17:25:26: Thread 30: starting
+17:25:26: Main    : create and start thread 31.
+17:25:26: Thread 31: starting
+17:25:26: Main    : before joining thread 0.
+Started 0 at 1620651326.2126729488
+Finished 0 at 1620651336.2229239941
+17:25:36: Thread 0: finishing
+17:25:36: Main    : thread 0 done
+17:25:36: Main    : before joining thread 1.
+Started 1 at 1620651327.2022259235
+Finished 1 at 1620651337.2120540142
+17:25:37: Thread 1: finishing
+17:25:37: Main    : thread 1 done
+17:25:37: Main    : before joining thread 2.
+Started 30 at 1620651327.2101778984
+Finished 30 at 1620651337.2140960693
+17:25:37: Thread 30: finishing
+Started 2 at 1620651328.2068090439
+Finished 2 at 1620651338.2182691097
+17:25:38: Thread 2: finishing
+17:25:38: Main    : thread 2 done
+17:25:38: Main    : before joining thread 3.
+Started 31 at 1620651328.2222359180
+Finished 31 at 1620651338.2338199615
+17:25:38: Thread 31: finishing
+Started 7 at 1620651329.2063989639
+Finished 7 at 1620651339.2115590572
+17:25:39: Thread 7: finishing
+Started 15 at 1620651330.2087130547
+Finished 15 at 1620651340.2192440033
+17:25:40: Thread 15: finishing
+Started 21 at 1620651331.2160348892
+Finished 21 at 1620651341.2246019840
+17:25:41: Thread 21: finishing
+Started 23 at 1620651332.2160398960
+Finished 23 at 1620651342.2200219631
+17:25:42: Thread 23: finishing
+Started 9 at 1620651333.2236700058
+Finished 9 at 1620651343.2359619141
+17:25:43: Thread 9: finishing
+Started 18 at 1620651334.2257950306
+Finished 18 at 1620651344.2365601063
+17:25:44: Thread 18: finishing
+Started 12 at 1620651335.2241439819
+Finished 12 at 1620651345.2335329056
+17:25:45: Thread 12: finishing
+Started 20 at 1620651336.2342200279
+Finished 20 at 1620651346.2429049015
+17:25:46: Thread 20: finishing
+Started 16 at 1620651337.4859669209
+Finished 16 at 1620651347.4899230003
+17:25:47: Thread 16: finishing
+Started 22 at 1620651338.2339038849
+Finished 22 at 1620651348.2375440598
+17:25:48: Thread 22: finishing
+Started 19 at 1620651339.2459530830
+Finished 19 at 1620651349.2504169941
+17:25:49: Thread 19: finishing
+Started 13 at 1620651340.2416980267
+Finished 13 at 1620651350.2485001087
+17:25:50: Thread 13: finishing
+Started 10 at 1620651340.2490129471
+Finished 10 at 1620651350.2568130493
+17:25:50: Thread 10: finishing
+Started 29 at 1620651341.2439520359
+Finished 29 at 1620651351.2504179478
+17:25:51: Thread 29: finishing
+Started 25 at 1620651342.2465701103
+Finished 25 at 1620651352.2498950958
+17:25:52: Thread 25: finishing
+Started 17 at 1620651343.2493131161
+Finished 17 at 1620651353.2571830750
+17:25:53: Thread 17: finishing
+Started 28 at 1620651344.2550890446
+Finished 28 at 1620651354.2586359978
+17:25:54: Thread 28: finishing
+Started 14 at 1620651345.2569661140
+Finished 14 at 1620651355.2659308910
+17:25:55: Thread 14: finishing
+Started 5 at 1620651346.2559928894
+Finished 5 at 1620651356.2631940842
+17:25:56: Thread 5: finishing
+Started 4 at 1620651347.2538421154
+Finished 4 at 1620651357.2619009018
+17:25:57: Thread 4: finishing
+Started 3 at 1620651347.2638580799
+Finished 3 at 1620651357.2686970234
+17:25:57: Thread 3: finishing
+17:25:57: Main    : thread 3 done
+17:25:57: Main    : before joining thread 4.
+17:25:57: Main    : thread 4 done
+17:25:57: Main    : before joining thread 5.
+17:25:57: Main    : thread 5 done
+17:25:57: Main    : before joining thread 6.
+Started 26 at 1620651348.2553079128
+Finished 26 at 1620651358.2628009319
+17:25:58: Thread 26: finishing
+Started 27 at 1620651348.2706210613
+Finished 27 at 1620651358.2781529427
+17:25:58: Thread 27: finishing
+Started 24 at 1620651349.2586579323
+Finished 24 at 1620651359.2646100521
+17:25:59: Thread 24: finishing
+Started 11 at 1620651350.2648739815
+Finished 11 at 1620651360.2702779770
+17:26:00: Thread 11: finishing
+Started 8 at 1620651351.2621378899
+Finished 8 at 1620651361.2658278942
+17:26:01: Thread 8: finishing
+Started 6 at 1620651352.4786870480
+Finished 6 at 1620651362.4896230698
+17:26:02: Thread 6: finishing
+17:26:02: Main    : thread 6 done
+17:26:02: Main    : before joining thread 7.
+17:26:02: Main    : thread 7 done
+17:26:02: Main    : before joining thread 8.
+17:26:02: Main    : thread 8 done
+17:26:02: Main    : before joining thread 9.
+17:26:02: Main    : thread 9 done
+17:26:02: Main    : before joining thread 10.
+17:26:02: Main    : thread 10 done
+17:26:02: Main    : before joining thread 11.
+17:26:02: Main    : thread 11 done
+17:26:02: Main    : before joining thread 12.
+17:26:02: Main    : thread 12 done
+17:26:02: Main    : before joining thread 13.
+17:26:02: Main    : thread 13 done
+17:26:02: Main    : before joining thread 14.
+17:26:02: Main    : thread 14 done
+17:26:02: Main    : before joining thread 15.
+17:26:02: Main    : thread 15 done
+17:26:02: Main    : before joining thread 16.
+17:26:02: Main    : thread 16 done
+17:26:02: Main    : before joining thread 17.
+17:26:02: Main    : thread 17 done
+17:26:02: Main    : before joining thread 18.
+17:26:02: Main    : thread 18 done
+17:26:02: Main    : before joining thread 19.
+17:26:02: Main    : thread 19 done
+17:26:02: Main    : before joining thread 20.
+17:26:02: Main    : thread 20 done
+17:26:02: Main    : before joining thread 21.
+17:26:02: Main    : thread 21 done
+17:26:02: Main    : before joining thread 22.
+17:26:02: Main    : thread 22 done
+17:26:02: Main    : before joining thread 23.
+17:26:02: Main    : thread 23 done
+17:26:02: Main    : before joining thread 24.
+17:26:02: Main    : thread 24 done
+17:26:02: Main    : before joining thread 25.
+17:26:02: Main    : thread 25 done
+17:26:02: Main    : before joining thread 26.
+17:26:02: Main    : thread 26 done
+17:26:02: Main    : before joining thread 27.
+17:26:02: Main    : thread 27 done
+17:26:02: Main    : before joining thread 28.
+17:26:02: Main    : thread 28 done
+17:26:02: Main    : before joining thread 29.
+17:26:02: Main    : thread 29 done
+17:26:02: Main    : before joining thread 30.
+17:26:02: Main    : thread 30 done
+17:26:02: Main    : before joining thread 31.
+17:26:02: Main    : thread 31 done
+Took 36.33210492134094
+#+end_example
+
 * Security considerations
 
 I am not a security expert, and security doesn't come by default in these situations. So be careful if you use untrusted input in the commands fed to zsh. Nevertheless, I can't imagine any (non-obvious) attack vectors, as the input gets automatically escaped by default. Feedback by security experts will be appreciated.
 
-Note that you can create security holes for yourself, by, e.g., `eval`ing user input:
+Note that you can create security holes for yourself, by, e.g., running =eval= on user input:
 
 #+begin_src python :session p1 :results value :exports both
 untrusted_input = " ; echo do evil | cat"
