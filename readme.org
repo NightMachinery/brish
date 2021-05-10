@@ -19,7 +19,7 @@ from brish import z, zp, Brish
 #+begin_src python :session p1 :results silent :exports none :tangle tests/test_tangled1.py
 NI = True
 #+end_src
-<64;35;16M
+
 #+begin_src python :session p1 :results silent :exports none
 NI = False
 #+end_src
@@ -31,7 +31,10 @@ z("echo Hello {name}")
 #+end_src
 
 #+RESULTS: t1
-<64;16;16M4;16;16M: Hello A$ron
+#+begin_example
+Hello A$ron
+#+end_example
+
 
 #+begin_src python :session p1 :var t1=t1 :results value :exports none :tangle tests/test_tangled1.py
 def test1():
@@ -41,7 +44,9 @@ NI or test1()
 #+end_src
 
 #+RESULTS:
-: True
+#+begin_example
+True
+#+end_example
 
 ~z~ automatically converts Python lists to shell lists:
 #+name: t2
@@ -51,10 +56,12 @@ z("for i in {alist} ; do echo $i ; done")
 #+end_src
 
 #+RESULTS: t2
-: # Fruits
-: 1. Orange
-: 2. Rambutan
-: 3. Strawberry
+#+begin_example
+# Fruits
+1. Orange
+2. Rambutan
+3. Strawberry
+#+end_example
 
 #+begin_src python :session p1 :var t2=t2 :results value :exports none :tangle tests/test_tangled1.py
 def test2():
@@ -66,7 +73,9 @@ NI or test2()
 #+end_src
 
 #+RESULTS:
-: None
+#+begin_example
+None
+#+end_example
 
 ~z~ returns a ~CmdResult~ (more about which later):
 
@@ -76,7 +85,9 @@ repr(res)
 #+end_src
 
 #+RESULTS:
-: CmdResult(retcode=0, out='2020\n', err='', cmd=' date +%Y ', cmd_stdin='')
+#+begin_example
+CmdResult(retcode=0, out='2021\n', err='', cmd=' date +%Y ', cmd_stdin='')
+#+end_example
 
 You can use ~zp~ as a shorthand for ~print(z(...).outerr, end='')~:
 
@@ -121,14 +132,15 @@ else:
 #+end_src
 
 #+RESULTS: t3
-: HOME exists!
+#+begin_example
+HOME exists!
+#+end_example
 
 #+begin_src python :session p1 :var t3=t3 :results value :exports none :tangle tests/test_tangled1.py
 assert t3 == "HOME exists!"
 #+end_src
 
 #+RESULTS:
-: None
 
 ~CmdResult~ is smart about iterating:
 #+name: t4
@@ -138,9 +150,34 @@ for path in z("command ls ~/tmp/"): # `command` helps bypass potential aliases d
 #+end_src
 
 #+RESULTS: t4
-: 260K	/Users/evar/tmp/a.png
-: 4.8M	/Users/evar/tmp/bug.mkv
-:   0B	/Users/evar/tmp/garden
+#+begin_example
+524K	/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/c01ed1a32d65c8d4ecb9095509e61f97
+524K	/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/36b77e6b3b7fde31f2fc4f182c0ecf82
+1.3M	/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/tumblr/dreamcorp420
+1.3M	/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/tumblr
+  0B	/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/34cc02221710caf309bff5ca96808d7a
+520K	/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/6cc3d153426e2b6d1ac0f3736aaf74a1
+2.9M	/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43
+  0B	/Users/evar/tmp/8826215ac0ed61d617906f658322fce7
+348K	/Users/evar/tmp/IMG_0396.PNG
+ 44K	/Users/evar/tmp/a2.jpg
+ 40K	/Users/evar/tmp/a4.jpg
+8.0K	/Users/evar/tmp/bills
+  0B	/Users/evar/tmp/garden
+468K	/Users/evar/tmp/image-14000213234237913.png
+ 40K	/Users/evar/tmp/photo_2021-05-08_00-35-24.jpg
+152K	/Users/evar/tmp/photo_2021-05-08_00-55-29.jpg
+8.0K	/Users/evar/tmp/tumblr
+4.0M	/Users/evar/tmp/tumblr_2c0ad7a3fba563996c9abaedc5e8d4f7_356ef3d9_1280.gif
+576K	/Users/evar/tmp/tumblr_5a2868650b058c42a7d141b8a2f474bc_eac04dc0_1280.jpg
+976K	/Users/evar/tmp/tumblr_5cc2e0e48418ec3c9eb200d151daf647_e44e419b_1280.jpg
+ 44K	/Users/evar/tmp/tumblr_6c90d77a676cf20fc096cc19220af4ab_e124dbec_540.gif.mp4
+  0B	/Users/evar/tmp/tumblr_70675efa5303a58292957ac942663309_f48499c2_1280.jpg
+4.0K	/Users/evar/tmp/tumblr_70675efa5303a58292957ac942663309_f48499c2_1280.jpg.aria2
+656K	/Users/evar/tmp/tumblr_bc2259b471f792065eb6707b7c29d27e_97f97d94_1280.jpg
+1.0M	/Users/evar/tmp/tumblr_ec36fde70ee0264cdc2f61f394181c61_575227e7_1280.jpg
+ 84K	/Users/evar/tmp/view.php
+#+end_example
 
 #+begin_src python :session p1 :results value :exports both
 res = z("""echo This is stdout
@@ -150,7 +187,9 @@ repr(res.out)
 #+end_src
 
 #+RESULTS:
-: This is stdout\n
+#+begin_example
+This is stdout\n
+#+end_example
 
 ~CmdResult.outrs~ strips the final newlines:
 
@@ -159,21 +198,27 @@ repr(res.outrs)
 #+end_src
 
 #+RESULTS:
-: This is stdout
+#+begin_example
+This is stdout
+#+end_example
 
 #+begin_src python :session p1 :results value :exports both
 repr(res.err)
 #+end_src
 
 #+RESULTS:
-: This is stderr\n
+#+begin_example
+This is stderr\n
+#+end_example
 
 #+begin_src python :session p1 :results value :exports both
 res.retcode
 #+end_src
 
 #+RESULTS:
-: 6
+#+begin_example
+6
+#+end_example
 
 #+begin_src python :session p1 :results value :exports both
 res.longstr
@@ -215,19 +260,21 @@ Cast: Anna Kendrick (Cinderella), Daniel Huttlestone (Jack), James Corden (Baker
 Runtime: 125.
 Country: United States.
 Language: English.
-Rating: 5.9 (129612 votes).
+Rating: 5.9 (134093 votes).
 Plot: A witch tasks a childless baker and his wife with procuring magical items from classic fairy tales to reverse the curse put on their family tree.
 #+end_example
 
-We can force a fork. This is useful to make your scripts more robusts.
+We can force a fork. This is useful to make your scripts more robust.
 #+begin_src python :session p1 :results output :exports both
 print(z("exit 7", fork=True).retcode)
 zp("echo 'Still alive!'")
 #+end_src
 
 #+RESULTS:
-: 7
-: Still alive!
+#+begin_example
+7
+Still alive!
+#+end_example
 
 Working with stdin:
 #+begin_src python :session p1 :results value :exports both
@@ -242,14 +289,18 @@ z("<<<{a} wc -l")
 #+end_src
 
 #+RESULTS:
-: 6
+#+begin_example
+6
+#+end_example
 
 #+begin_src python :session p1 :results value :exports both
 z("wc -l", cmd_stdin=a)
 #+end_src
 
 #+RESULTS:
-: 5
+#+begin_example
+5
+#+end_example
 
 ** More details
 The stdin will by default be set to the empty string:
@@ -259,7 +310,9 @@ zp("echo 'as you see, the previous command produced no output. It also did not b
 #+end_src
 
 #+RESULTS:
-: as you see, the previous command produced no output. It also did not block.
+#+begin_example
+as you see, the previous command produced no output. It also did not block.
+#+end_example
 
 ~z~ escapes your Python variables automagically:
 #+begin_src python :session p1 :results value :exports both
@@ -268,7 +321,9 @@ z("echo {python_var}")
 #+end_src
 
 #+RESULTS:
-: $HOME
+#+begin_example
+$HOME
+#+end_example
 
 Turning off the auto-escape:
 #+begin_src python :session p1 :results value :exports both
@@ -276,7 +331,9 @@ z("echo {python_var:e}")
 #+end_src
 
 #+RESULTS:
-: /Users/evar
+#+begin_example
+/Users/evar
+#+end_example
 
 Working with Python bools from the shell:
 #+begin_src python :session p1 :results value :exports both
@@ -284,14 +341,18 @@ z("test -n {True:bool}").retcode
 #+end_src
 
 #+RESULTS:
-: 0
+#+begin_example
+0
+#+end_example
 
 #+begin_src python :session p1 :results value :exports both
 z("test -n {False:bool}").retcode
 #+end_src
 
 #+RESULTS:
-: 1
+#+begin_example
+1
+#+end_example
 
 Working with NUL-terminated output:
 #+begin_src python :session p1 :results output :exports both
@@ -300,9 +361,41 @@ for f in z("fd -0 . ~/tmp").iter0():
 #+end_src
 
 #+RESULTS:
-: /Users/evar/tmp/a.png
-: /Users/evar/tmp/bug.mkv
-: /Users/evar/tmp/garden
+#+begin_example
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/34cc02221710caf309bff5ca96808d7a
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/36b77e6b3b7fde31f2fc4f182c0ecf82
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/36b77e6b3b7fde31f2fc4f182c0ecf82/tumblr_9527f4f6d2f1a39ef2b839780831f38f_859e5e2b_2048.jpg
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/36b77e6b3b7fde31f2fc4f182c0ecf82/tumblr_dd64a6ced93d19ffe78b47cf3439373d_e8e18fb0_2048.jpg
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/6cc3d153426e2b6d1ac0f3736aaf74a1
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/6cc3d153426e2b6d1ac0f3736aaf74a1/tumblr_9527f4f6d2f1a39ef2b839780831f38f_859e5e2b_2048.jpg
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/6cc3d153426e2b6d1ac0f3736aaf74a1/tumblr_dd64a6ced93d19ffe78b47cf3439373d_e8e18fb0_2048.jpg
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/c01ed1a32d65c8d4ecb9095509e61f97
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/c01ed1a32d65c8d4ecb9095509e61f97/tumblr_9527f4f6d2f1a39ef2b839780831f38f_859e5e2b_2048.jpg
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/c01ed1a32d65c8d4ecb9095509e61f97/tumblr_dd64a6ced93d19ffe78b47cf3439373d_e8e18fb0_2048.jpg
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/tumblr
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/tumblr/dreamcorp420
+/Users/evar/tmp/83e93d36396014e0cd979ddcad2d9d43/tumblr/dreamcorp420/tumblr_dreamcorp420_650543836474589184_01.gif
+/Users/evar/tmp/8826215ac0ed61d617906f658322fce7
+/Users/evar/tmp/IMG_0396.PNG
+/Users/evar/tmp/a2.jpg
+/Users/evar/tmp/a4.jpg
+/Users/evar/tmp/bills
+/Users/evar/tmp/garden
+/Users/evar/tmp/image-14000213234237913.png
+/Users/evar/tmp/photo_2021-05-08_00-35-24.jpg
+/Users/evar/tmp/photo_2021-05-08_00-55-29.jpg
+/Users/evar/tmp/tumblr
+/Users/evar/tmp/tumblr_2c0ad7a3fba563996c9abaedc5e8d4f7_356ef3d9_1280.gif
+/Users/evar/tmp/tumblr_5a2868650b058c42a7d141b8a2f474bc_eac04dc0_1280.jpg
+/Users/evar/tmp/tumblr_5cc2e0e48418ec3c9eb200d151daf647_e44e419b_1280.jpg
+/Users/evar/tmp/tumblr_6c90d77a676cf20fc096cc19220af4ab_e124dbec_540.gif.mp4
+/Users/evar/tmp/tumblr_70675efa5303a58292957ac942663309_f48499c2_1280.jpg
+/Users/evar/tmp/tumblr_70675efa5303a58292957ac942663309_f48499c2_1280.jpg.aria2
+/Users/evar/tmp/tumblr_bc2259b471f792065eb6707b7c29d27e_97f97d94_1280.jpg
+/Users/evar/tmp/tumblr_ec36fde70ee0264cdc2f61f394181c61_575227e7_1280.jpg
+/Users/evar/tmp/view.php
+#+end_example
 
 You can bypass the automatic iterable conversion by converting the iterable to a string first:
 #+begin_src python :session p1 :results value :exports both
@@ -310,7 +403,9 @@ z("echo {'    '.join(map(str,alist))}")
 #+end_src
 
 #+RESULTS:
-: # Fruits    1. Orange    2. Rambutan    3. Strawberry
+#+begin_example
+# Fruits    1. Orange    2. Rambutan    3. Strawberry
+#+end_example
 
 Normal Python formatting syntax works as expected:
 
@@ -319,14 +414,18 @@ z("echo {67:f}")
 #+end_src
 
 #+RESULTS:
-: 67.0
+#+begin_example
+67.0
+#+end_example
 
 #+begin_src python :session p1 :exports both :results verbatim
 z("echo {[11, 45]!s}")
 #+end_src
 
 #+RESULTS:
-: [11, 45]
+#+begin_example
+[11, 45]
+#+end_example
 
 
 You can obviously nest your ~z~ calls:
@@ -337,16 +436,14 @@ z("""echo monkey$'\n'{z("curl -s https://www.poemist.com/api/v1/randompoems | jq
 #+RESULTS:
 #+begin_example
 Random Poem:
-114
-
-Good night, because we must,
-How intricate the dust!
-I would go, to know!
-Oh incognito!
-Saucy, Saucy Seraph
-To elude me so!
-Father! they won't tell me,
-Won't you tell them to?
+’Tis said that the Passion Flower,
+   With its figures of spear and sword
+And hammer and nails, is a symbol
+   Of the Woe of our Blessed Lord.
+So still in the Heart of Beauty
+   Has been hidden, since Life drew breath,
+The sword and the spear of Anguish,
+   And the hammer and nails of Death.
 end
 #+end_example
 
@@ -369,7 +466,9 @@ my_own_brish.z("echo $PWD")
 #+end_src
 
 #+RESULTS:
-: /Users/evar/tmp
+#+begin_example
+/Users/evar/tmp
+#+end_example
 
 ~Brish.z~ itself is sugar around ~Brish.zstring~ and ~Brish.send_cmd~:
 #+begin_src python :session p1 :results value :exports both
@@ -378,14 +477,18 @@ cmd_str
 #+end_src
 
 #+RESULTS:
-:  echo zstring constructs the command string that will be sent to zsh. It interpolates the Pythonic variables: '$HOME' '# Fruits' '1. Orange' '2. Rambutan' '3. Strawberry'
+#+begin_example
+ echo zstring constructs the command string that will be sent to zsh. It interpolates the Pythonic variables: '$HOME' '# Fruits' '1. Orange' '2. Rambutan' '3. Strawberry'
+#+end_example
 
 #+begin_src python :session p1 :results value :exports both
 my_own_brish.send_cmd(cmd_str)
 #+end_src
 
 #+RESULTS:
-: zstring constructs the command string that will be sent to zsh. It interpolates the Pythonic variables: $HOME # Fruits 1. Orange 2. Rambutan 3. Strawberry
+#+begin_example
+zstring constructs the command string that will be sent to zsh. It interpolates the Pythonic variables: $HOME # Fruits 1. Orange 2. Rambutan 3. Strawberry
+#+end_example
 
 You can restart a Brish instance:
 #+begin_src python :session p1 :results output :exports both
@@ -397,9 +500,11 @@ my_own_brish.zp("echo But the boot_cmd has run in the restarted instance, too: $
 #+end_src
 
 #+RESULTS:
-: Before restart: 56
-: After restart:
-: But the boot_cmd has run in the restarted instance, too: /Users/evar/tmp
+#+begin_example
+Before restart: 56
+After restart:
+But the boot_cmd has run in the restarted instance, too: /Users/evar/tmp
+#+end_example
 
 ~Brish~ is threadsafe. I have built [[https://github.com/NightMachinary/BrishGarden][BrishGarden]] on top of ~Brish~ to provide an HTTP REST API for executing zsh code (if wanted, in sessions). Using ~BrishGarden~, you can embed ~zsh~ in pretty much any programming language, and pay no cost whatsoever for its startup. It can also function as a remote code executor.
 
@@ -415,14 +520,18 @@ z("eval {untrusted_input}") # unsafe
 #+end_src
 
 #+RESULTS:
-: do evil
+#+begin_example
+do evil
+#+end_example
 
 #+begin_src python :session p1 :results value :exports both
 z("echo {untrusted_input}") # safe
 #+end_src
 
 #+RESULTS:
-:  ; echo do evil | cat
+#+begin_example
+ ; echo do evil | cat
+#+end_example
 
 # One thing to keep in mind is that Brish purposely uses the zsh from your PATH. That zsh will load its dotfiles as usual.
 
