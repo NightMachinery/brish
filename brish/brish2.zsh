@@ -2,8 +2,6 @@
 # MARKER=$'\0'"BRISH_MARKER"
 MARKER=$'\0'
 
-unset FORCE_INTERACTIVE
-
 IFS= read -d "$MARKER" -r BRISH_STDIN
 IFS= read -d "$MARKER" -r BRISH_STDOUT
 IFS= read -d "$MARKER" -r BRISH_STDERR
