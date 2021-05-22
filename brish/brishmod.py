@@ -106,7 +106,11 @@ class Brish:
 
     def __init__(self, defaultShell=None, boot_cmd=None, **kwargs):
         self.lock = RLock()
-        self.boot_cmd = boot_cmd
+        if boot_cmd:
+            self.boot_cmd = _shared_brish.zstring(boot_cmd, getframe=2)
+        else:
+            self.boot_cmd = boot_cmd
+
         self.defaultShell = defaultShell or [
             str(pathlib.Path(__file__).parent / "brish2.zsh"),
             "--",
