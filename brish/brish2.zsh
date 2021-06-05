@@ -19,7 +19,13 @@ for brish_server_index in {1..${#stdins}} ; do
             if test -n "$brish_fork" ; then
                 ( { ( print -nr -- "$brish_stdin" ) || true }  | eval "$cmd" )
             else
-                { ( print -nr -- "$brish_stdin" ) || true } | eval "$cmd"
+                ##
+                # { ( print -nr -- "$brish_stdin" ) || true } | eval "$cmd"
+                ##
+                # Running the code wrapped in a function block has a lot of benefits, e.g., we can use 'return' freely.
+                functions[tmp_block_8182782]="$cmd"
+                { ( print -nr -- "$brish_stdin" ) || true } | tmp_block_8182782
+                ##
             fi
             # Note that exiting the shell can fail brish.py if not in the subshell.
             local ret=$?
