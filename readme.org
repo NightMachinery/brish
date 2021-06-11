@@ -1,17 +1,5 @@
 #+TITLE: Brish
 
-* private docs :noexport:
-Invalid unicode characters (binary data) in the stdout and the stderr are escaped:
-#+begin_src python :session p1 :results output :exports both :wrap example
-print("hi")
-print(repr(z("print -r -- 'Fade_–_One_Reason_opening_Deadman_w.mp3'").outrs)) # we can't input the invalid chars yet :facepalms:
-#+end_src
-
-#+RESULTS:
-#+begin_example
-hi
-#+end_example
-
 * Guide
 ** Installation
 
