@@ -103,6 +103,7 @@ class Brish:
 
     # MARKER = '\x00BRISH_MARKER'
     MARKER = "\x00"
+    DECODING_ERRORS = "backslashreplace" # https://docs.python.org/3/library/codecs.html#codec-base-classes
 
     def __init__(self, defaultShell=None, boot_cmd=None, **kwargs):
         self.lock = RLock()
@@ -151,8 +152,9 @@ class Brish:
                 stdout=PIPE,
                 stderr=PIPE,
                 env=dict(os.environ,),
-                universal_newlines=True,
-            )  # decode output as utf-8, newline is '\n'
+                universal_newlines=True, # decode output as utf-8, newline is '\n',
+                errors=self.DECODING_ERRORS, # escape invalid utf-8 bytes
+            )
             BRISH_STDIN = "\n".join(brish_stdin_paths)
             BRISH_STDOUT = "\n".join(brish_stdout_paths)
             BRISH_STDERR = "\n".join(brish_stderr_paths)
@@ -173,8 +175,8 @@ class Brish:
             self.p.brish_stdout_paths = brish_stdout_paths
             self.p.brish_stderr_paths = brish_stderr_paths
             self.p.brish_stdins = [open(p, "w") for p in self.p.brish_stdin_paths]
-            self.p.brish_stdouts = [open(p, "r") for p in self.p.brish_stdout_paths]
-            self.p.brish_stderrs = [open(p, "r") for p in self.p.brish_stderr_paths]
+            self.p.brish_stdouts = [open(p, "r", errors=self.DECODING_ERRORS) for p in self.p.brish_stdout_paths]
+            self.p.brish_stderrs = [open(p, "r", errors=self.DECODING_ERRORS) for p in self.p.brish_stderr_paths]
 
             if self.boot_cmd is not None:
                 return [
@@ -297,16 +299,26 @@ class Brish:
                     cmd_stdin,
                 )
             delim = self.MARKER + "\n"
+
+            cmd_processed = (cmd
+                             + self.MARKER
+                             + cmd_stdin
+                             + self.MARKER
+                             + boolsh(fork)
+                             + self.MARKER)
+
+            ##
+            # trying to open the stdin as binary. It didn't work, idk why.
+            # cmd_processed = cmd_processed.encode()
+            # self.p.brish_stdins[server_index].write(cmd_processed)
+            ##
             print(
-                cmd
-                + self.MARKER
-                + cmd_stdin
-                + self.MARKER
-                + boolsh(fork)
-                + self.MARKER,
+                cmd_processed,
                 file=self.p.brish_stdins[server_index],
                 flush=True,
             )
+            ##
+
             stdout = ""
             # embed()
             for line in iter(self.p.brish_stdouts[server_index].readline, delim):
