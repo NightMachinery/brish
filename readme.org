@@ -812,6 +812,18 @@ z("echo {untrusted_input}") # safe
 * Known issues
 ** Piping binary (non-text) output from zsh to Python does not work
 
+** Nonstandard encodings (non UTF-8) are corrupted
+#+begin_src python :session p1 :results value :exports both
+z("echo 'sth × another (ver.-)'")
+#+end_src
+
+#+RESULTS:
+#+begin_example
+sth Ã\xb7 another (ver.-)
+#+end_example
+
+** There is always sth piped to the standard input (an empty string by default). This can alter the behavior of some commands such as =ripgrep=; Using =</dev/null= can be a suitable workaround.
+
 * Future features
 
 I like to add a mode where the zsh session inherits the stderr from the parent Python process. This allows usage of interactive programs like ~fzf~.
