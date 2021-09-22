@@ -822,7 +822,7 @@ z("echo 'sth × another (ver.-)'")
 sth Ã\xb7 another (ver.-)
 #+end_example
 
-** There is always sth piped to the standard input (an empty string by default). This can alter the behavior of some commands such as =ripgrep=; Using =</dev/null= can be a suitable workaround.
+** There is always sth piped to the standard input (an empty string by default). This can alter the behavior of some commands such as =ripgrep=; Using =</dev/null= or =<&-= can be a suitable workaround.
 
 * Future features
 
