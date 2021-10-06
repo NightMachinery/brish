@@ -1,6 +1,9 @@
 try:
     # Dev imports
-    from IPython import embed
+    # from IPython import embed
+    # importing this takes quite a bit of time
+    #   `time2 python -c 'from IPython import embed'`
+    pass
 except ImportError:
 
     def embed(*args, **kwargs):
@@ -15,6 +18,7 @@ import os
 import shutil
 import tempfile
 from collections.abc import Iterable
+from typing import Union, Any
 import ast
 from string import Formatter
 import uuid
@@ -39,14 +43,23 @@ def boolsh(some_bool):
     else:
         return ""
 
+def bool_from_str(some_bool):
+    if some_bool in ("", "n", "no", "N", "NO"):
+        return False
+    else:
+        return bool(some_bool)
+
+
+class NonzeroBrishException(Exception):
+    pass
 
 @dataclass(frozen=True)
 class CmdResult:
     retcode: int
     out: str
     err: str
-    cmd: str
-    cmd_stdin: str
+    cmd: Any # Union[str, Iterable[str]]
+    cmd_stdin: str # Union[str, None]
 
     @property
     def outrs(self):
@@ -94,6 +107,12 @@ class CmdResult:
     def __bool__(self):
         return self.retcode == 0
 
+    @property
+    def assert_zero(self):
+        if self.retcode == 0:
+            return self
+        else:
+            raise NonzeroBrishException()
 
 class UninitializedBrishException(Exception):
     pass
@@ -105,7 +124,7 @@ class Brish:
     MARKER = "\x00"
     DECODING_ERRORS = "backslashreplace" # https://docs.python.org/3/library/codecs.html#codec-base-classes
 
-    def __init__(self, defaultShell=None, boot_cmd=None, **kwargs):
+    def __init__(self, defaultShell=None, boot_cmd=None, server_count=1, delayed_init=False, **kwargs):
         self.lock = RLock()
         if boot_cmd:
             self.boot_cmd = _shared_brish.zstring(boot_cmd, getframe=2)
@@ -118,11 +137,17 @@ class Brish:
             "BR" + "I" * 2048 + "SH",
         ]  # Reserve big argv for `insubshell`
         self.lastShell = self.defaultShell
+        self.last_server_count = server_count
         self.p = None
-        self.init(**kwargs)
+        self.delayed_init = delayed_init
+        if not self.delayed_init:
+            self.init(**kwargs)
 
-    def init(self, shell=None, server_count=1):
+    def init(self, shell=None, server_count=None):
         with self.lock:
+            if not server_count:
+                server_count = self.last_server_count
+
             if shell is None:
                 shell = self.defaultShell
 
@@ -229,8 +254,11 @@ class Brish:
     def acquire_lock(self, server_index=None, lock_sleep=1):
         while True:
             if self.p is None:
-                # self.restart()
-                raise UninitializedBrishException("acquire_lock called with an uninitialized Brish")
+                if self.delayed_init:
+                    self.delayed_init = False
+                    self.restart()
+                else:
+                    raise UninitializedBrishException("acquire_lock called with an uninitialized Brish")
 
             assert len(self.locks) >= 1
             current_p = self.p
@@ -483,5 +511,5 @@ class Brish:
 
 
 _shared_brish = (
-    Brish()
+    Brish(delayed_init=True)
 )  # Any identifier of the form __spam (at least two leading underscores, at most one trailing underscore) is textually replaced with _classname__spam, so we can't use it in Brish if we use two underscores.
