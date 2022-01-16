@@ -1,9 +1,22 @@
 #+TITLE: Brish
 
-[[https://pepy.tech/project/brish][file:https://pepy.tech/badge/brish]]
-[[https://pepy.tech/project/brish][file:https://pepy.tech/badge/brish/month]]
-[[https://opensource.org/licenses/MIT][file:https://img.shields.io/badge/License-MIT-blue.svg]]
-[[http://www.gnu.org/licenses/gpl-3.0.html][file:http://img.shields.io/:license-gpl3-blue.svg]]
+#+begin_html
+<a href="https://pepy.tech/project/brish">
+<img alt="Alltime Downloads" src="https://pepy.tech/badge/brish" />
+</a>
+
+<a href="https://pepy.tech/project/brish">
+<img alt="Monthly Downloads" src="https://pepy.tech/badge/brish/month" />
+</a>
+
+<a href="https://opensource.org/licenses/MIT">
+<img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg" />
+</a>
+
+<a href="http://www.gnu.org/licenses/gpl-3.0.html">
+<img alt="GPL3 License" src="http://img.shields.io/:license-gpl3-blue.svg" />
+</a>
+#+end_html
 
 * Guide
 ** Installation
