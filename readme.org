@@ -1,5 +1,7 @@
 #+TITLE: Brish
 
+[[file:https://pepy.tech/project/brish][https://pepy.tech/badge/brish]]
+
 * Guide
 ** Installation
 
