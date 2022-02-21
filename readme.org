@@ -325,7 +325,7 @@ z("wc -l", cmd_stdin=a)
 The stdin will by default be set to the empty string:
 #+begin_src python :session p1 :results output :exports both
 zp("cat")
-zp("echo 'as you see, the previous command produced no output. It also did not block.'")
+zp("echo 'As you see, the previous command produced no output. It also did not block.'")
 #+end_src
 
 #+RESULTS:
@@ -863,7 +863,7 @@ If you have any good design ideas, create an issue!
         python3 -c "from math import *; print($*)"
     }
     #+END_EXAMPLE
-- [[https://github.com/danylo-dubinin/zsh-jupyter-kernel][Z shell kernel for Jupyter Notebook]] allows you to do all sorts of stuff if you spend the time implementing your <65;45;18Musecase; See [[https://github.com/nnicandro/emacs-jupyter#org-mode-source-blocks][emacs-jupyter]] to get a taste of what's possible. [[https://github.com/jupyter/kernel_gateway][Jupyter Kernel Gateway]] also sounds promising, but I haven't tried it out yet. Beware the completion support in this kernel though. It uses a pre-alpha proof of concept [[https://github.com/Valodim/zsh-capture-completion][thingy]] that was very buggy when I tried it.
+- [[https://github.com/danylo-dubinin/zsh-jupyter-kernel][Z shell kernel for Jupyter Notebook]] allows you to do all sorts of stuff if you spend the time implementing your usecase; See [[https://github.com/nnicandro/emacs-jupyter#org-mode-source-blocks][emacs-jupyter]] to get a taste of what's possible. [[https://github.com/jupyter/kernel_gateway][Jupyter Kernel Gateway]] also sounds promising, but I haven't tried it out yet. Beware the completion support in this kernel though. It uses a pre-alpha proof of concept [[https://github.com/Valodim/zsh-capture-completion][thingy]] that was very buggy when I tried it.
 - Finally, if you're feeling adventurous, try Rust's [[https://github.com/rust-shell-script/rust_cmd_lib][rust_cmd_lib]]. It's quite beautiful.
 
 * Licenses

@@ -4,6 +4,7 @@ from .brishmod import *
 bsh = Brish(delayed_init=True, server_count=4)
 z = bsh.z
 zp = bsh.zp
+zpe = bsh.zpe
 zq = bsh.zsh_quote
 zs = bsh.zstring
 ## @personal

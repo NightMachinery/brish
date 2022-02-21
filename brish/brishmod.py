@@ -500,14 +500,27 @@ class Brish:
             self.zstring(template, locals_=locals_, getframe=getframe), *args, **kwargs
         )
 
-    def zp(self, *args, getframe=3, **kwargs):
+    def z_print(self, *args, getframe=3, file=None, **kwargs):
         res = self.z(*args, getframe=getframe, **kwargs)
-        print(res.outerr, end="", flush=True)
+
+        print_opts = dict()
+        if file is not None:
+            print_opts['file'] = file
+
+        print(res.outerr, end="", flush=True, **print_opts)
         return res
+
+    def z_print_stderr(self, *args, getframe=4, **kwargs):
+        ## tests:
+        #: `rederr python -c 'from brish import * ; zpe("echo hi") ; zp("echo ic") ; zpe("echo woo")'`
+        ##
+        return self.z_print(*args, getframe=getframe, file=sys.stderr, **kwargs)
 
     # Aliases
     c = send_cmd
     zq = zsh_quote
+    zp = z_print
+    zpe = z_print_stderr
 
 
 _shared_brish = (
