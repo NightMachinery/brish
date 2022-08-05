@@ -112,7 +112,7 @@ class CmdResult:
         if self.retcode == 0:
             return self
         else:
-            raise NonzeroBrishException()
+            raise NonzeroBrishException(f"retcode={self.retcode}, stderr:\n{self.err}")
 
 class UninitializedBrishException(Exception):
     pass
