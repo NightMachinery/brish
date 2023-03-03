@@ -3,8 +3,12 @@ try:
     # from IPython import embed
     # importing this takes quite a bit of time
     #   `time2 python -c 'from IPython import embed'`
+    from icecream import ic
+
     pass
 except ImportError:
+    def ic(*args, **kwargs):
+        pass
 
     def embed(*args, **kwargs):
         print("IPython not available.")
@@ -122,7 +126,6 @@ class Brish:
 
     # MARKER = '\x00BRISH_MARKER'
     MARKER = "\x00"
-    DECODING_ERRORS = "backslashreplace" # https://docs.python.org/3/library/codecs.html#codec-base-classes
 
     def __init__(self, defaultShell=None, boot_cmd=None, server_count=1, delayed_init=False, **kwargs):
         self.lock = RLock()
@@ -143,7 +146,12 @@ class Brish:
         if not self.delayed_init:
             self.init(**kwargs)
 
-    def init(self, shell=None, server_count=None):
+    def init(self,
+             shell=None,
+             server_count=None,
+             decoding_errors="backslashreplace",
+             # https://docs.python.org/3/library/codecs.html#codec-base-classes
+             encoding="utf-8",):
         with self.lock:
             if not server_count:
                 server_count = self.last_server_count
@@ -177,8 +185,9 @@ class Brish:
                 stdout=PIPE,
                 stderr=PIPE,
                 env=dict(os.environ,),
-                universal_newlines=True, # decode output as utf-8, newline is '\n',
-                errors=self.DECODING_ERRORS, # escape invalid utf-8 bytes
+                text=True,
+                errors=decoding_errors, # escape invalid utf-8 bytes
+                encoding=encoding,
             )
             BRISH_STDIN = "\n".join(brish_stdin_paths)
             BRISH_STDOUT = "\n".join(brish_stdout_paths)
@@ -199,9 +208,9 @@ class Brish:
             self.p.brish_stdin_paths = brish_stdin_paths
             self.p.brish_stdout_paths = brish_stdout_paths
             self.p.brish_stderr_paths = brish_stderr_paths
-            self.p.brish_stdins = [open(p, "w") for p in self.p.brish_stdin_paths]
-            self.p.brish_stdouts = [open(p, "r", errors=self.DECODING_ERRORS) for p in self.p.brish_stdout_paths]
-            self.p.brish_stderrs = [open(p, "r", errors=self.DECODING_ERRORS) for p in self.p.brish_stderr_paths]
+            self.p.brish_stdins = [open(p, "w", errors='strict', encoding=encoding,) for p in self.p.brish_stdin_paths]
+            self.p.brish_stdouts = [open(p, "r", errors=decoding_errors, encoding=encoding) for p in self.p.brish_stdout_paths]
+            self.p.brish_stderrs = [open(p, "r", errors=decoding_errors, encoding=encoding,) for p in self.p.brish_stderr_paths]
 
             if self.boot_cmd is not None:
                 return [

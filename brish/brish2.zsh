@@ -14,6 +14,8 @@ for brish_server_index in {1..${#stdins}} ; do
     (
         while IFS= read -d "$MARKER" -r cmd
         do
+            # typeset -p cmd &>> ~/tmp/c
+
             IFS= read -d "$MARKER" -r brish_stdin
             IFS= read -d "$MARKER" -r brish_fork
             if test -n "$brish_fork" ; then
@@ -22,8 +24,13 @@ for brish_server_index in {1..${#stdins}} ; do
                 ##
                 # { ( print -nr -- "$brish_stdin" ) || true } | eval "$cmd"
                 ##
-                # Running the code wrapped in a function block has a lot of benefits, e.g., we can use 'return' freely.
-                functions[tmp_block_8182782]="$cmd"
+                #: Running the code wrapped in a function block has a lot of benefits, e.g., we can use 'return' freely.
+                # functions[tmp_block_8182782]="$cmd"
+                #: This corrupts unicode characters! But using eval directly works.
+                #: @test typeset cmd=$'\nec \'HARRY: “Hermione,\' > ~/tmp/a'
+
+                eval "function tmp_block_8182782 {"$'\n'"$cmd"$'\n'"}"
+
                 { ( print -nr -- "$brish_stdin" ) || true } | tmp_block_8182782
                 ##
             fi

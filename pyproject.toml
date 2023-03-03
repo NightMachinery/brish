@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "brish"
-version = "0.3.4.1"
+version = "0.3.4.3"
 description = "A bridge between zsh and Python."
 authors = ["NightMachinary <rudiwillalwaysloveyou@gmail.com>"]
 repository = "https://github.com/NightMachinary/brish"
