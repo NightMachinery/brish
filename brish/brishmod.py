@@ -48,7 +48,7 @@ def boolsh(some_bool):
         return ""
 
 def bool_from_str(some_bool):
-    if some_bool.lower() in ("", "0", "n", "no", "false"):
+    if isinstance(some_bool, str) and some_bool.lower() in ("", "0", "n", "no", "false"):
         return False
     else:
         return bool(some_bool)
