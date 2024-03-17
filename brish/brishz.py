@@ -24,7 +24,7 @@ def isNight():
     return bool(os.environ.get("NIGHTDIR", False))
 
 def brishzn(*args, **kwargs):
-    if isNight:
+    if isNight():
         return brishz(*args, **kwargs)
     else:
         # return None
