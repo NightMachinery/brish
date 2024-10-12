@@ -7,6 +7,7 @@ try:
 
     pass
 except ImportError:
+
     def ic(*args, **kwargs):
         pass
 
@@ -47,9 +48,17 @@ def boolsh(some_bool):
     else:
         return ""
 
+
 def bool_from_str(some_bool):
-    if isinstance(some_bool, str) and some_bool.lower() in ("", "0", "n", "no", "false"):
+    if isinstance(some_bool, str) and some_bool.lower() in (
+        "",
+        "0",
+        "n",
+        "no",
+        "false",
+    ):
         return False
+
     else:
         return bool(some_bool)
 
@@ -57,17 +66,18 @@ def bool_from_str(some_bool):
 class NonzeroBrishException(Exception):
     pass
 
+
 @dataclass(frozen=True)
 class CmdResult:
     retcode: int
     out: str
     err: str
-    cmd: Any # Union[str, Iterable[str]]
-    cmd_stdin: str # Union[str, None]
+    cmd: Any  # Union[str, Iterable[str]]
+    cmd_stdin: str  # Union[str, None]
 
     @property
     def outrs(self):
-        """ out.rstrip('\\n') """
+        """out.rstrip('\\n')"""
         return self.out.rstrip("\n")
 
     @property
@@ -118,8 +128,10 @@ class CmdResult:
         else:
             raise NonzeroBrishException(f"retcode={self.retcode}, stderr:\n{self.err}")
 
+
 class UninitializedBrishException(Exception):
     pass
+
 
 class Brish:
     """Brish is a bridge between Python and an interpreter. The interpreter needs to adhere to the Brish protocol. A zsh interpreter is provided, and is the default. Threadsafe."""
@@ -127,7 +139,14 @@ class Brish:
     # MARKER = '\x00BRISH_MARKER'
     MARKER = "\x00"
 
-    def __init__(self, defaultShell=None, boot_cmd=None, server_count=1, delayed_init=False, **kwargs):
+    def __init__(
+        self,
+        defaultShell=None,
+        boot_cmd=None,
+        server_count=1,
+        delayed_init=False,
+        **kwargs,
+    ):
         self.lock = RLock()
         if boot_cmd:
             self.boot_cmd = _shared_brish.zstring(boot_cmd, getframe=2)
@@ -146,12 +165,14 @@ class Brish:
         if not self.delayed_init:
             self.init(**kwargs)
 
-    def init(self,
-             shell=None,
-             server_count=None,
-             decoding_errors="backslashreplace",
-             # https://docs.python.org/3/library/codecs.html#codec-base-classes
-             encoding="utf-8",):
+    def init(
+        self,
+        shell=None,
+        server_count=None,
+        decoding_errors="backslashreplace",
+        # https://docs.python.org/3/library/codecs.html#codec-base-classes
+        encoding="utf-8",
+    ):
         with self.lock:
             if not server_count:
                 server_count = self.last_server_count
@@ -184,9 +205,11 @@ class Brish:
                 stdin=PIPE,
                 stdout=PIPE,
                 stderr=PIPE,
-                env=dict(os.environ,),
+                env=dict(
+                    os.environ,
+                ),
                 text=True,
-                errors=decoding_errors, # escape invalid utf-8 bytes
+                errors=decoding_errors,  # escape invalid utf-8 bytes
                 encoding=encoding,
             )
             BRISH_STDIN = "\n".join(brish_stdin_paths)
@@ -208,9 +231,28 @@ class Brish:
             self.p.brish_stdin_paths = brish_stdin_paths
             self.p.brish_stdout_paths = brish_stdout_paths
             self.p.brish_stderr_paths = brish_stderr_paths
-            self.p.brish_stdins = [open(p, "w", errors='strict', encoding=encoding,) for p in self.p.brish_stdin_paths]
-            self.p.brish_stdouts = [open(p, "r", errors=decoding_errors, encoding=encoding) for p in self.p.brish_stdout_paths]
-            self.p.brish_stderrs = [open(p, "r", errors=decoding_errors, encoding=encoding,) for p in self.p.brish_stderr_paths]
+            self.p.brish_stdins = [
+                open(
+                    p,
+                    "w",
+                    errors="strict",
+                    encoding=encoding,
+                )
+                for p in self.p.brish_stdin_paths
+            ]
+            self.p.brish_stdouts = [
+                open(p, "r", errors=decoding_errors, encoding=encoding)
+                for p in self.p.brish_stdout_paths
+            ]
+            self.p.brish_stderrs = [
+                open(
+                    p,
+                    "r",
+                    errors=decoding_errors,
+                    encoding=encoding,
+                )
+                for p in self.p.brish_stderr_paths
+            ]
 
             if self.boot_cmd is not None:
                 return [
@@ -267,7 +309,9 @@ class Brish:
                     self.delayed_init = False
                     self.restart()
                 else:
-                    raise UninitializedBrishException("acquire_lock called with an uninitialized Brish")
+                    raise UninitializedBrishException(
+                        "acquire_lock called with an uninitialized Brish"
+                    )
 
             assert len(self.locks) >= 1
             current_p = self.p
@@ -337,12 +381,9 @@ class Brish:
                 )
             delim = self.MARKER + "\n"
 
-            cmd_processed = (cmd
-                             + self.MARKER
-                             + cmd_stdin
-                             + self.MARKER
-                             + boolsh(fork)
-                             + self.MARKER)
+            cmd_processed = (
+                cmd + self.MARKER + cmd_stdin + self.MARKER + boolsh(fork) + self.MARKER
+            )
 
             ##
             # trying to open the stdin as binary. It didn't work, idk why.
@@ -514,7 +555,7 @@ class Brish:
 
         print_opts = dict()
         if file is not None:
-            print_opts['file'] = file
+            print_opts["file"] = file
 
         print(res.outerr, end="", flush=True, **print_opts)
         return res
@@ -532,6 +573,6 @@ class Brish:
     zpe = z_print_stderr
 
 
-_shared_brish = (
-    Brish(delayed_init=True)
+_shared_brish = Brish(
+    delayed_init=True
 )  # Any identifier of the form __spam (at least two leading underscores, at most one trailing underscore) is textually replaced with _classname__spam, so we can't use it in Brish if we use two underscores.
