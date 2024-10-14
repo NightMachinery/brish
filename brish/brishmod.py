@@ -67,6 +67,31 @@ class NonzeroBrishException(Exception):
     pass
 
 
+def get_locals(
+    *,
+    getframe=1,
+    locals_=None,
+):
+    getframe += 1
+    #: To adjust for this function itself
+
+    if locals_ is None:
+        try:
+            ##
+            #: @duplicateCode/c55d771bbc2dfcf7f154f78c6634b680
+            previous_frame = sys._getframe(getframe)
+            previous_frame_locals = previous_frame.f_locals
+            locals_ = dict(previous_frame.f_globals, **previous_frame_locals)
+            # https://stackoverflow.com/questions/1041639/get-a-dict-of-all-variables-currently-in-scope-and-their-values
+            # We will still miss the closure variables.
+            ##
+        except:
+            # Julia runs Python in an embedded mode with no stack frame.
+            pass
+
+    return locals_
+
+
 @dataclass(frozen=True)
 class CmdResult:
     retcode: int
@@ -446,7 +471,8 @@ class Brish:
     _conversions = {"a": ascii, "r": repr, "s": str, "e": idem, "b": boolsh}
 
     def zstring_old(self, template, locals_=None):
-        # DEPRECATED
+        #: DEPRECATED
+        ##
         if locals_ is None:
             previous_frame = sys._getframe(1)
             previous_frame_locals = previous_frame.f_locals
@@ -475,17 +501,16 @@ class Brish:
         cmd = "".join(result)
         return cmd
 
-    def zstring(self, template, locals_=None, getframe=1):
-        if locals_ is None:
-            try:
-                previous_frame = sys._getframe(getframe)
-                previous_frame_locals = previous_frame.f_locals
-                locals_ = dict(previous_frame.f_globals, **previous_frame_locals)
-                # https://stackoverflow.com/questions/1041639/get-a-dict-of-all-variables-currently-in-scope-and-their-values
-                # We will still miss the closure variables.
-            except:
-                # Julia runs Python in an embedded mode with no stack frame.
-                pass
+    def zstring(
+        self,
+        template,
+        locals_=None,
+        getframe=1,
+    ):
+        locals_ = get_locals(
+            getframe=getframe,
+            locals_=locals_,
+        )
 
         def asteval(astNode):
             if astNode is not None:

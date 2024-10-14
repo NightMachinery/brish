@@ -321,7 +321,7 @@ z("wc -l", cmd_stdin=a)
 5
 #+end_example
 
-** More details
+** More Details
 The stdin will by default be set to the empty string:
 #+begin_src python :session p1 :results output :exports both
 zp("cat")
@@ -527,7 +527,7 @@ But the boot_cmd has run in the restarted instance, too: /Users/evar/tmp
 
 ~Brish~ is threadsafe. I have built [[https://github.com/NightMachinary/BrishGarden][BrishGarden]] on top of ~Brish~ to provide an HTTP REST API for executing zsh code (if wanted, in sessions). Using ~BrishGarden~, you can embed ~zsh~ in pretty much any programming language, and pay no cost whatsoever for its startup. It can also function as a remote code executor.
 
-**** Parallel execution using =server_count=
+**** Parallel Execution Using =server_count=
 =server_count= allows the underlying =zsh= instance of a =Brish= object to fork that many times, and so serve that many clients in parallel. This will not increase the startup time, as the forking happens after loading the =zsh= interpreter completely.
 
 I have combined this with =GNU parallel= to easily parallelize my =zsh= functions.
@@ -800,8 +800,63 @@ Finished 6 at 1620651362.4896230698
 Took 36.33210492134094
 #+end_example
 
-* Security considerations
+** Running in the Background
+The =z_background= function allows you to execute shell commands asynchronously in a new thread. It starts a new Zsh instance and runs the given command without blocking your main Python thread. This is particularly useful when you want to perform non-blocking operations or execute long-running shell commands without interrupting your Python program's flow.
 
+#+begin_src jupyter-python :kernel py_base :session emacs_py_1 :async yes :exports both
+from brish import z_background
+
+msg = "You can’t make an omelet without breaking a few eggs."
+result_future = z_background(
+    "say {msg}",
+    # Needs the `say` command, available by default on macOS
+)
+result_future
+#+end_src
+
+#+RESULTS:
+: <Future at 0x1435b51e0 state=running>
+
+The =z_background= function returns a =Future= object.
+
+#+begin_src jupyter-python :kernel py_base :session emacs_py_1 :async yes :exports both
+result_future.result()
+#+end_src
+
+#+RESULTS:
+: CmdResult(retcode=0, out='', err='', cmd=" say 'You can’t make an omelet without breaking a few eggs.' ", cmd_stdin='')
+
+Here is another example:
+
+#+begin_src jupyter-python :kernel py_base :session emacs_py_1 :async yes :exports both
+from brish import z_background
+import concurrent.futures
+
+# Define multiple commands
+commands = [
+    "sleep 5 && echo 'First command completed.'",
+    "sleep 3 && echo 'Second command completed.'",
+    "sleep 1 && echo 'Third command completed.'",
+]
+
+# Execute all commands asynchronously
+futures = [z_background(cmd) for cmd in commands]
+
+for future in concurrent.futures.as_completed(futures):
+    result = future.result()
+    print(result.out)
+#+end_src
+
+#+RESULTS:
+: Third command completed.
+: 
+: Second command completed.
+: 
+: First command completed.
+: 
+
+
+* Security Considerations
 I am not a security expert, and security doesn't come by default in these situations. So be careful if you use untrusted input in the commands fed to zsh. Nevertheless, I can't imagine any (non-obvious) attack vectors, as the input gets automatically escaped by default. Feedback by security experts will be appreciated.
 
 Note that you can create security holes for yourself, by, e.g., running =eval= on user input:
@@ -827,29 +882,27 @@ z("echo {untrusted_input}") # safe
 
 # One thing to keep in mind is that Brish purposely uses the zsh from your PATH. That zsh will load its dotfiles as usual.
 
-* Known issues
-** Piping binary (non-text) output from zsh to Python does not work
+* Known Issues
+- Piping binary (non-text) output from zsh to Python does not work
 
-** Nonstandard encodings (non UTF-8) are corrupted
-#+begin_src python :session p1 :results value :exports both
-z("echo 'sth × another (ver.-)'")
-#+end_src
+- Nonstandard encodings (non UTF-8) are corrupted
+  #+begin_src python :session p1 :results value :exports both
+  z("echo 'sth × another (ver.-)'")
+  #+end_src
 
-#+RESULTS:
-#+begin_example
-sth Ã\xb7 another (ver.-)
-#+end_example
+  #+RESULTS:
+  #+begin_example
+  sth Ã\xb7 another (ver.-)
+  #+end_example
 
-** There is always sth piped to the standard input (an empty string by default). This can alter the behavior of some commands such as =ripgrep=; Using =</dev/null= or =<&-= can be a suitable workaround.
+- There is always sth piped to the standard input (an empty string by default). This can alter the behavior of some commands such as =ripgrep=; Using =</dev/null= or =<&-= can be a suitable workaround.
 
-* Future features
-
+* Future Features
 I like to add a mode where the zsh session inherits the stderr from the parent Python process. This allows usage of interactive programs like ~fzf~.
 
 If you have any good design ideas, create an issue!
 
-* Related projects
-
+* Related Projects
 - [[https://github.com/sharkdp/pysh][pysh]] uses comments in bash scripts to switch the interpreter to Python, allowing variable reuse between the two.
 - [[https://github.com/tomerfiliba/plumbum][plumbum]] is a small yet feature-rich library for shell script-like programs in Python. It attempts to mimic the shell syntax ("shell combinators") where it makes sense, while keeping it all Pythonic and cross-platform. I personally like this one a lot. A robust option that is also easy-to-use.
 - [[https://github.com/timofurrer/shellfuncs][shellfuncs]]: Python API to execute shell functions as they would be Python functions. (Last commit is in 2017.)
@@ -867,5 +920,5 @@ If you have any good design ideas, create an issue!
 - Finally, if you're feeling adventurous, try Rust's [[https://github.com/rust-shell-script/rust_cmd_lib][rust_cmd_lib]]. It's quite beautiful.
 
 * Licenses
-
 Dual-licensed under MIT and GPL v3 or later.
+
