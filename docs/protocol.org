@@ -61,7 +61,7 @@ Markers are written with =syswrite= to the worker's private copies of the respon
 Python parses each stream on its own:
 
 1. Before START, it keeps only the last =len(START)-1= bytes, so output left over from earlier requests, or written by background jobs between requests, is discarded.
-2. After START, it searches for the fixed prefix =\0BRISH3-END:<nonce>:=, resuming each search where the last one stopped.
+2. After START, it collects the chunks and searches for the fixed prefix =\0BRISH3-END:<nonce>:=. Only the new chunk plus the last =len(prefix)-1= bytes before it are searched, so a prefix split across reads is still found. The prefix starts with NUL, so a chunk with no NUL byte in it or in those carried-over bytes is not searched at all.
 3. Once the prefix is found, it waits for the newline after it and parses =<retcode>[:exit]=. Anything after the END line is dropped.
 
 Output cannot end a reply early, fake a retcode or leak into the next reply, because it would have to contain the nonce, and the nonce is never visible to the command: in non-fork mode it lives only in the positional parameters of the worker's handler function, and in fork mode =builtin set --= clears them in the subshell. The stdout END carries the authoritative retcode.
@@ -130,7 +130,7 @@ A command that deliberately reads or overwrites the worker's internals (its fd v
 * Python side
 - One =selectors.DefaultSelector= per worker watches both response pipes.
 - The whole frame is built before anything is written, so an encoding error leaves the worker untouched.
-- The frame is written non-blocking inside the same select loop that drains the response pipes. A blocking write deadlocks when the worker is still busy with an earlier, abandoned command that fills its output pipe.
+- The frame is written non-blocking inside the same select loop that drains the response pipes. A readable pipe is read until a read comes back short before the next select. A blocking write deadlocks when the worker is still busy with an earlier, abandoned command that fills its output pipe.
 - *Worker death* is any of: EOF on a response pipe, =EPIPE= on the request pipe, or the worker's PID gone when the pipes have been silent for 0.5 s (a background job can hold the pipes open after the worker dies). On death, Python first collects whatever the worker already wrote, then:
   - if START was seen, the command ran: the result carries the END retcode if one arrived, and otherwise retcode 9001 with =brish: worker died during this command= appended to stderr. The instance restarts before its next use;
   - if START was not seen, the command never ran: Python restarts the instance and retries once, and raises =BrishWorkerDiedException= if the retry fails too.

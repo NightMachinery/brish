@@ -34,6 +34,15 @@ def test_parser_at_every_split():
     for i in range(len(stream)):
         st.feed(stream[i : i + 1])
     assert st.done and st.payload() == payload
+    #: NUL-free chunks skip the END search; the END that follows them must
+    #: still be found when it is split at any point.
+    plain = b"x" * 1000
+    stream = start + plain + end + b"0\n"
+    for size in range(1, len(end) + 3):
+        st = _StreamParser(start, end)
+        for i in range(0, len(stream), size):
+            st.feed(stream[i : i + size])
+        assert st.done and st.payload() == plain and st.trailer == b"0", size
     assert _parse_trailer(b"42:exit") == (42, True)
     assert _parse_trailer(b"0") == (0, False)
     assert _parse_trailer(b"x") == (9001, True)

@@ -38,7 +38,7 @@ def test_g12_performance():
         big = {}
         for mb in (10, 40, 50):
             data = os.urandom(mb << 20)
-            for _ in range(2):
+            for _ in range(3):
                 dt, r = timed(lambda: binary.send_cmd("command wc -c", cmd_stdin=data))
                 assert int(r.out) == len(data), repr(r)[:200]
                 big[mb] = min(dt, big.get(mb, dt))
@@ -51,7 +51,7 @@ def test_g12_performance():
         single = "command perl -e 'print \"x\" x %d'" % n
         for name, cmd in (("many-line", lines), ("single-line", single)):
             tl, tb = [], []
-            for _ in range(3):
+            for _ in range(5):
                 dt, r = timed(lambda: legacy.send_cmd(cmd))
                 assert len(r.out) == n, (name, len(r.out))
                 tl.append(dt)

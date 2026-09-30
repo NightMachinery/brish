@@ -397,31 +397,38 @@ class _StreamParser:
     """Splits one response stream into the bytes between START and END.
 
     Before START it keeps only the last len(START)-1 bytes. After START it
-    searches for the fixed END prefix, resuming where the previous search
-    stopped, and once the prefix is found it waits for the newline that ends
-    the END line. Anything after the END line is dropped.
+    collects the chunks in a list, joined once at the end, and keeps the last
+    len(END)-1 payload bytes as `tail`, so that an END prefix split across
+    chunks is still found. END starts with NUL, so a chunk without NUL (and a
+    tail without NUL) cannot contain it and is not searched. Once the prefix
+    is found it waits for the newline that ends the END line. Anything after
+    the END line is dropped.
     """
 
-    __slots__ = ("start", "end", "pre", "buf", "scan", "found", "trailer", "done")
+    __slots__ = ("start", "end", "keep", "pre", "chunks", "tail", "after", "trailer", "done")
 
     def __init__(self, start, end_prefix):
         self.start = start
         self.end = end_prefix
+        self.keep = len(end_prefix) - 1
         self.pre = b""
-        self.buf = None  # a bytearray once START has been seen
-        self.scan = 0
-        self.found = -1
+        self.chunks = None  # a list once START has been seen
+        self.tail = b""
+        self.after = None  # the bytes after the END prefix, until its newline
         self.trailer = None
         self.done = False
 
     @property
     def started(self):
-        return self.buf is not None
+        return self.chunks is not None
 
     def feed(self, chunk):
         if self.done:
             return
-        if self.buf is None:
+        if self.after is not None:
+            self._finish(self.after + chunk)
+            return
+        if self.chunks is None:
             data = self.pre + chunk
             i = data.find(self.start)
             if i < 0:
@@ -429,24 +436,45 @@ class _StreamParser:
                 self.pre = data[-keep:] if len(data) > keep else data
                 return
             self.pre = b""
-            self.buf = bytearray(data[i + len(self.start) :])
-        else:
-            self.buf += chunk
-        if self.found < 0:
-            j = self.buf.find(self.end, self.scan)
-            if j < 0:
-                self.scan = max(0, len(self.buf) - len(self.end) + 1)
+            self.chunks = []
+            chunk = data[i + len(self.start) :]
+            if not chunk:
                 return
-            self.found = j
-        k = self.buf.find(b"\n", self.found + len(self.end))
-        if k < 0:
+        tail = self.tail
+        if b"\0" not in chunk and b"\0" not in tail:
+            self.chunks.append(chunk)
+            self.tail = chunk[-self.keep :] if len(chunk) >= self.keep else (tail + chunk)[-self.keep :]
             return
-        self.trailer = bytes(self.buf[self.found + len(self.end) : k])
-        del self.buf[self.found :]
+        window = tail + chunk
+        j = window.find(self.end)
+        if j < 0:
+            self.chunks.append(chunk)
+            self.tail = window[-self.keep :]
+            return
+        if j >= len(tail):
+            self.chunks.append(chunk[: j - len(tail)])
+        else:
+            #: END began in bytes already collected: take them back.
+            extra = len(tail) - j
+            while extra:
+                last = self.chunks.pop()
+                if len(last) > extra:
+                    self.chunks.append(last[:-extra])
+                    break
+                extra -= len(last)
+        self._finish(window[j + len(self.end) :])
+
+    def _finish(self, rest):
+        k = rest.find(b"\n")
+        if k < 0:
+            self.after = rest
+            return
+        self.after = None
+        self.trailer = rest[:k]
         self.done = True
 
     def payload(self):
-        return b"" if self.buf is None else bytes(self.buf)
+        return b"" if self.chunks is None else b"".join(self.chunks)
 
 
 def _parse_trailer(trailer):
@@ -1110,14 +1138,22 @@ class Brish:
                             writing_registered = False
                         continue
                     st = streams[fd]
-                    try:
-                        chunk = os.read(fd, _READ_CHUNK)
-                    except BlockingIOError:
-                        continue
-                    if not chunk:
-                        died = True
+                    #: Drain the pipe before selecting again: one select per
+                    #: pipe-buffer refill is a large share of the cost of a
+                    #: big reply.
+                    while True:
+                        try:
+                            chunk = os.read(fd, _READ_CHUNK)
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            died = True
+                            break
+                        st.feed(chunk)
+                        if st.done or len(chunk) < _READ_CHUNK:
+                            break
+                    if died:
                         break
-                    st.feed(chunk)
             if died:
                 #: Whatever the dead worker wrote is already buffered in the
                 #: pipes; collect it, so that START and END are not missed on
