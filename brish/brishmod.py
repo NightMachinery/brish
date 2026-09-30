@@ -99,18 +99,99 @@ def get_locals(
     return locals_
 
 
+_BYTES_LIKE = (bytes, bytearray, memoryview)
+
+
+def _bytes_view(s):
+    """Encode a text view back to bytes, never raising."""
+    try:
+        return s.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return s.encode("utf-8", "backslashreplace")
+
+
+def _text_view(x):
+    """A printable form of a command or stdin that may be bytes."""
+    if isinstance(x, _BYTES_LIKE):
+        return bytes(x).decode("utf-8", "backslashreplace")
+    return x
+
+
 @dataclass(frozen=True)
 class CmdResult:
+    """The result of one command.
+
+    The five fields are text. `outb` and `errb` are the byte views: the exact
+    bytes the command wrote when the result came from `from_bytes` (as in
+    binary mode), and otherwise the text views encoded back as UTF-8.
+    """
+
     retcode: int
     out: str
     err: str
-    cmd: Any  # Union[str, Iterable[str]]
-    cmd_stdin: str  # Union[str, None]
+    cmd: Any  # Union[str, bytes, Iterable[str]]
+    cmd_stdin: Any  # Union[str, bytes, None]
+
+    def __post_init__(self):
+        #: Bytes passed positionally become the byte views; the fields keep
+        #: their text.
+        for name in ("out", "err"):
+            value = getattr(self, name)
+            if isinstance(value, _BYTES_LIKE):
+                raw = bytes(value)
+                object.__setattr__(self, "_" + name + "b", raw)
+                object.__setattr__(self, name, raw.decode("utf-8", "backslashreplace"))
+        if isinstance(self.cmd_stdin, (bytearray, memoryview)):
+            object.__setattr__(self, "cmd_stdin", bytes(self.cmd_stdin))
+
+    @classmethod
+    def from_bytes(
+        cls,
+        retcode,
+        outb,
+        errb,
+        cmd,
+        cmd_stdin,
+        *,
+        encoding="utf-8",
+        errors="backslashreplace",
+    ):
+        """Build a result from raw output. The text views are decoded now,
+        with `encoding` and `errors`; the bytes are kept as they are."""
+        outb = bytes(outb)
+        errb = bytes(errb)
+        res = cls(
+            retcode,
+            outb.decode(encoding, errors),
+            errb.decode(encoding, errors),
+            cmd,
+            cmd_stdin,
+        )
+        object.__setattr__(res, "_outb", outb)
+        object.__setattr__(res, "_errb", errb)
+        return res
+
+    @property
+    def outb(self):
+        """The stdout bytes."""
+        b = self.__dict__.get("_outb")
+        return _bytes_view(self.out) if b is None else b
+
+    @property
+    def errb(self):
+        """The stderr bytes."""
+        b = self.__dict__.get("_errb")
+        return _bytes_view(self.err) if b is None else b
 
     @property
     def outrs(self):
         """out.rstrip('\\n')"""
         return self.out.rstrip("\n")
+
+    @property
+    def outrsb(self):
+        """outb.rstrip(b'\\n')"""
+        return self.outb.rstrip(b"\n")
 
     @property
     def summary(self):
@@ -121,11 +202,15 @@ class CmdResult:
         return self.out + self.err
 
     @property
+    def outerrb(self):
+        return self.outb + self.errb
+
+    @property
     def longstr(self):
         r = ""
         if self.cmd_stdin:
-            r += f"""\ncmd_stdin:\n{self.cmd_stdin}"""
-        r += f"""\ncmd: {self.cmd}"""
+            r += f"""\ncmd_stdin:\n{_text_view(self.cmd_stdin)}"""
+        r += f"""\ncmd: {_text_view(self.cmd)}"""
         if True or self.out:
             r += f"""\nstdout:\n{self.out}"""
         if self.err:
@@ -141,8 +226,14 @@ class CmdResult:
         # return iter(self.toTuple())
         return iter(self.outrs.split("\n"))
 
+    def iterb(self):
+        return iter(self.outrsb.split(b"\n"))
+
     def iter0(self):
         return iter(self.out.rstrip("\x00").split("\x00"))
+
+    def iter0b(self):
+        return iter(self.outb.rstrip(b"\x00").split(b"\x00"))
 
     # def __getitem__(self, index):
     #     return self.toTuple()[index]
@@ -152,6 +243,19 @@ class CmdResult:
 
     def __bool__(self):
         return self.retcode == 0
+
+    def __eq__(self, other):
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        return (
+            (self.retcode, self.out, self.err, self.cmd, self.cmd_stdin)
+            == (other.retcode, other.out, other.err, other.cmd, other.cmd_stdin)
+            and self.outb == other.outb
+            and self.errb == other.errb
+        )
+
+    def __hash__(self):
+        return hash((self.retcode, self.out, self.err, self.cmd, self.cmd_stdin))
 
     @property
     def assert_zero(self):
