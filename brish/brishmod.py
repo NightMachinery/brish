@@ -34,6 +34,8 @@ from dataclasses import dataclass
 import inspect
 from icecream import ic
 
+from .quoting import zsh_quote_bytes
+
 # http://docs.python.org/library/threading.html#rlock-objects
 from threading import RLock
 
@@ -291,41 +293,27 @@ class Brish:
             self.init(shell=self.lastShell, server_count=self.last_server_count)
 
     def zsh_quote(self, obj, use_shared_instance=True, retry_count=0, retry_limit=10):
+        """Quote `obj` as zsh words, in pure Python (no zsh process is used).
+
+        `None` gives an empty expansion, a `CmdResult` quotes its `outrs`, and
+        other iterables (except `str`) become one word per item. See
+        `brish.quoting` for the rules. The remaining arguments are accepted
+        for compatibility and ignored.
+        """
         if obj is None:
             return ""
 
-        if (
-            use_shared_instance
-        ):  # protects against accidentally reading output from previously running processes (background jobs)
-            # @perf perhaps using a specialized routine might be faster, or just calling =zsh -f=
-            self = _shared_brish
-
         typ = type(obj)
         if typ is CmdResult:
-            return self.zsh_quote(obj.outrs)
+            return self._quote_word(obj.outrs)
         elif not isinstance(obj, str) and isinstance(obj, Iterable):
-            result = []
-            for i in iter(obj):
-                # zsh doesn't support nested arrays, so we str the inner object.
-                result.append(self.zsh_quote(str(i)))
-            return " ".join(result)
+            # zsh doesn't support nested arrays, so we str the inner object.
+            return " ".join(self._quote_word(str(i)) for i in iter(obj))
         else:
-            res = self.send_cmd(
-                'print -rn -- "${(q+@)brish_stdin}"', cmd_stdin=str(obj)
-            )
-            if res:
-                return res.out
-            elif retry_count < retry_limit:
-                return self.zsh_quote(
-                    obj,
-                    use_shared_instance=use_shared_instance,
-                    retry_count=(retry_count + 1),
-                    retry_limit=retry_limit,
-                )
-            else:
-                raise Exception(
-                    f"Quoting object {repr(obj)} failed; CmdResult:\n{res.longstr}"
-                )
+            return self._quote_word(str(obj))
+
+    def _quote_word(self, s):
+        return zsh_quote_bytes(s.encode("utf-8", "surrogateescape"))
 
     def acquire_lock(self, server_index=None, lock_sleep=1):
         while True:

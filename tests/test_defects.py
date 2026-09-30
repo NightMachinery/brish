@@ -17,7 +17,6 @@ OPEN = {
     "F3": "NUL framing: output can forge the terminator",
     "F4": "stdin travels as str(cmd_stdin) through a text FIFO",
     "F5": "bytes values are interpolated as ints or reprs",
-    "F6": "(q+) quoting is unfaithful and injectable",
     "F7": "zstring rewrites CR in the template's literal text",
     "F8": "stdout is read to its terminator before any stderr",
     "F9": "readline() == '' at EOF never matches the delimiter",

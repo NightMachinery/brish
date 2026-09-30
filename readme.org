@@ -859,7 +859,11 @@ for future in concurrent.futures.as_completed(futures):
 
 
 * Security Considerations
-I am not a security expert, and security doesn't come by default in these situations. So be careful if you use untrusted input in the commands fed to zsh. Nevertheless, I can't imagine any (non-obvious) attack vectors, as the input gets automatically escaped by default. Feedback by security experts will be appreciated.
+Interpolated values are quoted in pure Python (see =brish/quoting.py=), and zsh reads each quoted word back as exactly the original bytes. So a value from an untrusted source is safe to interpolate as ={value}=, as long as nothing evaluates it as code a second time. The template's literal text is code, and so are values inserted with =:e=.
+
+Earlier versions quoted values with zsh's =${(q+)...}= flag, which mis-escapes some bytes and code points. Several of them are valid UTF-8 (U+001C, U+0080 to U+009F and U+00AD), and the broken escape can end the quoted word early, so the rest of the value ran as shell code. Upgrade if you interpolate untrusted text.
+
+I am not a security expert, and feedback by security experts will be appreciated.
 
 Note that you can create security holes for yourself, by, e.g., running =eval= on user input:
 
