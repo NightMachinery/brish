@@ -55,9 +55,9 @@ Hello A$ron
 #+end_example
 
 
-#+begin_src python :session p1 :var t1=t1 :results value :exports none :tangle tests/test_tangled1.py
+#+begin_src python :session p1 :results value :exports none :tangle tests/test_tangled1.py
 def test1():
-    assert t1 == "Hello A$ron"
+    assert z("echo Hello {name}").outrs == "Hello A$ron"
     return True
 NI or test1()
 #+end_src
@@ -82,9 +82,9 @@ z("for i in {alist} ; do echo $i ; done")
 3. Strawberry
 #+end_example
 
-#+begin_src python :session p1 :var t2=t2 :results value :exports none :tangle tests/test_tangled1.py
+#+begin_src python :session p1 :results value :exports none :tangle tests/test_tangled1.py
 def test2():
-    assert t2 == """# Fruits
+    assert z("for i in {alist} ; do echo $i ; done").outrs == """# Fruits
 1. Orange
 2. Rambutan
 3. Strawberry"""
@@ -155,15 +155,17 @@ else:
 HOME exists!
 #+end_example
 
-#+begin_src python :session p1 :var t3=t3 :results value :exports none :tangle tests/test_tangled1.py
-assert t3 == "HOME exists!"
+#+begin_src python :session p1 :results value :exports none :tangle tests/test_tangled1.py
+def test3():
+    assert z("test -e ~/")
+NI or test3()
 #+end_src
 
 #+RESULTS:
 
 ~CmdResult~ is smart about iterating:
 #+name: t4
-#+begin_src python :session p1 :results output :exports both :tangle tests/test_tangled1.py
+#+begin_src python :session p1 :results output :exports both
 for path in z("command ls ~/tmp/"): # `command` helps bypass potential aliases defined on `ls`
     zp("du -h ~/tmp/{path}") # zp prints the result
 #+end_src

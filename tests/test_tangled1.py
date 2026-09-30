@@ -5,18 +5,16 @@ NI = True
 name="A$ron"
 z("echo Hello {name}")
 
-t1=""
 def test1():
-    assert t1 == "Hello A$ron"
+    assert z("echo Hello {name}").outrs == "Hello A$ron"
     return True
 NI or test1()
 
 alist = ["# Fruits", "1. Orange", "2. Rambutan", "3. Strawberry"]
 z("for i in {alist} ; do echo $i ; done")
 
-t2=""
 def test2():
-    assert t2 == """# Fruits
+    assert z("for i in {alist} ; do echo $i ; done").outrs == """# Fruits
 1. Orange
 2. Rambutan
 3. Strawberry"""
@@ -27,8 +25,6 @@ if z("test -e ~/"):
 else:
     print("We're homeless :(")
 
-t3=""
-assert t3 == "HOME exists!"
-
-for path in z("command ls ~/tmp/"): # `command` helps bypass potential aliases defined on `ls`
-    zp("du -h ~/tmp/{path}") # zp prints the result
+def test3():
+    assert z("test -e ~/")
+NI or test3()
