@@ -18,10 +18,6 @@ OPEN = {
     "F4": "stdin travels as str(cmd_stdin) through a text FIFO",
     "F5": "bytes values are interpolated as ints or reprs",
     "F7": "zstring rewrites CR in the template's literal text",
-    "F8": "stdout is read to its terminator before any stderr",
-    "F9": "readline() == '' at EOF never matches the delimiter",
-    "F10": "an interrupt leaves results one behind",
-    "F11": "restart drops init kwargs and races with other threads",
 }
 
 

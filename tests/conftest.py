@@ -130,12 +130,12 @@ BINARY = {binary!r}
 """
 
 
-def run_py(code, timeout=60, real_env=False, env=None, cwd=None, allow_orphans=False):
+def run_py(code, timeout=60, real_env=False, env=None, cwd=None, allow_orphans=False, setup=""):
     """Run `code` in a child python with a timeout. Returns a ChildResult.
 
     `real_env=False` points ZDOTDIR at an empty directory, so the workers
     start fast and deterministically. `real_env=True` keeps the caller's zsh
-    startup files.
+    startup files. `setup` is more code, dedented on its own and run first.
     """
     scratch = tempfile.mkdtemp(prefix="child-", dir=_SCRATCH)
     child_env = dict(os.environ)
@@ -150,7 +150,11 @@ def run_py(code, timeout=60, real_env=False, env=None, cwd=None, allow_orphans=F
                 child_env.pop(k, None)
             else:
                 child_env[k] = v
-    src = PRELUDE.format(root=str(ROOT), scratch=scratch, binary=BINARY) + textwrap.dedent(code)
+    src = (
+        PRELUDE.format(root=str(ROOT), scratch=scratch, binary=BINARY)
+        + textwrap.dedent(setup)
+        + textwrap.dedent(code)
+    )
     p = subprocess.Popen(
         [sys.executable, "-c", src],
         env=child_env,

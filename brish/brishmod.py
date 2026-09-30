@@ -20,7 +20,12 @@ except ImportError:
 import sys
 import time
 import os
+import errno
+import codecs
+import signal
 import shutil
+import subprocess
+import threading
 import tempfile
 from collections.abc import Iterable
 from typing import Union, Any
@@ -37,7 +42,7 @@ from icecream import ic
 from .quoting import zsh_quote_bytes
 
 # http://docs.python.org/library/threading.html#rlock-objects
-from threading import RLock
+from threading import RLock, Lock
 
 
 def idem(x):
@@ -160,6 +165,130 @@ class UninitializedBrishException(Exception):
     pass
 
 
+class BrishWorkerDiedException(Exception):
+    """A worker could not run the command: it died before the command started,
+    and the restarted instance could not run it either."""
+
+    pass
+
+
+#: Return code of a command whose worker died before reporting a status.
+RETCODE_WORKER_DIED = 9001
+WORKER_DIED_NOTE = "brish: worker died during this command"
+
+_NEVER_RAN = object()
+
+
+def _with_note(err, note):
+    if err and not err.endswith("\n"):
+        err += "\n"
+    return err + note + "\n"
+
+
+def _child_pids(pid):
+    """PIDs whose parent is `pid`, from `ps` (used only on slow shutdown paths)."""
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid="], capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception:
+        return []
+    kids = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == str(pid):
+            kids.append(int(parts[0]))
+    return kids
+
+
+def _signal_pids(pids, sig):
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _stop_pids(pids, grace=1.0):
+    """SIGTERM `pids`, then SIGKILL whichever are still alive after `grace`."""
+    if not pids:
+        return
+    _signal_pids(pids, signal.SIGTERM)
+    deadline = time.time() + grace
+    while time.time() < deadline and any(_alive(pid) for pid in pids):
+        time.sleep(0.01)
+    _signal_pids([pid for pid in pids if _alive(pid)], signal.SIGKILL)
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+class _ErrReader:
+    """Reads one legacy stderr reply in a helper thread.
+
+    If the reply never completes (an interrupt, or a dead worker whose stderr
+    FIFO is still held open by a background job), the thread is left running
+    and owns the file: cleanup() does not close a file that a live helper is
+    blocked on, because closing a buffered file waits for its lock.
+    """
+
+    def __init__(self, f, delim):
+        self.f = f
+        self.delim = delim
+        self.text = ""
+        self.eof = False
+        self.exc = None
+        self.done = False
+        self.close_when_done = False
+        self._lock = Lock()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            self.text, self.eof = _legacy_read_reply(self.f, self.delim)
+        except BaseException as e:
+            self.exc = e
+        finally:
+            with self._lock:
+                self.done = True
+                close = self.close_when_done
+            if close:
+                try:
+                    self.f.close()
+                except Exception:
+                    pass
+
+    def close_or_hand_over(self):
+        with self._lock:
+            if not self.done:
+                self.close_when_done = True
+                return
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+
+def _legacy_read_reply(f, delim):
+    """Read lines until `delim`. Returns (text, eof)."""
+    lines = []
+    while True:
+        line = f.readline()
+        if line == delim:
+            return "".join(lines)[:-1], False
+        if line == "":
+            return "".join(lines), True
+        lines.append(line)
+
+
 class Brish:
     """Brish is a bridge between Python and an interpreter. The interpreter needs to adhere to the Brish protocol. A zsh interpreter is provided, and is the default. Threadsafe."""
 
@@ -175,6 +304,10 @@ class Brish:
         **kwargs,
     ):
         self.lock = RLock()
+        #: `init()` arguments are kept on the instance, so that `restart()`
+        #: and a delayed first use start the same kind of worker.
+        self.encoding = kwargs.get("encoding") or "utf-8"
+        self.decoding_errors = kwargs.get("decoding_errors") or "backslashreplace"
         if boot_cmd:
             self.boot_cmd = _shared_brish.zstring(boot_cmd, getframe=2)
         else:
@@ -185,9 +318,19 @@ class Brish:
             "--",
             "BR" + "I" * 2048 + "SH",
         ]  # Reserve big argv for `insubshell`
-        self.lastShell = self.defaultShell
+        self.lastShell = kwargs.get("shell") or self.defaultShell
         self.last_server_count = server_count
         self.p = None
+        self.locks = []
+        #: Bumped by every init(); a restart requested for an older
+        #: generation is already done.
+        self._gen = 0
+        #: The generation that must restart before its next use.
+        self._restart_gen = None
+        #: A failed restart leaves the instance uninitialized; the next use
+        #: tries again instead of raising UninitializedBrishException.
+        self._init_on_use = False
+        self._booting = False
         self.delayed_init = delayed_init
         if not self.delayed_init:
             self.init(**kwargs)
@@ -196,101 +339,166 @@ class Brish:
         self,
         shell=None,
         server_count=None,
-        decoding_errors="backslashreplace",
+        decoding_errors=None,
         # https://docs.python.org/3/library/codecs.html#codec-base-classes
-        encoding="utf-8",
+        encoding=None,
     ):
         with self.lock:
+            if self.p is not None:
+                self.cleanup()
+
+            if encoding is not None:
+                self.encoding = encoding
+            if decoding_errors is not None:
+                self.decoding_errors = decoding_errors
             if not server_count:
                 server_count = self.last_server_count
 
             if shell is None:
-                shell = self.defaultShell
+                shell = self.lastShell or self.defaultShell
 
             self.lastShell = shell
             self.last_server_count = server_count
-
-            tmpdir = tempfile.mkdtemp()
-
             assert server_count >= 1
-            self.locks = [RLock() for i in range(server_count)]
-            brish_stdin_paths = [
-                os.path.join(tmpdir, f"brish_{i}_stdin") for i in range(server_count)
-            ]
-            brish_stdout_paths = [
-                os.path.join(tmpdir, f"brish_{i}_stdout") for i in range(server_count)
-            ]
-            brish_stderr_paths = [
-                os.path.join(tmpdir, f"brish_{i}_stderr") for i in range(server_count)
-            ]
-            brish_stdins = [os.mkfifo(p) for p in brish_stdin_paths]
-            brish_stdouts = [os.mkfifo(p) for p in brish_stdout_paths]
-            brish_stderrs = [os.mkfifo(p) for p in brish_stderr_paths]
 
-            self.p = Popen(
-                shell,
-                stdin=PIPE,
-                stdout=PIPE,
-                stderr=PIPE,
-                env=dict(
-                    os.environ,
-                ),
-                text=True,
-                errors=decoding_errors,  # escape invalid utf-8 bytes
-                encoding=encoding,
-            )
+            self._gen += 1
+            self._restart_gen = None
+            try:
+                self._init_legacy(shell, server_count)
+            except BaseException:
+                self._init_on_use = True
+                raise
+            self._init_on_use = False
+
+            if self.boot_cmd is not None:
+                self._booting = True
+                try:
+                    return [
+                        self.send_cmd(self.boot_cmd, fork=False, server_index=i)
+                        for i in range(server_count)
+                    ]
+                finally:
+                    self._booting = False
+
+    def _init_legacy(self, shell, server_count):
+        encoding = self.encoding
+        decoding_errors = self.decoding_errors
+        tmpdir = tempfile.mkdtemp()
+
+        brish_stdin_paths = [
+            os.path.join(tmpdir, f"brish_{i}_stdin") for i in range(server_count)
+        ]
+        brish_stdout_paths = [
+            os.path.join(tmpdir, f"brish_{i}_stdout") for i in range(server_count)
+        ]
+        brish_stderr_paths = [
+            os.path.join(tmpdir, f"brish_{i}_stderr") for i in range(server_count)
+        ]
+        for path in brish_stdin_paths + brish_stdout_paths + brish_stderr_paths:
+            os.mkfifo(path)
+
+        p = Popen(
+            shell,
+            stdin=PIPE,
+            stdout=PIPE,
+            stderr=PIPE,
+            env=dict(
+                os.environ,
+            ),
+            text=True,
+            errors=decoding_errors,  # escape invalid utf-8 bytes
+            encoding=encoding,
+        )
+        p.tmpdir = tmpdir
+        p.gen = self._gen
+        p.binary = False
+        p.server_count = server_count
+        p.free_server_count = server_count
+        p.brish_stdin_paths = brish_stdin_paths
+        p.brish_stdout_paths = brish_stdout_paths
+        p.brish_stderr_paths = brish_stderr_paths
+        p.brish_stdins = []
+        p.brish_stdouts = []
+        p.brish_stderrs = []
+        p.err_readers = [None] * server_count
+        try:
             BRISH_STDIN = "\n".join(brish_stdin_paths)
             BRISH_STDOUT = "\n".join(brish_stdout_paths)
             BRISH_STDERR = "\n".join(brish_stderr_paths)
-            print(
-                BRISH_STDIN
-                + self.MARKER
-                + BRISH_STDOUT
-                + self.MARKER
-                + BRISH_STDERR
-                + self.MARKER,
-                file=self.p.stdin,
-                flush=True,
-            )
-            self.p.tmpdir = tmpdir
-            self.p.server_count = server_count
-            self.p.free_server_count = server_count
-            self.p.brish_stdin_paths = brish_stdin_paths
-            self.p.brish_stdout_paths = brish_stdout_paths
-            self.p.brish_stderr_paths = brish_stderr_paths
-            self.p.brish_stdins = [
-                open(
-                    p,
-                    "w",
-                    errors="strict",
-                    encoding=encoding,
+            try:
+                print(
+                    BRISH_STDIN
+                    + self.MARKER
+                    + BRISH_STDOUT
+                    + self.MARKER
+                    + BRISH_STDERR
+                    + self.MARKER,
+                    file=p.stdin,
+                    flush=True,
                 )
-                for p in self.p.brish_stdin_paths
-            ]
-            self.p.brish_stdouts = [
-                open(p, "r", errors=decoding_errors, encoding=encoding)
-                for p in self.p.brish_stdout_paths
-            ]
-            self.p.brish_stderrs = [
-                open(
-                    p,
-                    "r",
-                    errors=decoding_errors,
-                    encoding=encoding,
+            except BrokenPipeError:
+                raise BrishWorkerDiedException(
+                    f"the shell exited during startup (status {p.wait()}): {shell[0]!r}"
                 )
-                for p in self.p.brish_stderr_paths
-            ]
+            #: Open each request FIFO without blocking, so that a shell that
+            #: dies before opening its end is noticed instead of hanging init.
+            for path in brish_stdin_paths:
+                p.brish_stdins.append(
+                    open(
+                        self._legacy_open_request_fifo(path, p, shell),
+                        "w",
+                        errors="strict",
+                        encoding=encoding,
+                    )
+                )
+            for path in brish_stdout_paths:
+                p.brish_stdouts.append(
+                    open(path, "r", errors=decoding_errors, encoding=encoding)
+                )
+            for path in brish_stderr_paths:
+                p.brish_stderrs.append(
+                    open(path, "r", errors=decoding_errors, encoding=encoding)
+                )
+        except BaseException:
+            self._cleanup_legacy(p)
+            raise
+        self.locks = [RLock() for i in range(server_count)]
+        self.p = p
 
-            if self.boot_cmd is not None:
-                return [
-                    self.send_cmd(self.boot_cmd, fork=False, server_index=i)
-                    for i in range(server_count)
-                ]
+    @staticmethod
+    def _legacy_open_request_fifo(path, p, shell):
+        while True:
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError as e:
+                if e.errno != errno.ENXIO:
+                    raise
+                if p.poll() is not None:
+                    raise BrishWorkerDiedException(
+                        f"the shell exited during startup (status {p.returncode}): {shell[0]!r}"
+                    )
+                time.sleep(0.002)
+        os.set_blocking(fd, True)
+        return fd
 
     def restart(self):
         with self.lock:
             self.cleanup()
+            self.delayed_init = False
             self.init(shell=self.lastShell, server_count=self.last_server_count)
+
+    def _request_restart(self, gen):
+        """Restart generation `gen` before its next use."""
+        if gen == self._gen:
+            self._restart_gen = gen
+
+    def _restart_now(self, gen):
+        """Restart unless generation `gen` has already been replaced. Never
+        call this while holding a worker lock."""
+        with self.lock:
+            if gen == self._gen or self.p is None:
+                self.restart()
 
     def zsh_quote(self, obj, use_shared_instance=True, retry_count=0, retry_limit=10):
         """Quote `obj` as zsh words, in pure Python (no zsh process is used).
@@ -313,91 +521,132 @@ class Brish:
             return self._quote_word(str(obj))
 
     def _quote_word(self, s):
-        return zsh_quote_bytes(s.encode("utf-8", "surrogateescape"))
+        encoding = self.encoding
+        utf8 = codecs.lookup(encoding).name == "utf-8"
+        return zsh_quote_bytes(s.encode(encoding, "surrogateescape"), ascii_only=not utf8)
 
     def acquire_lock(self, server_index=None, lock_sleep=1):
+        lock, server_index, _ = self._acquire(server_index, lock_sleep)
+        return lock, server_index
+
+    def _acquire(self, server_index=None, lock_sleep=1):
+        """Lock one worker. Returns (lock, server_index, p).
+
+        A pending restart runs here, before the worker lock is taken, so a
+        thread never restarts while holding a worker lock.
+        """
         while True:
-            if self.p is None:
-                if self.delayed_init:
-                    self.delayed_init = False
+            with self.lock:
+                if self.p is not None and self._restart_gen == self._gen:
                     self.restart()
-                else:
-                    raise UninitializedBrishException(
-                        "acquire_lock called with an uninitialized Brish"
-                    )
+                if self.p is None:
+                    if self.delayed_init or self._init_on_use:
+                        self.delayed_init = False
+                        self.restart()
+                    else:
+                        raise UninitializedBrishException(
+                            "acquire_lock called with an uninitialized Brish"
+                        )
+                current_p = self.p
+                locks = self.locks
 
-            assert len(self.locks) >= 1
-            current_p = self.p
+            assert len(locks) >= 1
             lock = None
-            if server_index == None:
-                acquired = False
-                while acquired == False:
-                    for i, c_lock in enumerate(self.locks):
-                        acquired = c_lock.acquire(blocking=False)
+            if server_index is None:
+                for i in self._worker_order(current_p):
+                    if locks[i].acquire(blocking=False):
                         # https://docs.python.org/3/library/threading.html#threading.Lock.acquire
+                        lock, index = locks[i], i
+                        break
+                if lock is None:
+                    if lock_sleep is not None:
+                        time.sleep(lock_sleep)
+                        continue
+                    index = random.randrange(len(locks))
+            else:
+                index = server_index
 
-                        if acquired == True:
-                            lock = c_lock
-                            server_index = i
-                            break
-
-                    if acquired == False:
-                        if lock_sleep != None:
-                            time.sleep(lock_sleep)
-                        else:
-                            break
-
-                if acquired == False:
-                    # server_index = random.randrange(self.p.server_count)
-                    server_index = random.randrange(len(self.locks))
-
-            if lock == None:
+            if lock is None:
                 try:
-                    lock = self.locks[server_index]
-                except:
-                    ic(len(self.locks), server_index)
+                    lock = locks[index]
+                except IndexError:
+                    ic(len(locks), index)
                     time.sleep(1)
                     continue
-
                 lock.acquire()
 
-            ##
-            # f1 is f2 checks if two references are to the same object. Under the hood, this compares the results of id(f1) == id(f2) using the id builtin function, which returns a integer that's guaranteed unique to the object (but only within the object's lifetime).
-            # Under CPython, this integer happens to be the address of the object in memory, though the docs mention you should pretend you don't know that (since other implementation may have other methods of generating the id).
-            if self.p == current_p:
-                # since we have acquired a lock, self.p can no longer change so there is no race condition anymore
-                return lock, server_index
-            else:
-                lock.release()
-                continue
+            #: Holding a worker lock, `self.p` can no longer be replaced.
+            if self.p is current_p:
+                return lock, index, current_p
+            lock.release()
+
+    def _worker_order(self, p):
+        return range(len(self.locks))
 
     def send_cmd(
-        self, cmd: str, cmd_stdin="", fork=False, server_index=None, lock_sleep=1
+        self, cmd, cmd_stdin="", fork=False, server_index=None, lock_sleep=1
     ):
-        lock, server_index = self.acquire_lock(
-            server_index=server_index, lock_sleep=lock_sleep
-        )
-        try:
-            self.p.free_server_count -= 1
-            cmd_stdin = str(cmd_stdin)
-            # assert  isinstance(cmd, str)
-            if cmd == "%BRISH_RESTART":
-                self.restart()
-                return CmdResult(0, "Restarted succesfully.", "", cmd, cmd_stdin)
-            if any(self.MARKER in input for input in (cmd, cmd_stdin)):
-                return CmdResult(
-                    9000,
-                    "",
-                    "Illegal input: Input contained the Brish marker (currently the NUL character).",
-                    cmd,
-                    cmd_stdin,
-                )
-            delim = self.MARKER + "\n"
+        if cmd == "%BRISH_RESTART":
+            #: Handled before any worker lock is taken: restarting needs every
+            #: worker lock, so holding one here could deadlock with another
+            #: thread's restart().
+            self.restart()
+            return CmdResult(0, "Restarted succesfully.", "", cmd, str(cmd_stdin))
+        return self._send_legacy(cmd, cmd_stdin, fork, server_index, lock_sleep)
 
-            cmd_processed = (
-                cmd + self.MARKER + cmd_stdin + self.MARKER + boolsh(fork) + self.MARKER
+    def _send_legacy(self, cmd, cmd_stdin, fork, server_index, lock_sleep):
+        cmd_stdin = str(cmd_stdin)
+        # assert  isinstance(cmd, str)
+        if any(self.MARKER in input for input in (cmd, cmd_stdin)):
+            return CmdResult(
+                9000,
+                "",
+                "Illegal input: Input contained the Brish marker (currently the NUL character).",
+                cmd,
+                cmd_stdin,
             )
+        cmd_processed = (
+            cmd + self.MARKER + cmd_stdin + self.MARKER + boolsh(fork) + self.MARKER
+        )
+        #: Fail on unencodable input before anything reaches a worker.
+        (cmd_processed + "\n").encode(self.encoding)
 
+        for attempt in range(2):
+            lock, index, p = self._acquire(server_index, lock_sleep)
+            outcome = None
+            try:
+                p.free_server_count -= 1
+                outcome = self._legacy_transact(p, index, cmd_processed, cmd, cmd_stdin)
+            except BaseException:
+                #: An interrupt leaves a half-written request or a half-read
+                #: reply, and possibly a helper thread that would consume the
+                #: next reply's stderr. Restart before the next use.
+                p.interrupted = True
+                self._request_restart(p.gen)
+                raise
+            finally:
+                p.free_server_count += 1
+                lock.release()
+
+            if outcome is _NEVER_RAN:
+                if self._booting:
+                    raise BrishWorkerDiedException(
+                        "a worker died before running the boot command"
+                    )
+                self._restart_now(p.gen)
+                continue
+            result, died = outcome
+            if died:
+                self._request_restart(p.gen)
+            return result
+
+        raise BrishWorkerDiedException(
+            "a worker died before running the command, twice"
+        )
+
+    def _legacy_transact(self, p, index, cmd_processed, cmd, cmd_stdin):
+        delim = self.MARKER + "\n"
+        try:
             ##
             # trying to open the stdin as binary. It didn't work, idk why.
             # cmd_processed = cmd_processed.encode()
@@ -405,25 +654,50 @@ class Brish:
             ##
             print(
                 cmd_processed,
-                file=self.p.brish_stdins[server_index],
+                file=p.brish_stdins[index],
                 flush=True,
             )
-            ##
+        except BrokenPipeError:
+            #: The worker is gone; it cannot have read the whole request.
+            return _NEVER_RAN
 
-            stdout = ""
-            # embed()
-            for line in iter(self.p.brish_stdouts[server_index].readline, delim):
-                stdout += line
-            stdout = stdout[:-1]
-            return_code = int(self.p.brish_stdouts[server_index].readline())
-            stderr = ""
-            for line in iter(self.p.brish_stderrs[server_index].readline, delim):
-                stderr += line
-            stderr = stderr[:-1]
-            return CmdResult(return_code, stdout, stderr, cmd, cmd_stdin)
-        finally:
-            self.p.free_server_count += 1
-            lock.release()
+        #: Read stderr concurrently: a command that fills the stderr FIFO
+        #: before finishing its stdout would otherwise deadlock.
+        err_reader = _ErrReader(p.brish_stderrs[index], delim)
+        p.err_readers[index] = err_reader
+        stdout, died = _legacy_read_reply(p.brish_stdouts[index], delim)
+        return_code = None
+        if not died:
+            rc_line = p.brish_stdouts[index].readline()
+            if rc_line == "":
+                died = True
+            else:
+                return_code = int(rc_line)
+        err_reader.thread.join(2 if died else None)
+        if err_reader.exc is not None:
+            raise err_reader.exc
+        stderr = err_reader.text
+        if err_reader.done:
+            p.err_readers[index] = None
+            died = died or err_reader.eof
+        else:
+            #: A background job holds the dead worker's stderr open.
+            died = True
+        if died:
+            #: The caller restarts the instance before its next use.
+            if return_code is None:
+                return_code = RETCODE_WORKER_DIED
+            return (
+                CmdResult(
+                    return_code,
+                    stdout,
+                    _with_note(stderr, WORKER_DIED_NOTE),
+                    cmd,
+                    cmd_stdin,
+                ),
+                True,
+            )
+        return CmdResult(return_code, stdout, stderr, cmd, cmd_stdin), False
 
     def cleanup(self):
         with self.lock:
@@ -433,28 +707,53 @@ class Brish:
             for lock in locks:
                 lock.acquire()
             try:
-                self.p.stdout.close()
-                if self.p.stderr:
-                    self.p.stderr.close()
-                self.p.stdin.close()
-
-                for p in self.p.brish_stdins:
-                    p.close()
-
-                for p in self.p.brish_stdouts:
-                    p.close()
-
-                for p in self.p.brish_stderrs:
-                    p.close()
-
-                shutil.rmtree(self.p.tmpdir)
-
-                self.p.wait()
+                p = self.p
                 self.p = None
                 self.locks = []
+                self._cleanup_legacy(p)
             finally:
                 for lock in locks:
                     lock.release()
+
+    @staticmethod
+    def _cleanup_legacy(p):
+        def close(f):
+            try:
+                f.close()
+            except Exception:
+                pass
+
+        if getattr(p, "interrupted", False):
+            #: A worker may hold a truncated request. Closing its FIFO would
+            #: let it run the command with truncated stdin, so stop it first.
+            _stop_pids(_child_pids(p.pid))
+
+        for f in (p.stdout, p.stderr, p.stdin):
+            if f is not None:
+                close(f)
+        for f in p.brish_stdins:
+            close(f)
+        for f in p.brish_stdouts:
+            close(f)
+        readers = getattr(p, "err_readers", [])
+        for i, f in enumerate(p.brish_stderrs):
+            reader = readers[i] if i < len(readers) else None
+            if reader is not None:
+                reader.close_or_hand_over()
+            else:
+                close(f)
+        shutil.rmtree(p.tmpdir, ignore_errors=True)
+        #: Workers exit once their request FIFO closes, unless a command is
+        #: still running (after an interrupt). Do not wait for it for long.
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            _stop_pids(_child_pids(p.pid))
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
 
     _conversions = {"a": ascii, "r": repr, "s": str, "e": idem, "b": boolsh}
 
