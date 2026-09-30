@@ -1,0 +1,155 @@
+#+TITLE: Protocol BRISH3
+
+This is the wire protocol of Brish's binary mode, spoken between =brish/brishmod.py= and the worker script =brish/brish3.zsh=. Legacy mode (=brish/brish2.zsh=) is described at the end for contrast; its wire format is frozen.
+
+* Terms
+- *Bootstrap*: the zsh process Python starts. It loads the startup files once and forks the workers.
+- *Worker*: one zsh subshell that serves requests, one at a time.
+- *Request pipe*, *response pipes*: per worker, one anonymous pipe Python writes requests to, and two (stdout and stderr) the worker answers on.
+- *Frame*: the bytes Python writes for one request.
+- *Marker*: an in-band line a worker writes into its response pipes. Every marker starts with a NUL byte and ends with a newline.
+- *Nonce*: 128 random bits in lowercase hex (32 characters), fresh for every request.
+
+* Processes and file descriptors
+Python creates three pipes per worker with =os.pipe()= and starts the bootstrap with the child ends in =pass_fds=:
+
+#+begin_example
+brish3.zsh -- BRIII...IIISH BRISH3-FDS <req>,<out>,<err> [<req>,<out>,<err> ...]
+#+end_example
+
+- Everything before =BRISH3-FDS= is left alone. The long =BRI...SH= word is the argv reservation that lets tools rewrite the process title in place.
+- There is one =<req>,<out>,<err>= triple of fd numbers per worker, in order. Worker =i= (1-based) gets triple =i= and sets =$brish_server_index= to =i=.
+- The bootstrap's stdin is a pipe from Python and its stdout is =/dev/null=. Its stderr is inherited, so startup errors stay visible.
+- A bootstrap started without =BRISH3-FDS= (for example by an older Python that still speaks the legacy protocol) prints an error and exits with status 64 without running anything.
+
+The bootstrap forks the workers at top level, so each one inherits the options, functions and aliases the startup files left behind. It then closes every passed fd and reads its stdin until EOF. That EOF comes when Python closes the pipe in =cleanup()= or dies, and the bootstrap then sends SIGTERM to the workers and waits for them. It reads with =read=, not =sysread=, because zsh reaps exited children while blocked in =read= but not in =sysread=, and Python's liveness check cannot tell a zombie from a live worker.
+
+Each worker:
+1. closes the other workers' fds;
+2. moves its own three fds above 9 and closes the originals, so that a command's =exec 3>file= cannot clobber them, and the request fd still has exactly one reader;
+3. opens its *empty-stdin pipe*, an always-EOF pipe (=exec {fd}< <(builtin true)=) that is the default stdin of every command;
+4. points its own fd 0 at =/dev/null= and fds 1 and 2 at the response pipes, so stray output between requests lands where Python discards it;
+5. writes =\0BRISH3-HELLO:<pid>\n= on its stdout pipe, where =<pid>= is =$sysparams[pid]= (inside a subshell, =$$= is the bootstrap's PID).
+
+Python waits for every HELLO, with a startup timeout of 30 seconds by default (=Brish(startup_timeout=...)=), and records each worker's PID. A worker that exits before its HELLO, or no HELLO before the timeout, raises =BrishWorkerDiedException= with "not a BRISH3 worker" in the message.
+
+* Request frame
+#+begin_example
+BRISH3 <nonce> <cmd_len> <stdin_len> <fork>\n<cmd bytes><stdin bytes>
+#+end_example
+
+- The header is ASCII, one line, five fields separated by single spaces.
+- =<cmd_len>= and =<stdin_len>= are decimal byte counts (at most 15 digits). =<stdin_len>= may instead be =-=, which means "no stdin": the command reads =/dev/null= and no stdin bytes follow. A length of =0= means the empty-stdin pipe.
+- =<fork>= is =1= to run the command in a subshell, =0= to run it in the worker itself.
+
+The worker validates the header before doing any arithmetic with it, because zsh arithmetic performs command substitution. Anything else (a bad header, or EOF inside a payload) makes the worker exit without running anything; a frame of the legacy protocol, which is NUL-separated text, is one such case.
+
+Payloads are read with =sysread= in chunks of at most 64 KiB, each straight into the next element of an array, and joined once in a quoted expansion. Appending to a scalar with =+== is quadratic, and unquoted expansions of large values are several times slower. The command lands in =$BRISH3_CMD= and, for compatibility, in =$cmd=. The stdin lands in =$brish_stdin=.
+
+* Reply
+For every request the worker writes, on both response pipes:
+
+#+begin_example
+\0BRISH3-START:<nonce>\n
+... the command's output ...
+\0BRISH3-END:<nonce>:<retcode>\n        after the command returns
+\0BRISH3-END:<nonce>:<retcode>:exit\n   from the EXIT trap, when the command exits the worker
+#+end_example
+
+Markers are written with =syswrite= to the worker's private copies of the response fds. Each marker is shorter than =PIPE_BUF= (512 bytes), so it is written atomically even when background jobs share the pipe. The command itself runs with call-site redirections to those fds, so a command's =exec >file= is undone when it returns.
+
+Python parses each stream on its own:
+
+1. Before START, it keeps only the last =len(START)-1= bytes, so output left over from earlier requests, or written by background jobs between requests, is discarded.
+2. After START, it searches for the fixed prefix =\0BRISH3-END:<nonce>:=, resuming each search where the last one stopped.
+3. Once the prefix is found, it waits for the newline after it and parses =<retcode>[:exit]=. Anything after the END line is dropped.
+
+Output cannot end a reply early, fake a retcode or leak into the next reply, because it would have to contain the nonce, and the nonce is never visible to the command: in non-fork mode it lives only in the positional parameters of the worker's handler function, and in fork mode =builtin set --= clears them in the subshell. The stdout END carries the authoritative retcode.
+
+* Execution
+A non-fork command runs as the body of a function:
+
+#+begin_src zsh
+builtin eval "function tmp_block_8182782 {"$'\n'"$BRISH3_CMD"$'\n'"}" &&
+  tmp_block_8182782 <stdin >&out 2>&err
+#+end_src
+
+- The function body lets the command use =return=.
+- The =&&= matters: after a syntax error, the function from the previous request must not run again.
+- The body goes through =eval= and not =functions[tmp_block_8182782]==, because assigning to =functions= does not unmetafy the body and so corrupts NUL and the bytes 0x83 to 0x9D.
+
+A fork command runs as =( builtin set --; builtin eval "$BRISH3_CMD" )= with the same redirections. When the request has stdin bytes, the command reads them through a pipeline:
+
+#+begin_src zsh
+{ builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | tmp_block_8182782 ...
+#+end_src
+
+The writer ignores SIGPIPE and always succeeds, so a command that does not read its stdin still reports its own status under =pipefail=, and the write error goes to =/dev/null= (zsh reports it when the writer exits, so the redirection covers the whole group). Without stdin bytes no process is forked.
+
+** Loop structure, and why
+#+begin_src zsh
+brish3_run() {  # $1 nonce, $2 fork, $3 stdin mode; no locals: user code runs in here
+  BRISH3_NONCE=
+  {
+    repeat 1 do        # absorbs a bare break or continue
+      ...run the command as above...
+    done
+  } always {
+    BRISH3_RET=$? BRISH3_NONCE=$1
+    TRY_BLOCK_ERROR=0  # NOMATCH and other shell errors do not end the serve loop
+    builtin unsetopt err_exit err_return
+  }
+  builtin true         # a failing status must not reach the user's ZERR trap
+}
+
+while brish3_recv; do  # parses the frame, reads the payloads, writes START
+  BRISH3_INREQ=1
+  brish3_run "$BRISH3_NONCE" "$BRISH3_FORK" "$BRISH3_STDIN_MODE"
+  ...write END on both pipes...
+  BRISH3_INREQ=
+done
+...catch-up END if a user `break 2` left the loop with a request open...
+#+end_src
+
+- =brish3_run= is never called inside =||= or =if=, because that would disable =err_exit= for the command.
+- END is written after =brish3_run= returns, never in =always=: while =exit= unwinds, =always= runs with =$?= set to 0.
+- The worker's EXIT trap writes =END:<nonce>:<status>:exit= when a request is open, so =exit N= returns a normal result with retcode N. Python restarts the instance before its next use.
+- =errexit=, =${x:?}= and similar fatal errors end the worker without an END. Python then returns retcode 9001 (see below).
+- Header parsing, both payload reads and the START write happen in one =emulate -LR zsh= function, since every =emulate= and every function call costs tens of microseconds.
+
+** Defences against user state
+User commands run in the worker, so they can change its state. The worker is written to survive that:
+- Aliases are off while =brish3.zsh= is parsed (startup files may define global aliases), and turned back on before the first command, if they were on, so commands keep their aliases.
+- Every internal command is prefixed with =builtin=, so user functions named =print=, =read=, =eval=, =sysread=, =syswrite= or =true= are never called.
+- Internal names use the =BRISH3_*= and =__brish3_*= prefixes. None is read-only, because assigning a read-only variable is fatal in zsh.
+- Internal logic runs in =emulate -LR zsh= helpers. The code between them only expands scalars inside double quotes, and the marker prefixes (which contain NUL) are computed once at startup, so =ksh_arrays=, =sh_word_split=, =no_multibyte=, =nounset=, =posix_strings= (from =emulate sh=) and a changed =IFS= do not break the loop.
+- =err_exit= and =err_return= are cleared after every request.
+
+A command that deliberately reads or overwrites the worker's internals (its fd variables, say) can still break it. That is outside the guarantee.
+
+* Python side
+- One =selectors.DefaultSelector= per worker watches both response pipes.
+- The whole frame is built before anything is written, so an encoding error leaves the worker untouched.
+- The frame is written non-blocking inside the same select loop that drains the response pipes. A blocking write deadlocks when the worker is still busy with an earlier, abandoned command that fills its output pipe.
+- *Worker death* is any of: EOF on a response pipe, =EPIPE= on the request pipe, or the worker's PID gone when the pipes have been silent for 0.5 s (a background job can hold the pipes open after the worker dies). On death, Python first collects whatever the worker already wrote, then:
+  - if START was seen, the command ran: the result carries the END retcode if one arrived, and otherwise retcode 9001 with =brish: worker died during this command= appended to stderr. The instance restarts before its next use;
+  - if START was not seen, the command never ran: Python restarts the instance and retries once, and raises =BrishWorkerDiedException= if the retry fails too.
+- *Interrupts.* An exception (such as =KeyboardInterrupt=) while reading the reply leaves the worker *stale*: the command keeps running, and the next request on that worker skips the old reply through its own START. =acquire_lock= prefers workers that are not stale. An exception while the frame is being written restarts the instance, because the worker may hold part of a frame.
+- *Restarts* never happen while a worker lock is held. A generation counter makes several threads that notice the same death restart the instance only once. =cleanup()= sends SIGTERM to the HELLO PIDs, then SIGKILL after one second, so it never waits for a running command. One worker's death recycles every worker of the instance.
+
+* Why anonymous pipes
+The legacy transport uses named FIFOs. Binary mode uses anonymous pipes passed with =pass_fds= because:
+- on macOS, kqueue and poll miss readiness on FIFOs and never report FIFO EOF, which rules out a select loop;
+- opening FIFOs has an ordering constraint (each open blocks until the other side opens), which hangs =init()= when a worker dies before opening its end;
+- a macOS FIFO holds only 8 KiB, while an anonymous pipe holds 64 KiB;
+- nothing touches the filesystem, and there are no paths to clean up.
+
+* Contract for a custom =shell==
+=Brish(binary=True, shell=[...])= runs the given argv with =BRISH3-FDS= and the fd triples appended. A replacement worker must:
+- find the last =BRISH3-FDS= argument and serve one worker per triple after it, closing the fds it does not use (otherwise Python sees no EOF when a worker dies);
+- write =\0BRISH3-HELLO:<pid>\n= on each stdout pipe before the startup timeout, with the PID of the process that serves that worker;
+- parse frames and write START and END markers exactly as above, each marker in a single write shorter than =PIPE_BUF=, on both response pipes;
+- exit when its stdin (the bootstrap's) reaches EOF, or at least not hold the pipes open forever.
+
+* Legacy mode, for contrast
+=brish2.zsh= reads three NUL-terminated lists of FIFO paths from its stdin. Each request is =cmd NUL stdin NUL fork NUL newline= on the request FIFO, and the reply is the output followed by =\n NUL \n <retcode> \n= on stdout and =\n NUL \n= on stderr, all read as text. Output that contains a NUL between two line boundaries forges the terminator, and the text layer translates newlines and cannot carry arbitrary bytes. This format is frozen: long-running processes with older Python code spawn =brish2.zsh= by path, so it stays byte-identical until the legacy path is removed.

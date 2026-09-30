@@ -858,6 +858,69 @@ for future in concurrent.futures.as_completed(futures):
 : 
 
 
+** Binary Data
+By default Brish talks to zsh through a text transport (/legacy mode/): output is decoded as text, newlines are translated, and stdin and interpolated values must be text. /Binary mode/ carries exact bytes in every direction. Turn it on per instance, or for a whole process with the env var =BRISH_BINARY= (read when each =Brish= is created, including the module-level =z=, =zp= and friends at import):
+
+#+begin_example
+from brish import Brish
+b = Brish(binary=True)
+
+# or, for everything in the process:
+#   BRISH_BINARY=1 python3 my_script.py
+#+end_example
+
+Every =CmdResult= has byte views next to its text fields: =outb=, =errb=, =outrsb= (=outb= without trailing newlines), =outerrb=, =iterb()= (lines) and =iter0b()= (NUL-separated items). In binary mode they hold exactly what the command wrote, and the text views are decoded from those bytes without any newline translation:
+
+#+begin_src python :exports both
+r = b.send_cmd("print -rn -- $'caf\\xc3\\xa9\\r\\n\\xff\\0'")
+(r.outb, r.out)
+#+end_src
+
+#+RESULTS:
+#+begin_example
+(b'caf\xc3\xa9\r\n\xff\x00', 'café\r\n\\xff\x00')
+#+end_example
+
+stdin and commands can be bytes. A =str= is encoded with the instance encoding (UTF-8 by default) and =surrogateescape=, so file names from =os.listdir= round-trip. =cmd_stdin=None= gives the command =/dev/null= instead of an empty pipe:
+
+#+begin_src python :exports both
+(b.send_cmd("cat", cmd_stdin=b"\xff\xfe").outb,
+ b.send_cmd("[[ -c /dev/stdin ]] && print /dev/null", cmd_stdin=None).out)
+#+end_src
+
+#+RESULTS:
+#+begin_example
+(b'\xff\xfe', '/dev/null\n')
+#+end_example
+
+Interpolated =bytes=, =bytearray=, =memoryview= and path-like values (including =os.DirEntry=) are quoted byte-exactly, also inside lists, and ={value:e}= with bytes inserts them unquoted:
+
+#+begin_src python :exports both
+name = b"report \xff.txt"
+(b.zstring("print -rn -- {name}"), b.z("print -rn -- {name}").outb)
+#+end_src
+
+#+RESULTS:
+#+begin_example
+(" print -rn -- $'report \\xff.txt' ", b'report \xff.txt')
+#+end_example
+
+=zp= and =zpe= write the bytes to =sys.stdout.buffer= and =sys.stderr.buffer= (flushing the text layer first, so output stays in order). A script that runs =zp("cat some.png")= with its stdout redirected to a file makes an identical copy. For a target without a binary buffer, such as =io.StringIO=, they print the text views.
+
+Binary mode also changes a few behaviours of non-fork commands, because each one now runs in a protected loop:
+- =exit N= returns a normal result with retcode N, and the instance restarts before its next use;
+- NOMATCH and other shell errors return retcode 1 instead of killing the worker;
+- a bare =break= or =continue= ends the command with status 0;
+- =setopt errexit= and =errreturn= do not persist to the next command;
+- a syntax error no longer re-runs the previous command.
+
+Binary mode is also faster: a command without stdin forks nothing, and large stdin is read in 64 KiB chunks. The wire protocol is documented in [[file:docs/protocol.org][docs/protocol.org]], and the design in [[file:docs/binary-transport.org][docs/binary-transport.org]].
+
+** When a Worker Dies
+If the command ran and killed its shell (with =exit= in legacy mode, =errexit=, =${x:?}=, a signal, ...), you get a =CmdResult= like from =subprocess.run=: the command's status if the worker reported it, otherwise the reserved retcode 9001 with =brish: worker died during this command= appended to =.err=. The instance restarts before its next use. If a worker died before it could run the command (killed between two commands, say), Brish restarts it and retries once; only when that fails too does it raise =BrishWorkerDiedException=.
+
+A =KeyboardInterrupt= in =send_cmd= abandons the reply but does not stop the shell command. In binary mode the next command on that worker waits for it and then gets its own result, and other idle workers are preferred meanwhile. In legacy mode the instance restarts before its next use.
+
 * Security Considerations
 Interpolated values are quoted in pure Python (see =brish/quoting.py=), and zsh reads each quoted word back as exactly the original bytes. So a value from an untrusted source is safe to interpolate as ={value}=, as long as nothing evaluates it as code a second time. The template's literal text is code, and so are values inserted with =:e=.
 
@@ -889,7 +952,9 @@ z("echo {untrusted_input}") # safe
 # One thing to keep in mind is that Brish purposely uses the zsh from your PATH. That zsh will load its dotfiles as usual.
 
 * Known Issues
-- Piping binary (non-text) output from zsh to Python does not work
+- In legacy mode (the default), piping binary (non-text) output from zsh to Python does not work, =\r= is translated, and a NUL at a line boundary in the output desynchronises the instance. Use binary mode (see Binary Data).
+
+- In legacy mode, a command with a syntax error re-runs the previous command, and returns status 0.
 
 - Nonstandard encodings (non UTF-8) are corrupted
   #+begin_src python :session p1 :results value :exports both
@@ -901,7 +966,11 @@ z("echo {untrusted_input}") # safe
   sth Ã\xb7 another (ver.-)
   #+end_example
 
-- There is always sth piped to the standard input (an empty string by default). This can alter the behavior of some commands such as =ripgrep=; Using =</dev/null= or =<&-= can be a suitable workaround.
+- There is always sth piped to the standard input (an empty string by default). This can alter the behavior of some commands such as =ripgrep=; Using =</dev/null= or =<&-= can be a suitable workaround. In binary mode, =cmd_stdin=None= gives the command =/dev/null=.
+
+- An interrupt (=KeyboardInterrupt=) does not stop the shell command, and there is no per-command timeout.
+
+- Output that background jobs write while a later command runs is part of that command's result.
 
 * Future Features
 I like to add a mode where the zsh session inherits the stderr from the parent Python process. This allows usage of interactive programs like ~fzf~.
