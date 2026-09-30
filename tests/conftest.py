@@ -101,10 +101,12 @@ def kill_pids(pids, why):
 
 
 class ChildResult:
-    def __init__(self, rc, out, err, timed_out, orphans):
+    def __init__(self, rc, outb, errb, timed_out, orphans):
         self.rc = rc
-        self.out = out
-        self.err = err
+        self.outb = outb
+        self.errb = errb
+        self.out = outb.decode("utf-8", "backslashreplace")
+        self.err = errb.decode("utf-8", "backslashreplace")
         self.timed_out = timed_out
         self.orphans = orphans
 
@@ -193,13 +195,7 @@ def run_py(code, timeout=60, real_env=False, env=None, cwd=None, allow_orphans=F
         time.sleep(0.05)
     if orphans:
         kill_pids(orphans, f"orphans of child {p.pid}")
-    res = ChildResult(
-        "TIMEOUT" if timed_out else p.returncode,
-        out.decode("utf-8", "backslashreplace"),
-        err.decode("utf-8", "backslashreplace"),
-        timed_out,
-        orphans,
-    )
+    res = ChildResult("TIMEOUT" if timed_out else p.returncode, out, err, timed_out, orphans)
     if orphans and not allow_orphans and res.ok():
         res.rc = "ORPHANS"
     return res

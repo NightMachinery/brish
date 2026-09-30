@@ -26,6 +26,9 @@ import signal
 import shutil
 import subprocess
 import threading
+import selectors
+import secrets
+import re
 import tempfile
 from collections.abc import Iterable
 from typing import Union, Any
@@ -381,6 +384,109 @@ class _ErrReader:
             pass
 
 
+#: Protocol BRISH3 (binary mode). See docs/protocol.org.
+BRISH3_FDS_ARG = "BRISH3-FDS"
+_HELLO = b"\0BRISH3-HELLO:"
+_READ_CHUNK = 65536
+#: Seconds between liveness checks while a worker is silent.
+_POLL = 0.5
+_END_TRAILER = re.compile(rb"(\d+)(:exit)?\Z")
+
+
+class _StreamParser:
+    """Splits one response stream into the bytes between START and END.
+
+    Before START it keeps only the last len(START)-1 bytes. After START it
+    searches for the fixed END prefix, resuming where the previous search
+    stopped, and once the prefix is found it waits for the newline that ends
+    the END line. Anything after the END line is dropped.
+    """
+
+    __slots__ = ("start", "end", "pre", "buf", "scan", "found", "trailer", "done")
+
+    def __init__(self, start, end_prefix):
+        self.start = start
+        self.end = end_prefix
+        self.pre = b""
+        self.buf = None  # a bytearray once START has been seen
+        self.scan = 0
+        self.found = -1
+        self.trailer = None
+        self.done = False
+
+    @property
+    def started(self):
+        return self.buf is not None
+
+    def feed(self, chunk):
+        if self.done:
+            return
+        if self.buf is None:
+            data = self.pre + chunk
+            i = data.find(self.start)
+            if i < 0:
+                keep = len(self.start) - 1
+                self.pre = data[-keep:] if len(data) > keep else data
+                return
+            self.pre = b""
+            self.buf = bytearray(data[i + len(self.start) :])
+        else:
+            self.buf += chunk
+        if self.found < 0:
+            j = self.buf.find(self.end, self.scan)
+            if j < 0:
+                self.scan = max(0, len(self.buf) - len(self.end) + 1)
+                return
+            self.found = j
+        k = self.buf.find(b"\n", self.found + len(self.end))
+        if k < 0:
+            return
+        self.trailer = bytes(self.buf[self.found + len(self.end) : k])
+        del self.buf[self.found :]
+        self.done = True
+
+    def payload(self):
+        return b"" if self.buf is None else bytes(self.buf)
+
+
+def _parse_trailer(trailer):
+    """(retcode, exited) from an END trailer such as b"0" or b"3:exit"."""
+    m = _END_TRAILER.match(trailer or b"")
+    if not m:
+        return RETCODE_WORKER_DIED, True
+    return int(m.group(1)), m.group(2) is not None
+
+
+class _Worker:
+    """Python's side of one BRISH3 worker."""
+
+    __slots__ = ("index", "req", "out", "err", "pid", "sel", "stale")
+
+    def __init__(self, index, req, out, err):
+        self.index = index
+        self.req = req
+        self.out = out
+        self.err = err
+        self.pid = None
+        self.sel = None
+        #: The last reply was abandoned by an interrupt. The next request
+        #: resynchronises through its START marker.
+        self.stale = False
+
+    def close(self):
+        if self.sel is not None:
+            try:
+                self.sel.close()
+            except Exception:
+                pass
+            self.sel = None
+        for fd in (self.req, self.out, self.err):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _legacy_read_reply(f, delim):
     """Read lines until `delim`. Returns (text, eof)."""
     lines = []
@@ -393,11 +499,36 @@ def _legacy_read_reply(f, delim):
         lines.append(line)
 
 
+_TEMPLATE_UNSAFE = re.compile("[\r\0\ud800-\udfff]")
+
+
+def _escape_template_literals(template):
+    """Rewrite CR, NUL and lone surrogates as Python escapes, so that
+    zstring's `ast.parse` keeps them instead of translating or rejecting them;
+    the escapes decode back to the same characters."""
+    if not _TEMPLATE_UNSAFE.search(template):
+        return template
+
+    def esc(m):
+        ch = m.group()
+        if ch == "\r":
+            return "\\r"
+        if ch == "\0":
+            return "\\x00"
+        return "\\u%04x" % ord(ch)
+
+    return _TEMPLATE_UNSAFE.sub(esc, template)
+
+
 class Brish:
     """Brish is a bridge between Python and an interpreter. The interpreter needs to adhere to the Brish protocol. A zsh interpreter is provided, and is the default. Threadsafe."""
 
     # MARKER = '\x00BRISH_MARKER'
     MARKER = "\x00"
+
+    #: Seconds to wait for every worker's HELLO in binary mode. Startup files
+    #: can take seconds on a loaded machine.
+    startup_timeout = 30
 
     def __init__(
         self,
@@ -405,20 +536,31 @@ class Brish:
         boot_cmd=None,
         server_count=1,
         delayed_init=False,
+        binary=None,
         **kwargs,
     ):
         self.lock = RLock()
+        #: Binary mode (protocol BRISH3, byte-exact) or legacy mode (the
+        #: brish2.zsh transport). Read once; restarts keep it.
+        if binary is None:
+            binary = bool_from_str(os.environ.get("BRISH_BINARY", ""))
+        self.binary = bool(binary)
         #: `init()` arguments are kept on the instance, so that `restart()`
         #: and a delayed first use start the same kind of worker.
         self.encoding = kwargs.get("encoding") or "utf-8"
         self.decoding_errors = kwargs.get("decoding_errors") or "backslashreplace"
+        if kwargs.get("startup_timeout"):
+            self.startup_timeout = kwargs["startup_timeout"]
         if boot_cmd:
-            self.boot_cmd = _shared_brish.zstring(boot_cmd, getframe=2)
+            self.boot_cmd = self.zstring(boot_cmd, getframe=2)
         else:
             self.boot_cmd = boot_cmd
 
         self.defaultShell = defaultShell or [
-            str(pathlib.Path(__file__).parent / "brish2.zsh"),
+            str(
+                pathlib.Path(__file__).parent
+                / ("brish3.zsh" if self.binary else "brish2.zsh")
+            ),
             "--",
             "BR" + "I" * 2048 + "SH",
         ]  # Reserve big argv for `insubshell`
@@ -446,6 +588,7 @@ class Brish:
         decoding_errors=None,
         # https://docs.python.org/3/library/codecs.html#codec-base-classes
         encoding=None,
+        startup_timeout=None,
     ):
         with self.lock:
             if self.p is not None:
@@ -455,6 +598,8 @@ class Brish:
                 self.encoding = encoding
             if decoding_errors is not None:
                 self.decoding_errors = decoding_errors
+            if startup_timeout:
+                self.startup_timeout = startup_timeout
             if not server_count:
                 server_count = self.last_server_count
 
@@ -468,7 +613,10 @@ class Brish:
             self._gen += 1
             self._restart_gen = None
             try:
-                self._init_legacy(shell, server_count)
+                if self.binary:
+                    self._init_binary(shell, server_count)
+                else:
+                    self._init_legacy(shell, server_count)
             except BaseException:
                 self._init_on_use = True
                 raise
@@ -586,6 +734,99 @@ class Brish:
         os.set_blocking(fd, True)
         return fd
 
+    def _init_binary(self, shell, server_count):
+        workers, child_fds = [], []
+        try:
+            for i in range(server_count):
+                req_r, req_w = os.pipe()
+                out_r, out_w = os.pipe()
+                err_r, err_w = os.pipe()
+                child_fds += [req_r, out_w, err_w]
+                workers.append(_Worker(i, req_w, out_r, err_r))
+            argv = list(shell) + [BRISH3_FDS_ARG] + [
+                f"{child_fds[3 * i]},{child_fds[3 * i + 1]},{child_fds[3 * i + 2]}"
+                for i in range(server_count)
+            ]
+            p = Popen(
+                argv,
+                stdin=PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=None,  # startup errors stay visible
+                pass_fds=child_fds,
+                env=dict(os.environ),
+            )
+        except BaseException:
+            for w in workers:
+                w.close()
+            for fd in child_fds:
+                os.close(fd)
+            raise
+        for fd in child_fds:
+            os.close(fd)
+
+        p.gen = self._gen
+        p.binary = True
+        p.workers = workers
+        p.server_count = server_count
+        p.free_server_count = server_count
+        try:
+            for w in workers:
+                os.set_blocking(w.req, False)
+                os.set_blocking(w.out, False)
+                os.set_blocking(w.err, False)
+            self._await_hellos(p, shell)
+            for w in workers:
+                w.sel = selectors.DefaultSelector()
+                w.sel.register(w.out, selectors.EVENT_READ)
+                w.sel.register(w.err, selectors.EVENT_READ)
+        except BaseException:
+            self._cleanup_binary(p)
+            raise
+        self.locks = [RLock() for i in range(server_count)]
+        self.p = p
+
+    def _await_hellos(self, p, shell):
+        """Wait until every worker has said HELLO, and record its PID."""
+        deadline = time.monotonic() + self.startup_timeout
+        pending = {w.out: w for w in p.workers}
+        bufs = {fd: b"" for fd in pending}
+        sel = selectors.DefaultSelector()
+        try:
+            for fd in pending:
+                sel.register(fd, selectors.EVENT_READ)
+            while pending:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise BrishWorkerDiedException(
+                        f"no HELLO within {self.startup_timeout}s: {shell[0]!r} is not a BRISH3 worker"
+                    )
+                for key, _ in sel.select(min(left, _POLL)):
+                    fd = key.fd
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        status = p.poll()
+                        raise BrishWorkerDiedException(
+                            f"a worker exited before its HELLO (shell status {status}): "
+                            f"{shell[0]!r} is not a BRISH3 worker, or it failed to start"
+                        )
+                    buf = bufs[fd] + chunk
+                    i = buf.find(_HELLO)
+                    if i >= 0:
+                        j = buf.find(b"\n", i)
+                        if j >= 0:
+                            pending.pop(fd).pid = int(buf[i + len(_HELLO) : j])
+                            sel.unregister(fd)
+                            continue
+                        buf = buf[i:]
+                    else:
+                        buf = buf[-len(_HELLO) :]
+                    bufs[fd] = buf
+        finally:
+            sel.close()
+
     def restart(self):
         with self.lock:
             self.cleanup()
@@ -617,17 +858,42 @@ class Brish:
 
         typ = type(obj)
         if typ is CmdResult:
+            if self.binary:
+                return self._quote_bytes(obj.outrsb)
             return self._quote_word(obj.outrs)
-        elif not isinstance(obj, str) and isinstance(obj, Iterable):
+        if self.binary:
+            #: Bytes-like values are quoted byte-exactly, before the Iterable
+            #: branch would turn them into ints.
+            if isinstance(obj, os.PathLike):
+                obj = os.fspath(obj)
+            if isinstance(obj, _BYTES_LIKE):
+                return self._quote_bytes(bytes(obj))
+        if not isinstance(obj, str) and isinstance(obj, Iterable):
             # zsh doesn't support nested arrays, so we str the inner object.
-            return " ".join(self._quote_word(str(i)) for i in iter(obj))
+            words = []
+            for i in iter(obj):
+                if self.binary:
+                    if isinstance(i, os.PathLike):
+                        i = os.fspath(i)
+                    if isinstance(i, _BYTES_LIKE):
+                        words.append(self._quote_bytes(bytes(i)))
+                        continue
+                words.append(self._quote_word(str(i)))
+            return " ".join(words)
         else:
             return self._quote_word(str(obj))
 
+    def _quote_ascii_only(self):
+        return codecs.lookup(self.encoding).name != "utf-8"
+
     def _quote_word(self, s):
-        encoding = self.encoding
-        utf8 = codecs.lookup(encoding).name == "utf-8"
-        return zsh_quote_bytes(s.encode(encoding, "surrogateescape"), ascii_only=not utf8)
+        return zsh_quote_bytes(
+            s.encode(self.encoding, "surrogateescape"),
+            ascii_only=self._quote_ascii_only(),
+        )
+
+    def _quote_bytes(self, b):
+        return zsh_quote_bytes(b, ascii_only=self._quote_ascii_only())
 
     def acquire_lock(self, server_index=None, lock_sleep=1):
         lock, server_index, _ = self._acquire(server_index, lock_sleep)
@@ -685,18 +951,221 @@ class Brish:
             lock.release()
 
     def _worker_order(self, p):
-        return range(len(self.locks))
+        n = len(self.locks)
+        if not getattr(p, "binary", False):
+            return range(n)
+        workers = p.workers
+        return [i for i in range(n) if not workers[i].stale] + [
+            i for i in range(n) if workers[i].stale
+        ]
 
     def send_cmd(
         self, cmd, cmd_stdin="", fork=False, server_index=None, lock_sleep=1
     ):
-        if cmd == "%BRISH_RESTART":
+        """Run `cmd` in a worker and return its CmdResult.
+
+        In binary mode `cmd` and `cmd_stdin` may be bytes-like; `str` is
+        encoded with the instance encoding and surrogateescape, and
+        `cmd_stdin=None` means /dev/null.
+        """
+        restart_cmd = cmd
+        if self.binary and isinstance(cmd, _BYTES_LIKE):
+            restart_cmd = bytes(cmd).decode("utf-8", "surrogateescape")
+        if restart_cmd == "%BRISH_RESTART":
             #: Handled before any worker lock is taken: restarting needs every
             #: worker lock, so holding one here could deadlock with another
             #: thread's restart().
             self.restart()
-            return CmdResult(0, "Restarted succesfully.", "", cmd, str(cmd_stdin))
+            stored = self._stored_stdin(cmd_stdin) if self.binary else str(cmd_stdin)
+            return CmdResult(0, "Restarted succesfully.", "", cmd, stored)
+        if self.binary:
+            return self._send_binary(cmd, cmd_stdin, fork, server_index, lock_sleep)
         return self._send_legacy(cmd, cmd_stdin, fork, server_index, lock_sleep)
+
+    def _to_bytes(self, x, what="value"):
+        """The encoding boundary of binary mode: any value to bytes."""
+        if isinstance(x, _BYTES_LIKE):
+            return bytes(x)
+        if isinstance(x, CmdResult):
+            return x.outrsb
+        if isinstance(x, os.PathLike):
+            x = os.fspath(x)
+            if isinstance(x, bytes):
+                return x
+        if not isinstance(x, str):
+            x = str(x)
+        try:
+            return x.encode(self.encoding, "surrogateescape")
+        except UnicodeEncodeError as e:
+            raise UnicodeEncodeError(
+                e.encoding,
+                e.object,
+                e.start,
+                e.end,
+                f"{what} is not encodable as {self.encoding} with surrogateescape "
+                "(a lone surrogate or an unencodable character); pass bytes instead",
+            ) from None
+
+    @staticmethod
+    def _stored_stdin(cmd_stdin):
+        if cmd_stdin is None or isinstance(cmd_stdin, (str, bytes)):
+            return cmd_stdin
+        if isinstance(cmd_stdin, _BYTES_LIKE):
+            return bytes(cmd_stdin)
+        return str(cmd_stdin)
+
+    def _send_binary(self, cmd, cmd_stdin, fork, server_index, lock_sleep):
+        #: Encode everything first: an encoding error must leave the worker
+        #: untouched.
+        cmd_b = self._to_bytes(cmd, "cmd")
+        stdin_b = None if cmd_stdin is None else self._to_bytes(cmd_stdin, "cmd_stdin")
+        stored_stdin = self._stored_stdin(cmd_stdin)
+        stdin_len = b"-" if stdin_b is None else b"%d" % len(stdin_b)
+
+        for attempt in range(2):
+            nonce = secrets.token_hex(16).encode()
+            header = b"BRISH3 %s %d %s %d\n" % (nonce, len(cmd_b), stdin_len, 1 if fork else 0)
+            frame = b"".join((header, cmd_b, stdin_b or b""))
+            lock, index, p = self._acquire(server_index, lock_sleep)
+            try:
+                p.free_server_count -= 1
+                outcome = self._binary_transact(p, p.workers[index], frame, nonce)
+            finally:
+                p.free_server_count += 1
+                lock.release()
+
+            if outcome is _NEVER_RAN:
+                if self._booting:
+                    raise BrishWorkerDiedException(
+                        "a worker died before running the boot command"
+                    )
+                self._restart_now(p.gen)
+                continue
+            retcode, outb, errb, restart = outcome
+            if restart:
+                self._request_restart(p.gen)
+            return CmdResult.from_bytes(
+                retcode,
+                outb,
+                errb,
+                cmd,
+                stored_stdin,
+                encoding=self.encoding,
+                errors=self.decoding_errors,
+            )
+
+        raise BrishWorkerDiedException(
+            "a worker died before running the command, twice"
+        )
+
+    def _binary_transact(self, p, w, frame, nonce):
+        """One request/response exchange with worker `w`.
+
+        Returns _NEVER_RAN if the worker died before START, or
+        (retcode, outb, errb, restart). The frame is written non-blocking
+        inside the loop that drains both response pipes, so neither side can
+        block the other.
+        """
+        start = b"\0BRISH3-START:" + nonce + b"\n"
+        end = b"\0BRISH3-END:" + nonce + b":"
+        so, se = _StreamParser(start, end), _StreamParser(start, end)
+        streams = {w.out: so, w.err: se}
+        sel = w.sel
+        total = len(frame)
+        sent = 0
+        attempted = False
+        died = False
+        writing_registered = False
+        try:
+            #: Most frames fit in the pipe buffer: try the write first.
+            attempted = True
+            try:
+                sent = os.write(w.req, frame)
+            except BlockingIOError:
+                pass
+            except BrokenPipeError:
+                died = True
+            mv = memoryview(frame)
+            while not died and not (so.done and se.done):
+                if sent < total and not writing_registered:
+                    sel.register(w.req, selectors.EVENT_WRITE)
+                    writing_registered = True
+                events = sel.select(_POLL)
+                if not events:
+                    if not _alive(w.pid):
+                        died = True
+                    continue
+                for key, _ in events:
+                    fd = key.fd
+                    if fd == w.req:
+                        try:
+                            sent += os.write(fd, mv[sent : sent + _READ_CHUNK])
+                        except BlockingIOError:
+                            continue
+                        except BrokenPipeError:
+                            died = True
+                            break
+                        if sent >= total:
+                            sel.unregister(fd)
+                            writing_registered = False
+                        continue
+                    st = streams[fd]
+                    try:
+                        chunk = os.read(fd, _READ_CHUNK)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        died = True
+                        break
+                    st.feed(chunk)
+            if died:
+                #: Whatever the dead worker wrote is already buffered in the
+                #: pipes; collect it, so that START and END are not missed on
+                #: the stream that did not report EOF first.
+                for fd, st in streams.items():
+                    for _ in range(64):  # a background job may keep writing
+                        if st.done:
+                            break
+                        try:
+                            chunk = os.read(fd, _READ_CHUNK)
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            break
+                        st.feed(chunk)
+            w.stale = False
+        except BaseException:
+            if sent >= total:
+                #: The command runs on; the next request resyncs via START.
+                w.stale = True
+            elif attempted:
+                #: The worker may hold part of a frame (an interrupt can land
+                #: after a write returned but before `sent` was updated), and
+                #: only a restart recovers from that.
+                self._request_restart(p.gen)
+            raise
+        finally:
+            if writing_registered:
+                try:
+                    sel.unregister(w.req)
+                except (KeyError, ValueError, OSError):
+                    pass
+
+        if died:
+            if not (so.started or se.started):
+                return _NEVER_RAN
+            if so.done:
+                retcode, _ = _parse_trailer(so.trailer)
+                errb = se.payload()
+            elif se.done:
+                retcode, _ = _parse_trailer(se.trailer)
+                errb = se.payload()
+            else:
+                retcode = RETCODE_WORKER_DIED
+                errb = _with_note(se.payload().decode("latin-1"), WORKER_DIED_NOTE).encode("latin-1")
+            return retcode, so.payload(), errb, True
+        retcode, exited = _parse_trailer(so.trailer)
+        return retcode, so.payload(), se.payload(), exited
 
     def _send_legacy(self, cmd, cmd_stdin, fork, server_index, lock_sleep):
         cmd_stdin = str(cmd_stdin)
@@ -814,10 +1283,35 @@ class Brish:
                 p = self.p
                 self.p = None
                 self.locks = []
-                self._cleanup_legacy(p)
+                if getattr(p, "binary", False):
+                    self._cleanup_binary(p)
+                else:
+                    self._cleanup_legacy(p)
             finally:
                 for lock in locks:
                     lock.release()
+
+    @staticmethod
+    def _cleanup_binary(p):
+        #: Stop the workers first, so this never waits for a user command.
+        pids = [w.pid for w in p.workers if w.pid]
+        _signal_pids(pids, signal.SIGTERM)
+        for w in p.workers:
+            w.close()
+        if p.stdin is not None:
+            try:
+                p.stdin.close()  # the bootstrap exits when its stdin closes
+            except Exception:
+                pass
+        deadline = time.time() + 1
+        while time.time() < deadline and any(_alive(pid) for pid in pids):
+            time.sleep(0.005)
+        _signal_pids([pid for pid in pids if _alive(pid)], signal.SIGKILL)
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
 
     @staticmethod
     def _cleanup_legacy(p):
@@ -920,6 +1414,8 @@ class Brish:
                 format_spec = list(filter(lambda a: a != code, flags))
             return ":".join(format_spec), res
 
+        if self.binary:
+            template = _escape_template_literals(template)
         p = ast.parse(f"f''' {template} '''")  # The whitespace is necessary
         result = []
         parts = p.body[0].value.values
@@ -956,6 +1452,13 @@ class Brish:
 
                 if not fmt_eval:
                     value = self.zsh_quote(value)
+                elif self.binary:
+                    #: `:e` inserts the value itself; bytes decode losslessly
+                    #: and are encoded back to the same bytes by send_cmd.
+                    if isinstance(value, os.PathLike):
+                        value = os.fspath(value)
+                    if isinstance(value, _BYTES_LIKE):
+                        value = bytes(value).decode(self.encoding, "surrogateescape")
                 value = str(value)
                 result.append(value)
         cmd = "".join(result)
@@ -968,6 +1471,17 @@ class Brish:
 
     def z_print(self, *args, getframe=3, file=None, **kwargs):
         res = self.z(*args, getframe=getframe, **kwargs)
+
+        if self.binary:
+            #: Pass the bytes through when the target has a binary buffer;
+            #: flush the text layer first so the output stays in order.
+            target = sys.stdout if file is None else file
+            buffer = getattr(target, "buffer", None)
+            if buffer is not None:
+                target.flush()
+                buffer.write(res.outerrb)
+                buffer.flush()
+                return res
 
         print_opts = dict()
         if file is not None:

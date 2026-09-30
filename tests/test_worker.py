@@ -4,7 +4,7 @@ on worker death), G8 (interrupt safety) and G9 (restart under concurrency).
 Binary-only refinements are asserted when BINARY is set.
 """
 
-from tests.conftest import BINARY, check
+from tests.conftest import check
 
 #: Child-side helpers, prepended to snippets that need them.
 HELPERS = r'''

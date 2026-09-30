@@ -10,14 +10,16 @@ All worker traffic runs in a child process with a timeout (see conftest).
 
 import pytest
 
-from tests.conftest import BINARY, check, run_py
+from tests.conftest import BINARY, check
 
-#: Findings still open in this mode. Keyed by finding id.
-OPEN = {
-    "F3": "NUL framing: output can forge the terminator",
-    "F4": "stdin travels as str(cmd_stdin) through a text FIFO",
-    "F5": "bytes values are interpolated as ints or reprs",
-    "F7": "zstring rewrites CR in the template's literal text",
+#: Findings still open in this mode. Keyed by finding id. Legacy mode keeps
+#: its wire format and text semantics, so the transport findings stay open
+#: there; binary mode fixes them.
+OPEN = {} if BINARY else {
+    "F3": "legacy NUL framing: output can forge the terminator",
+    "F4": "legacy stdin travels as str(cmd_stdin) through a text FIFO",
+    "F5": "legacy mode interpolates bytes values as ints or reprs",
+    "F7": "legacy zstring rewrites CR in the template's literal text",
 }
 
 
