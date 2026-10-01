@@ -328,6 +328,28 @@ def _stop_pids(pids, grace=1.0):
     _signal_pids([pid for pid in pids if _alive(pid)], signal.SIGKILL)
 
 
+def _acquire_all(locks):
+    """Acquire every lock in `locks`, without ever blocking on one while
+    holding another. A thread that holds one worker lock and waits for a
+    second (both at the same time are fine) can then never deadlock with a
+    restart that waits for all of them."""
+    while True:
+        taken = []
+        busy = None
+        for lock in locks:
+            if lock.acquire(blocking=False):
+                taken.append(lock)
+            else:
+                busy = lock
+                break
+        if busy is None:
+            return
+        for lock in reversed(taken):
+            lock.release()
+        busy.acquire()
+        busy.release()
+
+
 def _alive(pid):
     try:
         os.kill(pid, 0)
@@ -953,10 +975,17 @@ class Brish:
             sel.close()
 
     def restart(self):
+        """Restart every worker. In a thread that holds a worker lock, the
+        restart is only scheduled: it runs before the next use by a thread
+        that holds none (see `acquire_lock`). Returns whether it ran."""
+        if self._holds_worker_lock():
+            self._request_restart(self._gen)
+            return False
         with self.lock:
             self.cleanup()
             self.delayed_init = False
             self.init(shell=self.lastShell, server_count=self.last_server_count)
+        return True
 
     def _request_restart(self, gen):
         """Restart generation `gen` before its next use."""
@@ -969,6 +998,34 @@ class Brish:
         with self.lock:
             if gen == self._gen or self.p is None:
                 self.restart()
+
+    def _holds_worker_lock(self):
+        """Whether this thread holds a worker lock of the current generation.
+
+        Such a thread must never restart, or wait for a restart: restart()
+        takes the instance lock and then waits for every worker lock, so a
+        lock holder that blocks on the instance lock deadlocks with it.
+        """
+        for lock in self.locks:
+            if lock._is_owned():
+                return True
+        return False
+
+    def _never_ran(self, p, index):
+        """The worker could not run a command. Restart, unless this thread
+        must not; then raise BrishWorkerDiedException, so that the call fails
+        fast instead of waiting for a restart that needs this thread's lock."""
+        if self._booting:
+            raise BrishWorkerDiedException(
+                "a worker died before running the boot command"
+            )
+        if self._holds_worker_lock():
+            self._request_restart(p.gen)
+            raise BrishWorkerDiedException(
+                f"worker {index} is dead, and this thread holds a worker lock, so the "
+                "instance cannot restart now; release the lock (it restarts before its next use)"
+            )
+        self._restart_now(p.gen)
 
     def zsh_quote(self, obj, use_shared_instance=True, retry_count=0, retry_limit=10):
         """Quote `obj` as zsh words, in pure Python (no zsh process is used).
@@ -1026,22 +1083,29 @@ class Brish:
         """Lock one worker. Returns (lock, server_index, p).
 
         A pending restart runs here, before the worker lock is taken, so a
-        thread never restarts while holding a worker lock.
+        thread never restarts while holding a worker lock. A thread that
+        already holds one (it called acquire_lock and goes on calling
+        send_cmd, say) skips both the restart and the instance lock: while it
+        holds a lock of this generation, `self.p` cannot be replaced.
         """
         while True:
-            with self.lock:
-                if self.p is not None and self._restart_gen == self._gen:
-                    self.restart()
-                if self.p is None:
-                    if self.delayed_init or self._init_on_use:
-                        self.delayed_init = False
-                        self.restart()
-                    else:
-                        raise UninitializedBrishException(
-                            "acquire_lock called with an uninitialized Brish"
-                        )
+            if self._holds_worker_lock():
                 current_p = self.p
                 locks = self.locks
+            else:
+                with self.lock:
+                    if self.p is not None and self._restart_gen == self._gen:
+                        self.restart()
+                    if self.p is None:
+                        if self.delayed_init or self._init_on_use:
+                            self.delayed_init = False
+                            self.restart()
+                        else:
+                            raise UninitializedBrishException(
+                                "acquire_lock called with an uninitialized Brish"
+                            )
+                    current_p = self.p
+                    locks = self.locks
 
             assert len(locks) >= 1
             lock = None
@@ -1098,8 +1162,12 @@ class Brish:
         if restart_cmd == "%BRISH_RESTART":
             #: Handled before any worker lock is taken: restarting needs every
             #: worker lock, so holding one here could deadlock with another
-            #: thread's restart().
-            self.restart()
+            #: thread's restart(). A thread that holds one only schedules it.
+            if not self.restart():
+                return CmdResult(
+                    0, "Restart scheduled: this thread holds a worker lock.", "",
+                    cmd, self._stored_stdin(cmd_stdin),
+                )
             return CmdResult(0, "Restarted succesfully.", "", cmd, self._stored_stdin(cmd_stdin))
         if self.binary:
             return self._send_binary(cmd, cmd_stdin, fork, server_index, lock_sleep)
@@ -1158,11 +1226,7 @@ class Brish:
                 lock.release()
 
             if outcome is _NEVER_RAN:
-                if self._booting:
-                    raise BrishWorkerDiedException(
-                        "a worker died before running the boot command"
-                    )
-                self._restart_now(p.gen)
+                self._never_ran(p, index)
                 continue
             retcode, outb, errb, restart = outcome
             if restart:
@@ -1337,11 +1401,7 @@ class Brish:
                 lock.release()
 
             if outcome is _NEVER_RAN:
-                if self._booting:
-                    raise BrishWorkerDiedException(
-                        "a worker died before running the boot command"
-                    )
-                self._restart_now(p.gen)
+                self._never_ran(p, index)
                 continue
             result, restart = outcome
             if restart:
@@ -1416,8 +1476,7 @@ class Brish:
             if self.p is None:
                 return
             locks = self.locks
-            for lock in locks:
-                lock.acquire()
+            _acquire_all(locks)
             try:
                 p = self.p
                 self.p = None

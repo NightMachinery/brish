@@ -923,6 +923,8 @@ If the command ran and killed its shell (with =exit=, =errexit=, =${x:?}=, a sig
 
 A =KeyboardInterrupt= in =send_cmd= abandons the reply but does not stop the shell command. In binary mode the next command on that worker waits for it and then gets its own result, and other idle workers are preferred meanwhile. In legacy mode the instance restarts before its next use.
 
+While a thread holds a worker lock (from =acquire_lock=), it never restarts the instance or waits for a restart, because a restart waits for every worker lock: =restart()= only schedules it then, and it runs at the next use by a thread that holds no lock. A call that finds the worker dead in the meantime raises =BrishWorkerDiedException= at once; release the lock, and the next call restarts the instance.
+
 * Security Considerations
 Interpolated values are quoted in pure Python (see =brish/quoting.py=), and zsh reads each quoted word back as exactly the original bytes. So a value from an untrusted source is safe to interpolate as ={value}=, as long as nothing evaluates it as code a second time. The template's literal text is code, and so are values inserted with =:e=.
 
