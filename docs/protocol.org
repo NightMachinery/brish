@@ -154,6 +154,10 @@ The legacy transport uses named FIFOs. Binary mode uses anonymous pipes passed w
 * Legacy mode
 =brish2.zsh= is the worker of legacy mode. Its wire format is *frozen*: Python processes that still run older Brish code (the pre-binary release, in a long-lived server or an IPython kernel, say) spawn the on-disk =brish2.zsh= by path on every =init()= and =restart()=, so whatever worker is on disk must answer them exactly as the original did. =tests/test_wire_compat.py= checks this. It loads the old =brishmod.py= sources from git, with =__file__= pointing into the tree so that they spawn today's worker, runs a corpus through them and through a raw FIFO driver, and compares every reply byte for byte with the original worker's, both with an empty =ZDOTDIR= and with the real startup files. The intended differences (the error handling below) are asserted separately.
 
+Two more differences show up only with unusual user state, and are not in the corpus:
+- A DEBUG trap that a command sets also fires on the worker's own commands until it is removed, in both workers. Today's worker runs more internal commands per request, so such a trap prints more often.
+- The original worker left a global =ret= holding the previous command's status. Today's worker keeps its state in private =__brish2_*= variables, so a command that reads =$ret= without setting it finds it unset.
+
 ** Wire format
 - *Bootstrap.* Python creates three FIFOs per worker (request, stdout, stderr) and writes to the bootstrap's stdin: the request FIFO paths, NUL, the stdout FIFO paths, NUL, the stderr FIFO paths, NUL, and a newline. Each list is newline-separated.
 - *Request*, on the request FIFO: =cmd NUL stdin NUL fork NUL newline=, where =fork= is =y= or empty. The newline is what Python's =print()= added in the original code. The worker reads it as a leading newline of the next command, where it is harmless, so today's Python still writes it.
