@@ -150,7 +150,7 @@ Code that builds on Brish can carry the same guarantees behind its own opt-in, s
 3. Flip the default in a later release.
 4. Remove the legacy path, and then delete =brish2.zsh= in its own commit, once a release has shipped both workers, no process started before the switch is still running, and nothing else spawns =brish2.zsh=.
 
-Rollback is unsetting =BRISH_BINARY=, which is the kill switch.
+For a process that opted in through the environment, rollback is unsetting =BRISH_BINARY=. BrishGarden made binary mode its default and passes =binary== to =Brish= explicitly, so there the kill switch is =BRISH_BINARY=0= in the garden's environment, followed by a restart of the garden.
 
 * Non-goals
 - A per-request timeout or an interrupt API. An interrupt still does not stop the shell command.
