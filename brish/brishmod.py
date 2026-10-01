@@ -397,73 +397,76 @@ _END_TRAILER = re.compile(rb"(\d+)(:exit)?\Z")
 class _StreamParser:
     """Splits one response stream into the bytes between START and END.
 
-    Before START it keeps only the last len(START)-1 bytes. After START it
-    collects the chunks in a list, joined once at the end, and keeps the last
-    len(END)-1 payload bytes as `tail`, so that an END prefix split across
-    chunks is still found. END starts with NUL, so a chunk without NUL (and a
-    tail without NUL) cannot contain it and is not searched. Once the prefix
-    is found it waits for the newline that ends the END line. Anything after
-    the END line is dropped.
+    Before START it keeps only the last len(START)-1 bytes. After START,
+    `feed()` returns the payload bytes that are certain, as soon as they
+    arrive: it holds back only a suffix that could be the start of END. END
+    starts with NUL and has no other NUL, so only a suffix that starts at the
+    last NUL can be such a start, and a chunk without NUL (with nothing held)
+    is passed through without a search. Once END's prefix is found it waits
+    for the newline that ends the END line. Anything after the END line is
+    dropped.
+
+    With `collect` (the default), the payload is also kept, in a list joined
+    once by `payload()`.
     """
 
-    __slots__ = ("start", "end", "keep", "pre", "chunks", "tail", "after", "trailer", "done")
+    __slots__ = (
+        "start", "end", "keep", "pre", "started", "chunks", "held", "after", "trailer", "done",
+    )
 
-    def __init__(self, start, end_prefix):
+    def __init__(self, start, end_prefix, collect=True):
         self.start = start
         self.end = end_prefix
         self.keep = len(end_prefix) - 1
         self.pre = b""
-        self.chunks = None  # a list once START has been seen
-        self.tail = b""
+        self.started = False
+        self.chunks = [] if collect else None
+        self.held = b""  # payload bytes that could be the start of END
         self.after = None  # the bytes after the END prefix, until its newline
         self.trailer = None
         self.done = False
 
-    @property
-    def started(self):
-        return self.chunks is not None
-
     def feed(self, chunk):
+        """Take the next bytes of the stream; return the payload bytes that
+        are now certain (possibly b"")."""
         if self.done:
-            return
+            return b""
         if self.after is not None:
             self._finish(self.after + chunk)
-            return
-        if self.chunks is None:
+            return b""
+        if not self.started:
             data = self.pre + chunk
             i = data.find(self.start)
             if i < 0:
                 keep = len(self.start) - 1
                 self.pre = data[-keep:] if len(data) > keep else data
-                return
+                return b""
             self.pre = b""
-            self.chunks = []
+            self.started = True
             chunk = data[i + len(self.start) :]
             if not chunk:
-                return
-        tail = self.tail
-        if b"\0" not in chunk and b"\0" not in tail:
-            self.chunks.append(chunk)
-            self.tail = chunk[-self.keep :] if len(chunk) >= self.keep else (tail + chunk)[-self.keep :]
-            return
-        window = tail + chunk
-        j = window.find(self.end)
-        if j < 0:
-            self.chunks.append(chunk)
-            self.tail = window[-self.keep :]
-            return
-        if j >= len(tail):
-            self.chunks.append(chunk[: j - len(tail)])
+                return b""
+        held = self.held
+        if not held and b"\0" not in chunk:
+            out = chunk
         else:
-            #: END began in bytes already collected: take them back.
-            extra = len(tail) - j
-            while extra:
-                last = self.chunks.pop()
-                if len(last) > extra:
-                    self.chunks.append(last[:-extra])
-                    break
-                extra -= len(last)
-        self._finish(window[j + len(self.end) :])
+            window = held + chunk if held else chunk
+            j = window.find(self.end)
+            if j >= 0:
+                out = window[:j]
+                self.held = b""
+                self._finish(window[j + len(self.end) :])
+            else:
+                i = window.rfind(b"\0", max(0, len(window) - self.keep))
+                if i >= 0 and self.end.startswith(window[i:]):
+                    out = window[:i]
+                    self.held = window[i:]
+                else:
+                    out = window
+                    self.held = b""
+        if out and self.chunks is not None:
+            self.chunks.append(out)
+        return out
 
     def _finish(self, rest):
         k = rest.find(b"\n")
@@ -473,6 +476,14 @@ class _StreamParser:
         self.after = None
         self.trailer = rest[:k]
         self.done = True
+
+    def flush(self):
+        """The stream ended without END (the worker died): release the
+        bytes held back as a possible start of END."""
+        out, self.held = self.held, b""
+        if out and self.chunks is not None:
+            self.chunks.append(out)
+        return out
 
     def payload(self):
         return b"" if self.chunks is None else b"".join(self.chunks)
@@ -1192,6 +1203,8 @@ class Brish:
         if died:
             if not (so.started or se.started):
                 return _NEVER_RAN
+            so.flush()
+            se.flush()
             if so.done:
                 retcode, _ = _parse_trailer(so.trailer)
                 errb = se.payload()
