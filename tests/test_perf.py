@@ -1,17 +1,33 @@
 """G12: binary mode against legacy mode, interleaved in one process so that
 machine load affects both alike. The measured ratios are printed; run with
-`-s` to see them."""
+`-s` to see them.
 
-from tests.conftest import binary_only, check
+Per-call latency is compared with the original legacy worker (brish2.zsh at
+9599fc3, the last release before binary mode), which forked a stdin writer
+for every command. Today's legacy worker forks nothing for an empty stdin
+either, and is about as fast as binary mode (often faster: it does less per
+request), so it is only checked against the original."""
+
+import stat
+import subprocess
+
+from tests.conftest import ROOT, binary_only, check
 
 
 @binary_only
-def test_g12_performance():
+def test_g12_performance(tmp_path):
+    original = tmp_path / "brish2_original.zsh"
+    original.write_bytes(subprocess.run(
+        ["git", "-C", str(ROOT), "show", "9599fc3:brish/brish2.zsh"],
+        capture_output=True, check=True).stdout)
+    original.chmod(original.stat().st_mode | stat.S_IXUSR)
     res = check(
         r'''
         import statistics
         legacy = Brish(binary=False, server_count=1)
         binary = Brish(binary=True, server_count=1)
+        original = Brish(binary=False, server_count=1,
+                         defaultShell=[ORIGINAL, "--", "BR" + "I" * 2048 + "SH"])
         T = time.perf_counter
 
         def per_call(b, n):
@@ -20,15 +36,19 @@ def test_g12_performance():
                 b.send_cmd("true")
             return (T() - t) / n
 
-        for b in (legacy, binary):
+        for b in (legacy, binary, original):
             per_call(b, 50)
-        lat = {"legacy": [], "binary": []}
+        lat = {"legacy": [], "binary": [], "original": []}
         for _ in range(5):
+            lat["original"].append(per_call(original, 400))
             lat["legacy"].append(per_call(legacy, 400))
             lat["binary"].append(per_call(binary, 400))
-        lm, bm_ = statistics.median(lat["legacy"]), statistics.median(lat["binary"])
-        print(f"true: legacy {lm*1e6:.0f} us, binary {bm_*1e6:.0f} us, speedup {lm/bm_:.2f}x")
-        assert bm_ <= lm * 1.1, (lm, bm_)
+        om, lm, bm_ = (statistics.median(lat[k]) for k in ("original", "legacy", "binary"))
+        print(f"true: original legacy {om*1e6:.0f} us, legacy {lm*1e6:.0f} us, binary {bm_*1e6:.0f} us, "
+              f"binary speedup over the original {om/bm_:.2f}x")
+        assert bm_ <= om * 1.1, (om, bm_)
+        assert lm <= om * 1.1, (om, lm)
+        original.cleanup()
 
         def timed(f):
             t = T()
@@ -66,6 +86,7 @@ def test_g12_performance():
         legacy.cleanup()
         binary.cleanup()
         ''',
+        setup=f"ORIGINAL = {str(original)!r}\n",
         real_env=True,
         timeout=600,
     )

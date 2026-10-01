@@ -1,16 +1,27 @@
 #!/usr/bin/env zsh
+\builtin \typeset -g "__brish2_aliases=${options[aliases]}"; \builtin \setopt \no_aliases
 # Brish worker for legacy mode (see docs/protocol.org, "Legacy mode").
 #
 # The wire format is frozen: Python processes running older Brish code spawn
 # this file by path on every init() and restart(), so every reply must stay
 # byte-compatible with what the original script wrote (checked by
 # tests/test_wire_compat.py).
+#
+# Aliases are off while this file is parsed (the startup files may define
+# global aliases) and every internal command is prefixed with `builtin`, so
+# user functions that shadow builtins cannot reach worker internals. Framing
+# uses the private constants below, set once before any command runs:
+# $MARKER is kept only because commands may read it, and a `$'\0'` literal
+# evaluates to the empty string while a command's POSIX_STRINGS is on (it is
+# part of `emulate sh`).
 # MARKER=$'\0'"BRISH_MARKER"
 MARKER=$'\0'
+builtin printf -v __brish2_nul '\0'
+__brish2_dl=$'\n'"$__brish2_nul"$'\n'  # a reply delimiter, with the newline before it
 
-IFS= read -d "$MARKER" -r BRISH_STDIN
-IFS= read -d "$MARKER" -r BRISH_STDOUT
-IFS= read -d "$MARKER" -r BRISH_STDERR
+IFS= builtin read -r -d "$__brish2_nul" BRISH_STDIN
+IFS= builtin read -r -d "$__brish2_nul" BRISH_STDOUT
+IFS= builtin read -r -d "$__brish2_nul" BRISH_STDERR
 stdins=(${(@f)BRISH_STDIN})
 stdouts=(${(@f)BRISH_STDOUT})
 stderrs=(${(@f)BRISH_STDERR})
@@ -26,61 +37,87 @@ stderrs=(${(@f)BRISH_STDERR})
 function __brish2_on_exit {  # $1: exit status
   if [[ -n $__brish2_inreq ]] && (( ZSH_SUBSHELL == __brish2_level )); then
     __brish2_inreq=
-    builtin print -rn -- $'\n\0\n'"+$1"$'\n'
+    builtin print -rn -- "$__brish2_dl+$1"$'\n'
     (
       if [[ -n $__brish2_pid ]] && builtin zmodload zsh/system zsh/zselect 2>/dev/null; then
         repeat 1000; do  # 10 ms steps; give up after 10 s
-          [[ $sysparams[ppid] == $__brish2_pid ]] || builtin break
-          builtin zselect -t 1  # status 1 is the timeout
+          [[ ${sysparams[ppid]} == $__brish2_pid ]] || builtin break
+          builtin zselect -t 1 || builtin true  # status 1 is the timeout
         done
       fi
-      builtin print -rn -- $'\n\0\n' >&2
+      builtin print -rn -- "$__brish2_dl" >&2
     ) </dev/null &
   fi
 }
 
-typeset -ga __brish2_pids
-local brish_server_index
+builtin typeset -ga __brish2_pids
+builtin local brish_server_index
 for brish_server_index in {1..${#stdins}} ; do
     (
-        typeset -g __brish2_inreq= __brish2_ret=0 __brish2_eof= __brish2_x=
-        typeset -g __brish2_level=$ZSH_SUBSHELL
+        #: fd 0 is the request FIFO. Commands never inherit it: they run with
+        #: stdin redirected at the call site, so zsh keeps fd 0 in a private
+        #: copy that it closes in every child process.
+        builtin typeset -g __brish2_inreq= __brish2_ret=0 __brish2_eof= __brish2_x=
+        builtin typeset -g __brish2_level=$ZSH_SUBSHELL
         #: This worker's PID, from a child, so the worker itself does not
         #: load zsh/system.
-        typeset -g __brish2_pid=$(builtin zmodload zsh/system 2>/dev/null && builtin print -r -- $sysparams[ppid])
-        trap '__brish2_on_exit $?' EXIT
+        builtin typeset -g __brish2_pid=$(builtin zmodload zsh/system 2>/dev/null && builtin print -r -- ${sysparams[ppid]})
+        builtin trap '__brish2_on_exit $?' EXIT
+        #: An always-EOF pipe, opened once: the stdin of every command that
+        #: gets no stdin, so such a command forks nothing.
+        builtin typeset -g __brish2_empty=
+        builtin exec {__brish2_empty}< <(builtin true)
+        if [[ $__brish2_aliases == on ]]; then
+            builtin setopt aliases  # user code keeps its aliases
+        fi
         #: The reply is written at the top of the loop, so a command's
         #: `continue N` still gets one, and the outer loop absorbs `break N`.
         while [[ -z $__brish2_eof ]]; do
             while {
                 if [[ -n $__brish2_inreq ]]; then
-                    print -nr -- $'\n'"$MARKER"$'\n'
-                    print -r -- $__brish2_ret
-                    print -nr -- $'\n'"$MARKER"$'\n' >&2
+                    builtin print -rn -- "$__brish2_dl$__brish2_ret"$'\n'
+                    builtin print -rn -- "$__brish2_dl" >&2
                     __brish2_inreq=
                 fi
-                IFS= read -d "$MARKER" -r cmd
+                IFS= builtin read -r -d "$__brish2_nul" cmd
             }
             do
-                IFS= read -d "$MARKER" -r brish_stdin
-                IFS= read -d "$MARKER" -r brish_fork
+                IFS= builtin read -r -d "$__brish2_nul" brish_stdin
+                IFS= builtin read -r -d "$__brish2_nul" brish_fork
+                #: Set again for every request: zsh skips an EXIT trap that was
+                #: set while POSIX_TRAPS was off, if a command turned it on and a
+                #: later command exits from inside a function.
+                builtin trap '__brish2_on_exit $?' EXIT
                 __brish2_inreq=1 __brish2_ret=
                 {
                     repeat 1 do  # absorbs a bare break or continue
-                        if test -n "$brish_fork" ; then
-                            #: </dev/null: nothing in the subshell may hold the
-                            #: request FIFO (see __brish2_on_exit).
-                            ( { ( print -nr -- "$brish_stdin" ) || true }  | eval "$cmd" ) </dev/null
+                        #: Call-site redirections: `>&1 2>&2` also undo a
+                        #: command's `exec >file`, which would hide the replies.
+                        #: The stdin writer ignores SIGPIPE and always succeeds,
+                        #: so a command that does not read its stdin still
+                        #: reports its own status, also under pipefail; it gets
+                        #: </dev/null so that it never holds the request FIFO.
+                        if [[ -n $brish_fork ]]; then
+                            if [[ -n $brish_stdin ]]; then
+                                ( { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | builtin eval "$cmd" ) </dev/null
+                            else
+                                ( builtin eval "$cmd" ) <&$__brish2_empty
+                            fi
                         else
-                            #: Running the code wrapped in a function block has a lot of benefits, e.g., we can use 'return' freely.
-                            # functions[tmp_block_8182782]="$cmd"
-                            #: This corrupts unicode characters! But using eval directly works.
+                            #: Running the code wrapped in a function block lets it
+                            #: use 'return'. `functions[tmp_block_8182782]="$cmd"`
+                            #: would corrupt unicode characters (it does not
+                            #: unmetafy), so the body goes through eval.
                             #: @test typeset cmd=$'\nec \'HARRY: “Hermione,\' > ~/tmp/a'
-                            #: `&&`: after a syntax error the previous command must not run again.
-                            #: The stdin writer gets </dev/null, so it does not hold
-                            #: the request FIFO (see __brish2_on_exit).
-                            eval "function tmp_block_8182782 {"$'\n'"$cmd"$'\n'"}" &&
-                                { ( print -nr -- "$brish_stdin" ) || true } </dev/null | tmp_block_8182782
+                            #: `&&`: after a syntax error the previous command must
+                            #: not run again.
+                            if [[ -n $brish_stdin ]]; then
+                                builtin eval "function tmp_block_8182782 {"$'\n'"$cmd"$'\n'"}" &&
+                                    { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } </dev/null 2>/dev/null | tmp_block_8182782 >&1 2>&2
+                            else
+                                builtin eval "function tmp_block_8182782 {"$'\n'"$cmd"$'\n'"}" &&
+                                    tmp_block_8182782 <&$__brish2_empty >&1 2>&2
+                            fi
                         fi
                     done
                     #: The status is taken here, so that the `always` construct
@@ -95,7 +132,7 @@ for brish_server_index in {1..${#stdins}} ; do
                         __brish2_ret=$__brish2_x
                     fi
                     TRY_BLOCK_ERROR=0
-                    unsetopt err_exit err_return
+                    builtin unsetopt err_exit err_return
                 }
             done
             if [[ -z $__brish2_inreq ]]; then
@@ -114,18 +151,18 @@ done
 #: finds the request FIFO without a reader and restarts the instance. The
 #: FIFOs are opened non-blocking, so this never waits for a reader.
 function __brish2_answer {  # $1: worker index
-  local fd
+  builtin local fd
   if builtin sysopen -w -o nonblock -u fd -- $stdouts[$1] 2>/dev/null; then
-    builtin syswrite -o $fd -- $'\n\0\n9001\n' 2>/dev/null
-    exec {fd}>&-
+    builtin syswrite -o $fd -- "${__brish2_dl}9001"$'\n' 2>/dev/null
+    builtin exec {fd}>&-
   fi
   if builtin sysopen -w -o nonblock -u fd -- $stderrs[$1] 2>/dev/null; then
-    builtin syswrite -o $fd -- $'\n\0\n' 2>/dev/null
-    exec {fd}>&-
+    builtin syswrite -o $fd -- "$__brish2_dl" 2>/dev/null
+    builtin exec {fd}>&-
   fi
 }
 function __brish2_reap {
-  local i
+  builtin local i
   for (( i = 1; i <= $#__brish2_pids; i++ )); do
     if [[ -n $__brish2_pids[i] ]] && ! builtin kill -0 $__brish2_pids[i] 2>/dev/null; then
       __brish2_pids[i]=
@@ -135,10 +172,10 @@ function __brish2_reap {
 }
 #: Set after the workers are forked, so they do not see the module or the
 #: traps. A reader that goes away must not kill the bootstrap with SIGPIPE.
-trap '' PIPE
+builtin trap '' PIPE
 if builtin zmodload zsh/system 2>/dev/null; then
-  trap __brish2_reap CHLD
+  builtin trap __brish2_reap CHLD
 fi
 
-wait
+builtin wait
 __brish2_reap

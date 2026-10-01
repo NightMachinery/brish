@@ -207,7 +207,11 @@ def test_loop_control_and_exit():
                          ("print -r b; continue 2; print -r no", "b\n"),
                          ("print -r c; continue 3; print -r no", "c\n"),
                          ("print -r d; break 3; print -r no", "d\n"),
-                         ("print -r e; exit 4", "e\n")):
+                         ("print -r e; exit 4", "e\n"),
+                         #: POSIX_TRAPS (part of `emulate sh`) changes when zsh
+                         #: runs EXIT traps.
+                         ("print -r f; f() { emulate sh; }; f; exit 4", "f\n"),
+                         ("print -r g; setopt posixtraps; g() { exit 4; }; g", "g\n")):
             r = b.send_cmd(cmd)
             want = 4 if "exit" in cmd else 0
             assert (r.retcode, r.out, r.err) == (want, out, ""), (cmd, repr(r))
@@ -215,5 +219,129 @@ def test_loop_control_and_exit():
             assert (r.retcode, r.out) == (0, "ok\n"), (cmd, repr(r))
         b.cleanup()
         ''',
+        timeout=60,
+    )
+
+
+#: Prints "LEAK n" for every open fd of a fresh process that is this
+#: worker's request FIFO, then "checked".
+FD_PROBE = (
+    r"command zsh -fc 'zmodload zsh/stat; want=$(zstat +device -- $1):$(zstat +inode -- $1); "
+    r"for f in {0..255}; do x=$(zstat -f $f +device 2>/dev/null):$(zstat -f $f +inode 2>/dev/null); "
+    r"[[ $x == $want ]] && print -r LEAK $f; done; print -r checked' zsh $stdins[$brish_server_index]"
+)
+
+
+def test_commands_never_inherit_the_request_fifo():
+    #: The worker reads requests on its fd 0. A command that could read it
+    #: would eat the next request, and a background job that holds it would
+    #: keep a dead worker's FIFO open.
+    check(
+        f'''
+        PROBE = {FD_PROBE!r}
+        b = Brish(server_count=1)
+        shapes = ["{{p}}", "{{{{ {{p}} }}}} &; wait", "( {{p}} ) &; wait", "print -r -- $({{p}})",
+                  "cat <({{p}})", "{{p}} | cat", "exec 3<&0; {{p}}"]
+        for fork in (False, True):
+            for stdin in ("", "x", None):
+                for shape in shapes:
+                    r = b.send_cmd(shape.format(p=PROBE), fork=fork, cmd_stdin=stdin)
+                    assert (r.retcode, r.out, r.err) == (0, "checked\\n", ""), (fork, stdin, shape, repr(r))
+        #: The probe itself works.
+        r = b.send_cmd(PROBE + " 9<$stdins[$brish_server_index]")
+        assert r.out == "LEAK 9\\nchecked\\n", repr(r)
+        b.cleanup()
+        ''',
+        timeout=120,
+    )
+
+
+def test_hostile_user_state():
+    #: The legacy counterpart of test_binary's G10: state a command leaves
+    #: behind must not break the worker loop or its framing.
+    check(
+        r'''
+        def normal(b, why):
+            r = b.send_cmd("\\builtin \\print -r ok; \\builtin \\print -ru2 e", cmd_stdin=b"in")
+            assert (r.retcode, r.outb, r.errb) == (0, b"ok\n", b"e\n"), (why, repr(r))
+            r = b.send_cmd("cat", cmd_stdin=b"x\xff")
+            assert (r.retcode, r.outb) == (0, b"x\xff"), (why, repr(r))
+            r = b.send_cmd("cat")
+            assert (r.retcode, r.outb) == (0, b""), (why, repr(r))
+            r = b.send_cmd("\\builtin \\print -r forked", fork=True)
+            assert (r.retcode, r.outb) == (0, b"forked\n"), (why, repr(r))
+
+        hostile = [
+            "print() { echo SHADOW; }; read() { echo SHADOW; }; eval() { echo SHADOW; }",
+            "exec() { echo SHADOW; }; trap() { echo SHADOW; }; typeset() { echo SHADOW; }",
+            "true() { echo SHADOW; }; test() { echo SHADOW; }; unsetopt() { echo SHADOW; }",
+            "zselect() { echo SHADOW; }; zmodload() { echo SHADOW; }; break() { echo SHADOW; }",
+            "unsetopt aliases; alias -g print=SHADOW builtin=SHADOW read=SHADOW; setopt aliases",
+            "MARKER=x cmd=x brish_stdin=x brish_fork=x",
+            "set -- x y z",
+            "setopt ksharrays",
+            "setopt shwordsplit",
+            "setopt nomultibyte",
+            "setopt nounset",
+            "setopt pipefail",
+            "emulate sh",
+            "emulate ksh",
+            "IFS=:",
+            "trap ': $((++__dbg))' DEBUG",
+            "trap 'return 1' ZERR",
+            "setopt errreturn",
+            "setopt errexit; true",
+            "exec >/dev/null 2>&1",
+        ]
+        for h in hostile:
+            b = Brish(server_count=1)
+            r = b.send_cmd(h)
+            normal(b, h)
+            normal(b, h)
+            #: exit is still answered with its status.
+            r = b.send_cmd("\\builtin \\print -r bye; \\builtin exit 3")
+            assert (r.retcode, r.outb) == (3, b"bye\n"), (h, repr(r))
+            b.cleanup()
+        #: A ZERR trap that prints must not fire for worker internals.
+        b = Brish(server_count=1)
+        b.send_cmd("trap 'builtin print -ru2 ZERR-FIRED' ZERR")
+        normal(b, "zerr-print")
+        r = b.send_cmd("false")
+        assert r.retcode == 1 and r.errb == b"ZERR-FIRED\n", repr(r)
+        normal(b, "zerr-print after false")
+        b.cleanup()
+        ''',
+        timeout=180,
+    )
+
+
+def test_startup_files_cannot_break_the_worker(tmp_path):
+    #: Global aliases and functions that shadow builtins, defined by the
+    #: startup files, are in place before the worker script is parsed.
+    zdot = tmp_path / "zdot"
+    zdot.mkdir()
+    (zdot / ".zshenv").write_text(
+        "alias zz='echo aliased'\n"
+        "alias -g read=SHADOW_R print=SHADOW_P typeset=SHADOW_T MARKER=SHADOW_M\n"
+        "print() { echo SHADOW; }; read() { echo SHADOW; }; exec() { echo SHADOW; }\n"
+        "trap() { echo SHADOW; }; wait() { echo SHADOW; }; eval() { echo SHADOW; }\n"
+    )
+    check(
+        r'''
+        b = Brish(server_count=2)
+        for i in (0, 1):
+            r = b.send_cmd('\\builtin \\print -r -- $brish_server_index', server_index=i)
+            assert (r.retcode, r.out, r.err) == (0, f"{i + 1}\n", ""), repr(r)
+        r = b.send_cmd("zz")
+        assert r.out == "aliased\n", repr(r)
+        r = b.send_cmd("cat", cmd_stdin="in")
+        assert r.out == "in", repr(r)
+        r = b.send_cmd("\\builtin exit 4")
+        assert r.retcode == 4, repr(r)
+        r = b.send_cmd("echo next")
+        assert r.out == "next\n", repr(r)
+        b.cleanup()
+        ''',
+        env={"ZDOTDIR": str(zdot)},
         timeout=60,
     )
