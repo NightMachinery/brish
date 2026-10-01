@@ -137,3 +137,85 @@ def test_old_python_on_this_worker(sources, real_env):
         real_env=real_env,
         timeout=300,
     )
+
+
+@pytest.mark.parametrize("real_env", ENVS)
+def test_intended_differences(sources, real_env):
+    #: Where this worker answers differently from the original on purpose.
+    #: The original hangs an old Python (it spins on EOF) for most of these,
+    #: so they are asserted here instead of in the corpus.
+    check(
+        r'''
+        T = time.monotonic
+        #: The original re-runs the previous command after a syntax error.
+        b = original_on(ORIG_FILE, "o").Brish(server_count=1)
+        b.send_cmd("print -r first")
+        r = b.send_cmd("fi")
+        assert (r.retcode, r.out) == (0, "first\n") and "parse error" in r.err, r
+        b.cleanup()
+        def run(name, mod, kw):
+            b = mod.Brish(server_count=1, **kw)
+            c = b.send_cmd
+            assert c("print -r first").out == "first\n"
+            want = [
+                ("fi", 1, "", "parse error"),  # no re-run
+                ("print *.nonexistent_zzz; print -r no", 1, "", "no matches found"),
+                ("setopt errexit errreturn; true", 0, "", ""),
+                ("false; print -r survived", 0, "survived\n", ""),  # not persistent
+                ("f() { false; print -r after }; f", 0, "after\n", ""),
+                ("break; print -r no", 0, "", ""),
+                ("continue; print -r no", 0, "", ""),
+                ("print -r a; break 2; print -r no", 0, "a\n", ""),
+                ("print -r b; continue 2; print -r no", 0, "b\n", ""),
+            ]
+            for cmd, rc, out, err in want:
+                r = c(cmd)
+                assert (r.retcode, r.out) == (rc, out) and err in r.err, (name, cmd, r)
+                if not err:
+                    assert r.err == "", (name, cmd, r)
+                r = c("echo ok")
+                assert (r.retcode, r.out) == (0, "ok\n"), (name, cmd, r)
+            #: exit: the real status. The worker is gone afterwards: the
+            #: original Python gets EPIPE, master restarts and runs the command.
+            for cmd, rc in (("sleep 2 & print -r bye; exit 3", 3),):
+                t = T()
+                r = c(cmd)
+                assert (r.retcode, r.out, r.err) == (rc, "bye\n", ""), (name, cmd, r)
+                assert T() - t < 1.5, (name, T() - t)
+                if name == "original":
+                    try:
+                        c("echo next")
+                        raise SystemExit("no BrokenPipeError for the original Python")
+                    except BrokenPipeError:
+                        pass
+                    b = mod.Brish(server_count=1)
+                    c = b.send_cmd
+                else:
+                    r = c("echo next")
+                    assert (r.retcode, r.out) == (0, "next\n"), (name, r)
+            if name == "master":
+                b.cleanup()
+            #: errexit kills the worker without an EXIT trap; the bootstrap
+            #: answers for it, even while a background job holds the FIFOs,
+            #: and the old Python no longer spins.
+            b = mod.Brish(server_count=1, **kw)
+            t = T()
+            r = b.send_cmd("sleep 2 & setopt errexit; false")
+            assert r.retcode == 9001, (name, r)
+            assert T() - t < 1.5, (name, T() - t)
+            if name == "master":
+                #: master reads the 9001 as a reply (without the note) and
+                #: finds the worker gone on its next request.
+                r = b.send_cmd("echo next")
+                assert (r.retcode, r.out) == (0, "next\n"), (name, r)
+                b.cleanup()
+        parallel(original=lambda: run("original", original_on(TREE_FILE, "t"), {}),
+                 master=lambda: run("master", master_on(TREE_FILE, "t"), {"binary": False}))
+        time.sleep(2)  # let the background sleeps finish
+        ''',
+        setup=LOADERS.format(sources=str(sources)),
+        env={"BRISH_BINARY": None},
+        real_env=real_env,
+        allow_orphans=True,
+        timeout=180,
+    )

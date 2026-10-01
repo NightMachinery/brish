@@ -1,8 +1,5 @@
 """Worker-facing goals that hold in both modes: G6 (no deadlock), G7 (no hang
-on worker death), G8 (interrupt safety) and G9 (restart under concurrency).
-
-Binary-only refinements are asserted when BINARY is set.
-"""
+on worker death), G8 (interrupt safety) and G9 (restart under concurrency)."""
 
 from tests.conftest import check
 
@@ -69,22 +66,15 @@ def test_g7_worker_death_returns_a_result():
         r'''
         b = Brish(server_count=1)
         cases = [
-            ("print *.nonexistent_zzz", None),
+            ("print *.nonexistent_zzz", 1),
             ("exit 3", 3),
-            ("setopt errexit; false", None),
+            ("setopt errexit; false", 9001),
             ("break", 0),
-            ("x=; : ${x:?}", None),
+            ("x=; : ${x:?}", 9001),
         ]
         for cmd, want in cases:
             r = timed(lambda: b.send_cmd(cmd), 10)
-            if BINARY and want is not None:
-                assert r.retcode == want, (cmd, repr(r))
-            elif want == 0:
-                assert r.retcode in (0, 9001), (cmd, repr(r))
-            else:
-                assert r.retcode not in (0,), (cmd, repr(r))
-                if want is not None:
-                    assert r.retcode in (want, 9001), (cmd, repr(r))
+            assert r.retcode == want, (cmd, repr(r))
             if r.retcode == 9001:
                 assert r.err.endswith("brish: worker died during this command\n"), repr(r)
             assert_ok(b)
@@ -100,8 +90,7 @@ def test_g7_nomatch_reports_the_error():
         b = Brish(server_count=1)
         r = timed(lambda: b.send_cmd("print *.nonexistent_zzz"), 10)
         assert "no matches found" in r.err, repr(r)
-        if BINARY:
-            assert r.retcode == 1, repr(r)
+        assert r.retcode == 1, repr(r)
         assert_ok(b)
         b.cleanup()
         ''',
@@ -117,13 +106,33 @@ def test_g7_syntax_error_does_not_rerun_the_previous_command():
         assert r.out == "first\n", repr(r)
         r = timed(lambda: b.send_cmd("fi"), 10)
         assert "parse error" in r.err, repr(r)
-        if BINARY:
-            #: Legacy mode re-runs the previous command here with status 0
-            #: (brish2.zsh calls the old function after the failed definition).
-            assert (r.retcode, r.out) == (1, ""), repr(r)
+        assert (r.retcode, r.out) == (1, ""), repr(r)
         r = b.send_cmd("echo x")
         assert (r.retcode, r.out) == (0, "x\n"), repr(r)
         b.cleanup()
+        ''',
+        timeout=60,
+    )
+
+
+def test_g7_death_while_a_background_job_holds_the_streams():
+    #: The job keeps the reply streams open after the worker is gone, so no
+    #: EOF arrives. The result must not wait for the job.
+    wcheck(
+        r'''
+        b = Brish(server_count=1)
+        for cmd, want in (("sleep 3 & print -r bye; exit 5", 5),
+                          ("sleep 3 & setopt errexit; false", 9001),
+                          ("sleep 3 & x=; : ${x:?}", 9001)):
+            r = timed(lambda: b.send_cmd(cmd), 2.5)
+            assert r.retcode == want, (cmd, repr(r))
+            if want == 9001:
+                assert r.err.endswith("brish: worker died during this command\n"), repr(r)
+            else:
+                assert (r.out, r.err) == ("bye\n", ""), repr(r)
+            timed(lambda: assert_ok(b), 15)
+        b.cleanup()
+        time.sleep(3)  # let the background sleeps finish
         ''',
         timeout=60,
     )
@@ -306,7 +315,7 @@ def test_real_environment_smoke():
         r = b.send_cmd("print -rn -- ${(l:20000::e:)} >&2; print ok")
         assert (r.retcode, r.out, len(r.err)) == (0, "ok\n", 20000), repr(r)
         r = b.send_cmd("exit 4")
-        assert r.retcode in (4, 9001), repr(r)
+        assert r.retcode == 4, repr(r)
         assert_ok(b)
         b.cleanup()
         ''',

@@ -195,3 +195,25 @@ def test_zp_passes_bytes_through(tmp_path):
     assert res.rc == 0, res
     assert res.outb == b"a\nbc\n", res
     assert res.errb == b"\xffe", res
+
+
+def test_loop_control_and_exit():
+    #: A command's break N or continue N cannot escape the worker loop, and
+    #: exit is answered with its status; the instance restarts afterwards.
+    check(
+        r'''
+        b = Brish(server_count=1)
+        for cmd, out in (("print -r a; break 2; print -r no", "a\n"),
+                         ("print -r b; continue 2; print -r no", "b\n"),
+                         ("print -r c; continue 3; print -r no", "c\n"),
+                         ("print -r d; break 3; print -r no", "d\n"),
+                         ("print -r e; exit 4", "e\n")):
+            r = b.send_cmd(cmd)
+            want = 4 if "exit" in cmd else 0
+            assert (r.retcode, r.out, r.err) == (want, out, ""), (cmd, repr(r))
+            r = b.send_cmd("echo ok")
+            assert (r.retcode, r.out) == (0, "ok\n"), (cmd, repr(r))
+        b.cleanup()
+        ''',
+        timeout=60,
+    )

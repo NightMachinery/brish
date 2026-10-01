@@ -1245,8 +1245,8 @@ class Brish:
                     )
                 self._restart_now(p.gen)
                 continue
-            result, died = outcome
-            if died:
+            result, restart = outcome
+            if restart:
                 self._request_restart(p.gen)
             return result
 
@@ -1255,6 +1255,11 @@ class Brish:
         )
 
     def _legacy_transact(self, p, index, frame, cmd, cmd_stdin):
+        """One request/reply exchange with legacy worker `index`.
+
+        Returns _NEVER_RAN if the request could not be written, or
+        (CmdResult, restart). See docs/protocol.org, "Legacy mode".
+        """
         try:
             f = p.brish_stdins[index]
             f.write(frame)
@@ -1269,12 +1274,19 @@ class Brish:
         p.err_readers[index] = err_reader
         outb, died = _legacy_read_reply(p.brish_stdouts[index])
         return_code = None
+        exited = False
         if not died:
             rc_line = p.brish_stdouts[index].readline()
             if not rc_line:
                 died = True
             else:
+                #: "+N" comes from the worker's EXIT trap: the command exited
+                #: the worker with status N. 9001 without "+" is the
+                #: bootstrap answering for a worker that died silently.
+                exited = rc_line.startswith(b"+")
                 return_code = int(rc_line)
+                if return_code == RETCODE_WORKER_DIED and not exited:
+                    died = True
         err_reader.thread.join(2 if died else None)
         if err_reader.exc is not None:
             raise err_reader.exc
@@ -1299,7 +1311,7 @@ class Brish:
             encoding=self.encoding,
             errors=self.decoding_errors,
         )
-        return res, died
+        return res, died or exited
 
     def cleanup(self):
         with self.lock:
