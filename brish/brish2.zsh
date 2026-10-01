@@ -142,20 +142,24 @@ for brish_server_index in {1..${#stdins}} ; do
             fi
         done
     ) < $stdins[$brish_server_index] >> $stdouts[$brish_server_index] 2>> $stderrs[$brish_server_index] &
-    __brish2_pids[brish_server_index]=$!
+    #: Quoted: zsh 5.9 stores a subscripted assignment from a bare `$!` as
+    #: the two characters `$!`, which made every worker look dead.
+    __brish2_pids[brish_server_index]="$!"
 done
 
 #: A worker that dies without answering (errexit, `${x:?}`, a signal, `exec`)
 #: would leave its caller waiting for as long as a background job holds the
 #: reply FIFOs open, and an old Python spinning on EOF. So when a worker is
-#: gone, the bootstrap writes the reply "retcode 9001" on its behalf. If the
+#: gone, the bootstrap writes the reply "retcode 9001" on its behalf, with the
+#: retcode line "09001": every Python parses it as 9001, and new Python tells
+#: it apart from a command's own `return 9001`. If the
 #: worker answered, or was idle, nobody reads it: the caller's next request
 #: finds the request FIFO without a reader and restarts the instance. The
 #: FIFOs are opened non-blocking, so this never waits for a reader.
 function __brish2_answer {  # $1: worker index
   builtin local fd
   if builtin sysopen -w -o nonblock -u fd -- $stdouts[$1] 2>/dev/null; then
-    builtin syswrite -o $fd -- "${__brish2_dl}9001"$'\n' 2>/dev/null
+    builtin syswrite -o $fd -- "${__brish2_dl}09001"$'\n' 2>/dev/null
     builtin exec {fd}>&-
   fi
   if builtin sysopen -w -o nonblock -u fd -- $stderrs[$1] 2>/dev/null; then

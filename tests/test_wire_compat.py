@@ -219,3 +219,62 @@ def test_intended_differences(sources, real_env):
         allow_orphans=True,
         timeout=180,
     )
+
+
+@pytest.mark.parametrize("real_env", ENVS)
+@pytest.mark.parametrize("python", ["original", "master", "tree"])
+def test_a_dying_worker_leaves_the_others_alone(sources, python, real_env):
+    #: The bootstrap answers only for the worker that died. A busy worker
+    #: finishes its own command, and the other workers' next replies are their
+    #: own. "tree" is this tree's own Python. A restart drops the state of
+    #: every worker, but each reply is still the answer to its own command.
+    check(
+        r"""
+        import faulthandler; faulthandler.dump_traceback_later(60, exit=True)
+        mod = {"original": lambda: original_on(TREE_FILE, "t"),
+               "master": lambda: master_on(TREE_FILE, "t"),
+               "tree": lambda: bm}[PY]()
+        kw = {"binary": False} if PY == "master" else {}
+        for method in ("kill", "exit", "errexit"):
+            b = mod.Brish(server_count=3, **kw)
+            c = b.send_cmd
+            for i in (1, 2):
+                assert c(f"v=kept{i}", server_index=i).retcode == 0
+            r = c("zmodload zsh/system; print -r -- $sysparams[pid]", server_index=0)
+            pid0 = int(r.out)
+            assert pid0 > 1 and pid0 != b.p.pid, (PY, method, repr(r))
+            busy = {}
+            def run_busy():
+                busy["r"] = c("sleep 1; print -r -- busy-$v", server_index=1)
+            t = threading.Thread(target=run_busy)
+            t.start()
+            time.sleep(0.3)
+            if method == "kill":
+                print(f"[test] SIGKILL worker {pid0}", file=sys.stderr)
+                os.kill(pid0, signal.SIGKILL)
+            elif method == "exit":
+                r = c("exit 4", server_index=0)
+                assert (r.retcode, r.out) == (4, ""), (PY, method, repr(r))
+            else:
+                r = c("setopt errexit; false", server_index=0)
+                assert (r.retcode, r.out) == (9001, ""), (PY, method, repr(r))
+            t.join(30)
+            r = busy["r"]
+            assert (r.retcode, r.out, r.err) == (0, "busy-kept1\n", ""), (PY, method, repr(r))
+            time.sleep(0.3)  # the bootstrap has reaped worker 0
+            #: Which Pythons restart the instance (dropping v) at their next
+            #: call: master after a 9001, this tree after any reported death.
+            keep = {"original": True, "master": method != "errexit",
+                    "tree": method == "kill"}[PY]
+            for k in range(3):
+                for i in (1, 2):
+                    r = c(f"print -r -- {k}-$v", server_index=i)
+                    want = f"{k}-kept{i}\n" if keep else f"{k}-\n"
+                    assert (r.retcode, r.out, r.err) == (0, want, ""), (PY, method, k, i, repr(r))
+            b.cleanup()
+        """,
+        setup=LOADERS.format(sources=str(sources)) + f"PY = {python!r}\n",
+        env={"BRISH_BINARY": None},
+        real_env=real_env,
+        timeout=180,
+    )

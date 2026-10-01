@@ -518,6 +518,9 @@ class _Worker:
 
 #: The legacy reply delimiter: a line holding only NUL (see docs/protocol.org).
 _LEGACY_DELIM = b"\0\n"
+#: The retcode line the bootstrap writes for a worker that died without
+#: answering. Every Python parses it as 9001; no command's status prints so.
+_LEGACY_DEATH_LINE = b"09001\n"
 
 
 def _legacy_read_reply(f, delim=_LEGACY_DELIM):
@@ -1281,11 +1284,12 @@ class Brish:
                 died = True
             else:
                 #: "+N" comes from the worker's EXIT trap: the command exited
-                #: the worker with status N. 9001 without "+" is the
-                #: bootstrap answering for a worker that died silently.
+                #: the worker with status N. "09001" is the bootstrap
+                #: answering for a worker that died silently; a plain 9001 is
+                #: the command's own status (`return 9001`).
                 exited = rc_line.startswith(b"+")
                 return_code = int(rc_line)
-                if return_code == RETCODE_WORKER_DIED and not exited:
+                if rc_line == _LEGACY_DEATH_LINE:
                     died = True
         err_reader.thread.join(2 if died else None)
         if err_reader.exc is not None:

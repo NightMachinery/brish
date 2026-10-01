@@ -95,7 +95,7 @@ The second round backported every binary-mode fix that fits the frozen wire form
 
 The worker (=brish2.zsh=), with every reply still in the frozen format:
 - the protected run loop of binary mode: no re-run after a syntax error, NOMATCH returns 1, =break= and =continue= end only the command, =errexit= and =errreturn= do not persist;
-- =exit N= is answered with N by an EXIT trap, and a worker that dies silently is answered with 9001 by the bootstrap, so neither old nor new Python waits on a background job that holds the reply FIFOs;
+- =exit N= is answered with N by an EXIT trap, and a worker that dies silently is answered with 9001 by the bootstrap (on that worker's FIFOs only), so neither old nor new Python waits on a background job that holds the reply FIFOs;
 - no fork for an empty stdin, which cuts the per-call latency of =send_cmd("true")= in a real environment from about 4.8 ms to about 0.3 ms;
 - the same defences against user state as binary mode.
 

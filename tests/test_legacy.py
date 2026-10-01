@@ -223,6 +223,23 @@ def test_loop_control_and_exit():
     )
 
 
+def test_status_9001_is_the_commands_own():
+    #: The bootstrap answers for a dead worker with the retcode line "09001";
+    #: a command's own `return 9001` is a plain status and keeps the worker.
+    check(
+        r'''
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        r = b.send_cmd("return 9001")
+        assert (r.retcode, r.out, r.err) == (9001, "", ""), repr(r)
+        r = b.send_cmd("print -r -- $v")
+        assert (r.retcode, r.out) == (0, "kept\n"), repr(r)
+        b.cleanup()
+        ''',
+        timeout=60,
+    )
+
+
 #: Prints "LEAK n" for every open fd of a fresh process that is this
 #: worker's request FIFO, then "checked".
 FD_PROBE = (
