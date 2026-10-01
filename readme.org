@@ -29,7 +29,7 @@ Or install the latest master (recommended, as I might have forgotten to push a n
 
 You need a recent Python version, as Brish uses some of the newer metaprogramming APIs. Obviously, you also need zsh installed.
 
-Installing from git builds Brish from source, which needs Python 3.9 or newer. Working on Brish itself needs Python 3.10 or newer; see [[file:docs/development.org][docs/development.org]] for the setup, the tests and the dependency audit.
+Brish needs Python 3.10 or newer. Working on Brish itself is described in [[file:docs/development.org][docs/development.org]]: the setup, the tests and the dependency audit.
 
 ** Quickstart
 

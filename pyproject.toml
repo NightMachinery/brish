@@ -3,17 +3,14 @@ name = "brish"
 version = "0.3.6"
 description = "A bridge between zsh and Python."
 authors = [{ name = "NightMachinery", email = "rudiwillalwaysloveyou@gmail.com" }]
-# The published Python floor. poetry.lock is resolved for the narrower
-# range in [tool.poetry.dependencies]; see docs/development.org.
-requires-python = ">=3.7.0,<4"
+# The patched pytest (9.0.3) needs Python 3.10, and the patched Pygments
+# (2.20.0, which icecream pulls in at runtime) needs 3.9, so 3.10 is the
+# oldest Python the lock can cover without vulnerable versions; it is also
+# the oldest one the tests run on. See docs/development.org.
+requires-python = ">=3.10,<4"
 dependencies = ["icecream (>=2.1.0,<3.0.0)"]
-# Static on purpose: Poetry derives automatic Python classifiers from the
-# locking range, which would drop 3.7 to 3.9 from the published page.
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -25,13 +22,6 @@ Repository = "https://github.com/NightMachinery/brish"
 
 [tool.poetry]
 exclude = ["__pycache__"]
-
-[tool.poetry.dependencies]
-# The range poetry.lock covers. It is not published. The patched pytest
-# (9.0.3) needs Python 3.10, and the patched Pygments (2.20.0, which
-# icecream pulls in at runtime) needs 3.9, so a lock that also covered
-# 3.7 would have to keep vulnerable versions.
-python = ">=3.10,<4"
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=9.0.3"

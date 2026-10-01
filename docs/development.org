@@ -2,18 +2,12 @@
 
 How to set up a development environment, run the tests and keep the dependency lock free of known vulnerabilities. The user-facing install instructions are in the "Installation" section of the readme.
 
-* Two Python ranges
-=pyproject.toml= declares two Python constraints, and they mean different things:
-- The *published floor* is =requires-python= in =[project]= (currently 3.7). It goes into the wheel and sdist metadata as =Requires-Python=, so it decides which interpreters pip will install a release on.
-- The *locking range* is =python= in =[tool.poetry.dependencies]= (currently 3.10). It is never published. Poetry resolves =poetry.lock=, including the dev group, for every interpreter in this range, and refuses to install the lock on an interpreter outside it.
+* Supported Python versions
+Brish needs Python 3.10 or newer. =requires-python= in =[project]= says so; it goes into the wheel and sdist metadata as =Requires-Python=, and Poetry resolves =poetry.lock=, including the dev group, for the same range.
 
-The locking range is narrower because the patched releases of two locked packages dropped old interpreters. Pygments 2.20.0 needs Python 3.9, and Pygments is a runtime dependency of icecream, so python markers on the dev dependencies cannot help: a lock that covered 3.7 and 3.8 would have to pin a vulnerable Pygments for them. pytest 9.0.3 needs Python 3.10. Dependabot scans every entry in =poetry.lock=, so one old entry kept for an old interpreter would keep its alert open.
+3.10 is the floor because the patched releases of two locked packages dropped older interpreters. Pygments 2.20.0 needs Python 3.9, and Pygments is a runtime dependency of icecream, so python markers on the dev dependencies cannot help: a lock that covered 3.7 or 3.8 would have to pin a vulnerable Pygments for them. pytest 9.0.3 needs Python 3.10. Dependabot scans every entry in =poetry.lock=, so one old entry kept for an old interpreter would keep its alert open. Python 3.9 and older are past their end of life, and the tests never ran on them.
 
-Consequences:
-- Installing a wheel needs only the published floor. The metadata is unchanged from the 0.3.6 release on PyPI.
-- Building from source (=pip install git+...=, or an sdist) needs the build backend, poetry-core 2, which needs Python 3.9. On 3.7 and 3.8 that build fails with "No matching distribution found for poetry-core".
-- Development needs Python 3.10 or newer.
-- The Python classifiers are written out by hand in =[project]=. Poetry would otherwise derive them from the locking range and drop 3.7 to 3.9 from the PyPI page. Add a line there when a new Python version is supported.
+Releases up to 0.3.6 declared Python 3.7 and still install there. The Python classifiers in =[project]= are written out by hand: add a line when a new Python version is tested.
 
 * Setting up
 Poetry 2 is required, since the metadata lives in =[project]=:
