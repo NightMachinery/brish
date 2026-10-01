@@ -1,0 +1,54 @@
+#+TITLE: Developing Brish
+
+How to set up a development environment, run the tests and keep the dependency lock free of known vulnerabilities. The user-facing install instructions are in the "Installation" section of the readme.
+
+* Two Python ranges
+=pyproject.toml= declares two Python constraints, and they mean different things:
+- The *published floor* is =requires-python= in =[project]= (currently 3.7). It goes into the wheel and sdist metadata as =Requires-Python=, so it decides which interpreters pip will install a release on.
+- The *locking range* is =python= in =[tool.poetry.dependencies]= (currently 3.10). It is never published. Poetry resolves =poetry.lock=, including the dev group, for every interpreter in this range, and refuses to install the lock on an interpreter outside it.
+
+The locking range is narrower because the patched releases of two locked packages dropped old interpreters. Pygments 2.20.0 needs Python 3.9, and Pygments is a runtime dependency of icecream, so python markers on the dev dependencies cannot help: a lock that covered 3.7 and 3.8 would have to pin a vulnerable Pygments for them. pytest 9.0.3 needs Python 3.10. Dependabot scans every entry in =poetry.lock=, so one old entry kept for an old interpreter would keep its alert open.
+
+Consequences:
+- Installing a wheel needs only the published floor. The metadata is unchanged from the 0.3.6 release on PyPI.
+- Building from source (=pip install git+...=, or an sdist) needs the build backend, poetry-core 2, which needs Python 3.9. On 3.7 and 3.8 that build fails with "No matching distribution found for poetry-core".
+- Development needs Python 3.10 or newer.
+- The Python classifiers are written out by hand in =[project]=. Poetry would otherwise derive them from the locking range and drop 3.7 to 3.9 from the PyPI page. Add a line there when a new Python version is supported.
+
+* Setting up
+Poetry 2 is required, since the metadata lives in =[project]=:
+
+#+begin_example
+poetry env use python3.13
+poetry install --no-root
+#+end_example
+
+=--no-root= leaves brish itself uninstalled. The tests import it from the working tree and fail if they find an installed copy instead (see =tests/test_guard.py=).
+
+After editing dependencies, regenerate the lock from scratch. A plain =poetry lock= in Poetry 2 keeps any old pin that still satisfies the constraints, which is how vulnerable versions survive:
+
+#+begin_example
+poetry lock --regenerate
+poetry check --lock
+#+end_example
+
+* Running the tests
+The suite runs in two modes, selected by =BRISH_BINARY= (see =tests/conftest.py=). Run both from the repository root:
+
+#+begin_example
+poetry run python -m pytest -q
+BRISH_BINARY=1 poetry run python -m pytest -q
+#+end_example
+
+=tests/test_perf.py= (binary mode only) asserts absolute timings, such as 50 MiB of stdin in under two seconds. It can fail on a heavily loaded machine; rerun it alone before treating a failure as a regression.
+
+* Auditing the lock
+pip-audit checks every pinned version against the PyPI and OSV advisory databases. Fed the pins straight from =poetry.lock=, it also covers packages that only install on other platforms or Python versions. The one-liner needs Python 3.11 or newer for =tomllib=:
+
+#+begin_example
+poetry run python -m pip install pip-audit
+poetry run python -c 'import tomllib; [print(p["name"] + "==" + p["version"]) for p in tomllib.load(open("poetry.lock", "rb"))["package"]]' > "${TMPDIR:-/tmp}/brish-lock-pins.txt"
+poetry run pip-audit -r "${TMPDIR:-/tmp}/brish-lock-pins.txt" --no-deps --disable-pip --strict
+#+end_example
+
+Running =pip-audit= with no arguments audits the whole virtualenv instead. That also reports the =pip= that seeded the virtualenv, which is not in the lock; upgrade it with =python -m pip install -U pip=.
