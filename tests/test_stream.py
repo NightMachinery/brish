@@ -1,0 +1,514 @@
+"""Brish.popen: output that streams while the command runs, and kill().
+
+Every test runs in both modes. Timing assertions use wide margins: they tell
+"arrives while the command runs" from "arrives when it ends".
+"""
+
+from tests.conftest import BINARY, check, legacy_only
+
+HELPERS = r'''
+from brish.brishmod import BrishPopen, BrishWorkerDiedException
+def collect(p, t0=None):
+    """[(seconds since t0, stream, chunk)] until the end."""
+    t0 = time.monotonic() if t0 is None else t0
+    evs = []
+    for stream, chunk in p:
+        assert isinstance(chunk, bytes) and chunk, (stream, chunk)
+        assert stream in ("out", "err"), stream
+        evs.append((time.monotonic() - t0, stream, chunk))
+    return evs
+def joined(evs, stream="out"):
+    return b"".join(c for _, s, c in evs if s == stream)
+def first_time(evs, needle, stream="out"):
+    """When the joined stream first contained `needle`."""
+    acc = b""
+    for t, s, c in evs:
+        if s == stream:
+            acc += c
+            if needle in acc:
+                return t
+    raise AssertionError((needle, evs))
+def kill_later(p, delay):
+    t = threading.Timer(delay, p.kill)
+    t.start()
+    return t
+def same_server_ok(b, i, want_v="kept"):
+    r = b.send_cmd("print -r -- ok-$v", server_index=i)
+    assert (r.retcode, r.out, r.err) == (0, f"ok-{want_v}\n", ""), repr(r)
+'''
+
+
+def run(code, timeout=60, **kw):
+    return check(code, setup=HELPERS, timeout=timeout, **kw)
+
+
+def test_lines_arrive_while_the_command_runs():
+    run(
+        r'''
+        b = Brish(server_count=1)
+        with b.popen("for i in 1 2 3 4 5; do print -r line$i; sleep 0.25; done; return 4") as p:
+            assert p.retcode is None
+            evs = collect(p)
+        assert p.retcode == 4, p.retcode
+        assert joined(evs) == b"".join(b"line%d\n" % i for i in range(1, 6)), evs
+        ts = [first_time(evs, b"line%d" % i) for i in range(1, 6)]
+        assert ts[0] < 0.2, ts
+        for a, c in zip(ts, ts[1:]):
+            assert c - a > 0.12, ts
+        assert ts[-1] - ts[0] > 0.8, ts
+        b.cleanup()
+        '''
+    )
+
+
+def test_progress_bar_and_partial_lines():
+    run(
+        r'''
+        b = Brish(server_count=1)
+        cmd = "for i in 1 2 3; do printf '\\r%d%%' $((i * 33)); sleep 0.3; done; printf 'part'; sleep 0.3; printf 'ial\\n'"
+        with b.popen(cmd) as p:
+            evs = collect(p)
+        assert p.retcode == 0
+        want = b"\r33%\r66%\r99%partial\n"
+        assert joined(evs) == want, evs
+        ts = [first_time(evs, x) for x in (b"\r33%", b"\r66%", b"\r99%", b"part", b"partial")]
+        for a, c in zip(ts, ts[1:]):
+            assert c - a > 0.15, (ts, evs)
+        assert b.send_cmd(cmd).outb == want
+        b.cleanup()
+        '''
+    )
+
+
+def test_stderr_separately_and_merged():
+    run(
+        r'''
+        b = Brish(server_count=1)
+        with b.popen("print -r o1; print -ru2 e1; sleep 0.3; print -r o2; print -ru2 e2; return 2") as p:
+            evs = collect(p)
+        assert p.retcode == 2
+        assert joined(evs, "out") == b"o1\no2\n", evs
+        assert joined(evs, "err") == b"e1\ne2\n", evs
+        assert first_time(evs, b"e2", "err") - first_time(evs, b"e1", "err") > 0.15, evs
+        #: Merged in the shell: one stream, in order.
+        cmd = "{ print -r a; print -ru2 b; sleep 0.2; print -r c; print -ru2 d } 2>&1"
+        with b.popen(cmd) as p:
+            evs = collect(p)
+        assert {s for _, s, _ in evs} == {"out"}, evs
+        assert joined(evs) == b"a\nb\nc\nd\n", evs
+        b.cleanup()
+        '''
+    )
+
+
+def test_nul_in_the_output():
+    run(
+        r'''
+        b = Brish(server_count=1)
+        cmd = "printf 'x\\0'; sleep 0.4; printf 'y\\0BR'; sleep 0.4; printf 'z\\n'"
+        with b.popen(cmd) as p:
+            evs = collect(p)
+        assert p.retcode == 0
+        want = b"x\0y\0BRz\n"
+        if BINARY:
+            assert joined(evs) == want, evs
+            #: "x" comes at once; a NUL is held only while it could start the
+            #: END marker ("\0" and "\0BR" could, "\0y" cannot).
+            tx, ty, tz = (first_time(evs, s) for s in (b"x", b"x\0y", b"z"))
+            assert ty - tx > 0.25 and tz - ty > 0.25, evs
+            assert first_time(evs, b"x\0y\0BR") >= tz - 0.05, evs
+        else:
+            #: Legacy holds back only a trailing newline (or newline + NUL).
+            assert joined(evs) == want, evs
+            tx, ty, tz = (first_time(evs, s) for s in (b"x\0", b"y\0BR", b"z"))
+            assert ty - tx > 0.25 and tz - ty > 0.25, evs
+        b.cleanup()
+        '''
+    )
+
+
+def test_buffer_gives_the_send_cmd_result():
+    run(
+        r'''
+        b = Brish(server_count=1)
+        cases = [
+            ("print -r out; print -ru2 err; return 3", ""),
+            ("printf 'a\\r\\nb'", ""),
+            ("cat", "some\nstdin"),
+            ("print -rn -- ${(l:300000::o:)}", ""),
+            ("print -r -- caf\xe9 \U0001f40d", ""),
+        ]
+        if BINARY:
+            cases.append(("printf 'a\\0b\\0BRISH3-END:'", ""))
+        for cmd, stdin in cases:
+            want = b.send_cmd(cmd, cmd_stdin=stdin)
+            p = b.popen(cmd, cmd_stdin=stdin, buffer=True)
+            assert p.wait() == want.retcode
+            r = p.result
+            assert (r.retcode, r.outb, r.errb, r.out, r.err) == (
+                want.retcode, want.outb, want.errb, want.out, want.err), (cmd, r, want)
+            assert (r.cmd, r.cmd_stdin) == (cmd, stdin)
+        p = b.popen("sleep 0.3; print -r late", buffer=True)
+        assert (p.retcode, p.result) == (None, None)  # not ended yet
+        assert p.wait() == 0 and p.result.out == "late\n"
+        p = b.popen("true")
+        p.wait()
+        try:
+            p.result
+            raise SystemExit("result without buffer=True")
+        except ValueError:
+            pass
+        b.cleanup()
+        '''
+    )
+
+
+def test_fork_stdin_and_zpopen():
+    run(
+        r'''
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        with b.popen("v=changed; cat; print -r -- $v", cmd_stdin="in\n", fork=True) as p:
+            evs = collect(p)
+        assert joined(evs) == b"in\nchanged\n", evs
+        same_server_ok(b, 0)
+        name = "a b'c"
+        with b.zpopen("print -r -- {name}") as p:
+            assert joined(collect(p)) == b"a b'c\n"
+        if not BINARY:
+            p = b.popen("print a\0b")
+            assert p.wait() == 9000 and p.retcode == 9000
+        b.cleanup()
+        '''
+    )
+
+
+def test_kill_an_external_command():
+    run(
+        r'''
+        b = Brish(server_count=2)
+        b.send_cmd("v=kept", server_index=1)
+        t0 = time.monotonic()
+        with b.popen("print -r before; sleep 100; print -r after", server_index=1) as p:
+            kill_later(p, 0.4)
+            evs = collect(p, t0)
+        dt = time.monotonic() - t0
+        assert p.retcode == 130, (p.retcode, evs)
+        assert joined(evs) == b"before\n", evs
+        assert dt < 1.9, dt  # before the SIGTERM step
+        same_server_ok(b, 1)
+        p.kill()  # idempotent, and harmless once the command has ended
+        same_server_ok(b, 1)
+        b.cleanup()
+        '''
+    )
+
+
+def test_kill_an_in_shell_loop_and_a_fork():
+    run(
+        r'''
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        for cmd, fork in [
+            ("print -r x; while :; do :; done", False),
+            ("print -r x; f() { while :; do while :; do :; done; done }; f", False),
+            ("print -r x; while :; do :; done", True),
+            ("print -r x; cat", False),  # reads its (empty) stdin, then ends
+            ("emulate sh; print -r x; while :; do :; done", True),
+        ]:
+            t0 = time.monotonic()
+            with b.popen(cmd, fork=fork) as p:
+                kill_later(p, 0.3)
+                evs = collect(p, t0)
+            dt = time.monotonic() - t0
+            assert joined(evs) == b"x\n", (cmd, evs)
+            if cmd.endswith("cat"):
+                assert p.retcode == 0, (cmd, p.retcode)
+            else:
+                assert p.retcode == 130, (cmd, fork, p.retcode)
+                assert dt < 1.9, (cmd, dt)
+            same_server_ok(b, 0)
+        b.cleanup()
+        '''
+    )
+
+
+def test_kill_with_a_user_int_trap():
+    run(
+        r'''
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        for fork in (False, True):
+            with b.popen("trap 'print -r caught' INT; sleep 100; print -r after", fork=fork) as p:
+                kill_later(p, 0.3)
+                evs = collect(p)
+            assert (p.retcode, joined(evs)) == (0, b"caught\nafter\n"), (fork, p.retcode, evs)
+            same_server_ok(b, 0)
+        #: The command's trap ended with the command.
+        with b.popen("sleep 100") as p:
+            kill_later(p, 0.3)
+            collect(p)
+        assert p.retcode == 130, p.retcode
+        same_server_ok(b, 0)
+        b.cleanup()
+        '''
+    )
+
+
+def test_escalation_stops_at_the_descendants():
+    #: A fork that ignores INT and TERM is SIGKILLed; the worker survives.
+    run(
+        r'''
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        t0 = time.monotonic()
+        with b.popen("trap '' INT TERM; print -r stuck; while :; do :; done", fork=True) as p:
+            p.kill_grace = 0.5
+            kill_later(p, 0.3)
+            evs = collect(p, t0)
+        dt = time.monotonic() - t0
+        assert p.retcode == 137, (p.retcode, evs)
+        assert joined(evs) == b"stuck\n" and not joined(evs, "err"), evs
+        assert 1.0 < dt < 4, dt
+        same_server_ok(b, 0)
+        #: A non-fork command whose child ignores them: the worker's own
+        #: interrupt takes effect once the child is gone.
+        with b.popen("print -r go; zsh -fc \"trap '' INT TERM; sleep 100\"") as p:
+            p.kill_grace = 0.5
+            kill_later(p, 0.3)
+            evs = collect(p)
+        assert p.retcode == 130, (p.retcode, evs)
+        same_server_ok(b, 0)
+        b.cleanup()
+        '''
+    )
+
+
+def test_escalation_to_the_worker():
+    #: The worker itself ignores INT and TERM: it is SIGKILLed, the retcode is
+    #: 9001 with the usual note, and the instance restarts before its next use.
+    run(
+        r'''
+        b = Brish(server_count=2)
+        b.send_cmd("v=kept", server_index=0)
+        t0 = time.monotonic()
+        with b.popen("trap '' INT TERM; print -r stuck; while :; do :; done", server_index=0) as p:
+            p.kill_grace = 0.5
+            kill_later(p, 0.3)
+            evs = collect(p, t0)
+        dt = time.monotonic() - t0
+        assert p.retcode == 9001, (p.retcode, evs)
+        assert joined(evs) == b"stuck\n", evs
+        assert joined(evs, "err").endswith(bm.WORKER_DIED_NOTE.encode() + b"\n"), evs
+        assert 0.8 < dt < 4, dt
+        r = b.send_cmd("print -r -- next-$v", server_index=0)
+        assert (r.retcode, r.out) == (0, "next-\n"), repr(r)  # restarted
+        b.cleanup()
+        ''',
+        allow_orphans=False,
+    )
+
+
+def test_leaving_early_kills_and_frees_the_worker():
+    run(
+        r'''
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        #: break
+        t0 = time.monotonic()
+        with b.popen("yes") as p:
+            n = 0
+            for s, c in p:
+                n += len(c)
+                if n > 1_000_000:
+                    break
+        assert p.retcode == 130, p.retcode
+        assert time.monotonic() - t0 < 3
+        same_server_ok(b, 0)
+        #: break without a with block
+        p = b.popen("print -r a; sleep 100")
+        for s, c in p:
+            break
+        assert p.retcode == 130, p.retcode
+        same_server_ok(b, 0)
+        #: an exception inside the with block
+        try:
+            with b.popen("print -r a; sleep 100") as p:
+                for s, c in p:
+                    raise KeyError("boom")
+        except KeyError:
+            pass
+        assert p.retcode == 130, p.retcode
+        same_server_ok(b, 0)
+        #: leaving before reading anything
+        with b.popen("sleep 100") as p:
+            pass
+        assert p.retcode == 130, p.retcode
+        same_server_ok(b, 0)
+        #: wait() without kill reads to the end
+        p = b.popen("print -r a; sleep 0.2; return 6")
+        assert p.wait() == 6 and p.retcode == 6
+        p.close()
+        same_server_ok(b, 0)
+        b.cleanup()
+        '''
+    )
+
+
+def test_reads_belong_to_the_creating_thread():
+    run(
+        r'''
+        b = Brish(server_count=2)
+        p = b.popen("print -r a; sleep 100", server_index=0)
+        err = []
+        def other():
+            try:
+                next(iter(p))
+            except RuntimeError as e:
+                err.append(e)
+            p.kill()  # allowed from any thread
+        t = threading.Thread(target=other)
+        t.start()
+        t.join(10)
+        assert err and "thread" in str(err[0]), err
+        assert p.wait() == 130
+        r = b.send_cmd("echo ok", server_index=0)
+        assert r.out == "ok\n", repr(r)
+        b.cleanup()
+        '''
+    )
+
+
+def test_a_command_that_exits_the_worker():
+    run(
+        r'''
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        with b.popen("print -r bye; exit 3") as p:
+            evs = collect(p)
+        assert (p.retcode, joined(evs), joined(evs, "err")) == (3, b"bye\n", b""), (p.retcode, evs)
+        r = b.send_cmd("print -r -- next-$v")
+        assert (r.retcode, r.out) == (0, "next-\n"), repr(r)  # restarted
+        b.cleanup()
+        '''
+    )
+
+
+def test_the_bot_pattern_under_concurrency():
+    #: The first consumer: a shared legacy-or-binary instance, commands run
+    #: from executor threads under acquire_lock, killed from another thread,
+    #: while other threads use send_cmd on the other workers.
+    run(
+        r'''
+        import faulthandler; faulthandler.dump_traceback_later(100, exit=True)
+        b = Brish(server_count=4)
+        errors = []
+        stop = time.time() + 8
+
+        def bot(k):
+            n = 0
+            while time.time() < stop:
+                n += 1
+                cwd = os.path.join(SCRATCH, f"jd{k}")
+                os.makedirs(cwd, exist_ok=True)
+                fork = n % 2 == 0
+                kill = n % 3 == 0
+                cmd = "pwd; print -r -- arg; print -ru2 err\n" + ("sleep 100" if kill else "print -r done; return 5")
+                lock, server_index = b.acquire_lock(server_index=None, lock_sleep=1)
+                try:
+                    b.z("typeset -g jd={cwd}", server_index=server_index)
+                    b.send_cmd('cd "$jd"', server_index=server_index)
+                    with b.popen('{ eval "$(< /dev/stdin)" } 2>&1', fork=fork,
+                                 cmd_stdin=cmd, server_index=server_index) as p:
+                        if kill:
+                            kill_later(p, 0.3)
+                        evs = collect(p)
+                    rc = p.retcode
+                    b.z("cd /tmp", server_index=server_index)
+                    pwd = b.send_cmd("pwd", server_index=server_index).out
+                finally:
+                    lock.release()
+                out = joined(evs)
+                want = os.path.realpath(cwd).encode() + b"\narg\nerr\n"
+                ok = {s for _, s, _ in evs} <= {"out"} and os.path.realpath(pwd.strip()) == os.path.realpath("/tmp")
+                if kill:
+                    ok = ok and rc == 130 and os.path.realpath(out.split(b"\n")[0]) == want.split(b"\n")[0]
+                else:
+                    ok = ok and rc == 5 and out.endswith(b"\narg\nerr\ndone\n")
+                if not ok:
+                    errors.append((k, n, fork, kill, rc, evs, pwd))
+
+        def other(k):
+            n = 0
+            while time.time() < stop:
+                n += 1
+                r = b.send_cmd(f"print -r -- other-{k}-{n}; print -ru2 e", cmd_stdin="x")
+                if (r.retcode, r.out, r.err) != (0, f"other-{k}-{n}\n", "e\n"):
+                    errors.append(("other", k, n, r))
+
+        ts = [threading.Thread(target=bot, args=(k,)) for k in range(2)]
+        ts += [threading.Thread(target=other, args=(k,)) for k in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(60)
+            assert not t.is_alive(), "a thread hung"
+        assert not errors, errors[:3]
+        b.cleanup()
+        ''',
+        timeout=120,
+    )
+
+
+def test_a_slow_reader_keeps_memory_flat():
+    #: 200 MB through a reader that pauses: the command blocks instead of
+    #: Python buffering what it has not read.
+    run(
+        r'''
+        import resource
+        def rss_mb():
+            r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return r / (1 << 20) if sys.platform == "darwin" else r / 1024
+        b = Brish(server_count=1)
+        with b.popen("print -r warm") as p:
+            collect(p)
+        base = rss_mb()
+        total = 200_000_000
+        n = 0
+        t0 = time.monotonic()
+        with b.popen(f"yes abcdefghijklmnop | head -c {total}") as p:
+            for i, (s, c) in enumerate(p):
+                n += len(c)
+                if i % 64 == 0:
+                    time.sleep(0.01)
+                if i == 100:
+                    time.sleep(1)  # a long pause: the command must wait
+        dt = time.monotonic() - t0
+        grew = rss_mb() - base
+        print(f"[measure] 200 MB slow reader: {dt:.2f}s, peak RSS grew {grew:.1f} MB", file=sys.stderr)
+        assert (p.retcode, n) == (0, total), (p.retcode, n)
+        assert grew < 40, grew
+        b.cleanup()
+        ''',
+        timeout=240,
+    )
+
+
+@legacy_only
+def test_legacy_learns_each_worker_pid_once():
+    run(
+        r'''
+        b = Brish(server_count=2)
+        assert b.p.legacy_pids == [None, None]
+        with b.popen("print -r a", server_index=1) as p:
+            collect(p)
+        pids = list(b.p.legacy_pids)
+        assert pids[0] is None and pids[1] > 1, pids
+        r = b.send_cmd("zmodload zsh/system; print -r -- $sysparams[pid]", server_index=1)
+        assert int(r.out) == pids[1], (r, pids)
+        with b.popen("print -r b", server_index=1) as p:
+            collect(p)
+        assert b.p.legacy_pids == pids
+        b.cleanup()
+        '''
+    )

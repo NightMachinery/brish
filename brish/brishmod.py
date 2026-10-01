@@ -30,6 +30,8 @@ import selectors
 import secrets
 import re
 import tempfile
+import queue
+import collections
 from collections.abc import Iterable
 from typing import Union, Any
 import ast
@@ -291,6 +293,29 @@ def _with_note(err, note):
     if err and not err.endswith("\n"):
         err += "\n"
     return err + note + "\n"
+
+
+def _descendants(root):
+    """PIDs of every descendant of `root`, from one `ps` snapshot."""
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid="], capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception:
+        return []
+    children = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found, stack, seen = [], [root], {root}
+    while stack:
+        for kid in children.get(stack.pop(), ()):
+            if kid not in seen:
+                seen.add(kid)
+                found.append(kid)
+                stack.append(kid)
+    return found
 
 
 def _child_pids(pid):
@@ -586,8 +611,8 @@ _LEGACY_END = b"\n\0\n"
 
 
 class _LegacyReplyParser:
-    """Splits one legacy reply stream as it arrives, and can be fed
-    chunk by chunk. send_cmd uses it through _legacy_read_reply.
+    """Splits one legacy reply stream as it arrives. Both send_cmd (through
+    _legacy_read_reply) and BrishPopen use it.
 
     A reply is the output, the newline the worker writes, a line holding only
     NUL, and on stdout the retcode line. The first line that is just NUL ends
@@ -651,6 +676,718 @@ class _LegacyReplyParser:
         out = self.held[self.skip :]
         self.held, self.skip = b"", 0
         return out
+
+
+class _Abandoned(Exception):
+    pass
+
+
+class _LegacyStreamReader:
+    """Reads one legacy reply stream for BrishPopen in a helper thread and
+    puts (stream, payload) items on a bounded queue, so a reader that stops
+    reading stops the command too. kqueue and poll are unreliable on FIFOs
+    on macOS, hence the thread. Like _ErrReader, it owns the file while it
+    runs: cleanup() hands the file over instead of closing it under a
+    blocked read.
+    """
+
+    def __init__(self, f, stream, with_rc, q):
+        self.f = f
+        self.stream = stream
+        self.q = q
+        self.parser = _LegacyReplyParser(with_rc)
+        self.eof = False
+        self.exc = None
+        self.done = False
+        self.abandoned = False
+        self.close_when_done = False
+        self._lock = Lock()
+        self.thread = threading.Thread(
+            target=self._run, daemon=True, name=f"brish-popen-{stream}"
+        )
+        self.thread.start()
+
+    def _put(self, item):
+        while True:
+            try:
+                self.q.put(item, timeout=_POLL)
+                return
+            except queue.Full:
+                if self.abandoned:
+                    raise _Abandoned
+
+    def _run(self):
+        try:
+            f, parser = self.f, self.parser
+            while not parser.done:
+                #: peek() returns what the buffer holds (one raw read when it
+                #: is empty); only the bytes of this reply are consumed.
+                buf = f.peek(1)
+                if not buf:
+                    self.eof = True
+                    tail = parser.flush()
+                    if tail:
+                        self._put((self.stream, tail))
+                    break
+                payload, used = parser.feed(buf)
+                f.read(used)
+                if payload:
+                    self._put((self.stream, payload))
+        except _Abandoned:
+            pass
+        except BaseException as e:
+            self.exc = e
+        finally:
+            with self._lock:
+                self.done = True
+                close = self.close_when_done
+            if close:
+                try:
+                    self.f.close()
+                except Exception:
+                    pass
+            try:
+                self.q.put_nowait((None, None))  # wakes the reader up
+            except queue.Full:
+                pass
+
+    def close_or_hand_over(self):
+        self.abandoned = True
+        with self._lock:
+            if not self.done:
+                self.close_when_done = True
+                return
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+
+def _legacy_busy(p, index):
+    """Whether a helper thread of an abandoned reply still reads one of
+    legacy worker `index`'s reply FIFOs."""
+    for readers in (p.err_readers, getattr(p, "out_readers", None)):
+        if readers:
+            r = readers[index]
+            if r is not None and not r.done:
+                return True
+    return False
+
+
+#: Internal request that prints a legacy worker's PID: the parent of a
+#: command substitution. The worker itself does not load zsh/system.
+_LEGACY_PID_CMD = (
+    b"builtin print -r -- $(builtin zmodload zsh/system && builtin print -r -- ${sysparams[ppid]})"
+)
+#: kill() sends its first SIGINT no sooner than this many seconds after the
+#: request was written, so that it reaches a command that has started.
+_KILL_SETTLE = 0.05
+
+
+class BrishPopen:
+    """A command whose output streams while it runs. Made by `Brish.popen`,
+    which documents the API.
+
+    It holds its worker's lock from creation until the command has ended and
+    its output has been read (or drained), so it is created, read, waited for
+    and closed in one thread; `kill()` and `terminate()` work from any thread.
+    """
+
+    #: Seconds between the steps of kill()'s escalation.
+    kill_grace = 2.0
+
+    def __init__(self, brish, cmd, cmd_stdin="", fork=False, server_index=None,
+                 lock_sleep=1, buffer=False):
+        self.cmd = cmd
+        self.cmd_stdin = brish._stored_stdin(cmd_stdin)
+        self.fork = bool(fork)
+        #: None until the command has ended, then its status.
+        self.retcode = None
+        #: The worker that runs it.
+        self.server_index = None
+        self._brish = brish
+        self._owner = threading.get_ident()
+        self._mu = Lock()  # guards _finished, _stage and signal sending
+        self._finished = False
+        self._released = True  # until a worker lock is taken
+        self._stage = 0  # 0: not killed; 1: SIGINT; 2: SIGTERM; 3, 4: SIGKILL
+        self._stage_t = 0.0
+        self._pending = collections.deque()
+        self._buffer = ([], []) if buffer else None
+        self._result = None
+        self._err_nl = True  # the err stream so far is empty or ends in a newline
+        self._worker_pid = None
+        self._last_io = time.monotonic()
+        self._dead_since = None
+        self._start(cmd, cmd_stdin, fork, server_index, lock_sleep)
+        self._started_at = time.monotonic()
+
+    def __repr__(self):
+        state = "running" if self.retcode is None else f"retcode={self.retcode}"
+        return f"<BrishPopen {state} server_index={self.server_index} cmd={_text_view(self.cmd)!r}>"
+
+    # Starting
+
+    def _start(self, cmd, cmd_stdin, fork, server_index, lock_sleep):
+        b = self._brish
+        restart_cmd = cmd
+        if isinstance(cmd, _BYTES_LIKE):
+            restart_cmd = bytes(cmd).decode("utf-8", "surrogateescape")
+        if restart_cmd == "%BRISH_RESTART":
+            res = b.send_cmd(cmd, cmd_stdin=cmd_stdin)
+            self._finish_without_worker(res.retcode, res.outb, res.errb)
+            return
+        #: Encode everything first: an encoding error must leave the worker
+        #: untouched.
+        cmd_b = b._to_bytes(cmd, "cmd")
+        if b.binary:
+            stdin_b = None if cmd_stdin is None else b._to_bytes(cmd_stdin, "cmd_stdin")
+            start = self._start_binary
+        else:
+            stdin_b = b"" if cmd_stdin is None else b._to_bytes(cmd_stdin, "cmd_stdin")
+            if b"\0" in cmd_b or b"\0" in stdin_b:
+                self._finish_without_worker(
+                    9000, b"",
+                    b"Illegal input: Input contained the Brish marker (currently the NUL character).",
+                )
+                return
+            start = self._start_legacy
+        for attempt in range(2):
+            lock, index, p = b._acquire(server_index, lock_sleep)
+            p.free_server_count -= 1
+            self._lock, self.server_index, self._p = lock, index, p
+            self._released = False
+            if start(p, index, cmd_b, stdin_b, fork) is not _NEVER_RAN:
+                return
+            self._release()
+            b._never_ran(p, index)
+        raise BrishWorkerDiedException("a worker died before running the command, twice")
+
+    def _finish_without_worker(self, retcode, outb, errb):
+        if outb:
+            self._pending.append(("out", outb))
+        if errb:
+            self._pending.append(("err", errb))
+        self._finished = True
+        self.retcode = retcode
+
+    def _start_binary(self, p, index, cmd_b, stdin_b, fork):
+        """Write the frame and wait for START. Returns _NEVER_RAN if the
+        worker died before START; then the lock is still held."""
+        w = p.workers[index]
+        self._w = w
+        self._worker_pid = w.pid
+        nonce = secrets.token_hex(16).encode()
+        stdin_len = b"-" if stdin_b is None else b"%d" % len(stdin_b)
+        header = b"BRISH3 %s %d %s %d\n" % (nonce, len(cmd_b), stdin_len, 1 if fork else 0)
+        frame = b"".join((header, cmd_b, stdin_b or b""))
+        self._frame = memoryview(frame)
+        self._total = len(frame)
+        self._sent = 0
+        self._wreg = False
+        start = b"\0BRISH3-START:" + nonce + b"\n"
+        end = b"\0BRISH3-END:" + nonce + b":"
+        self._so = _StreamParser(start, end, collect=False)
+        self._se = _StreamParser(start, end, collect=False)
+        self._streams = {w.out: ("out", self._so), w.err: ("err", self._se)}
+        self._pump = self._pump_binary
+        self._died = False
+        try:
+            try:
+                self._sent = os.write(w.req, frame)
+            except BlockingIOError:
+                pass
+            except BrokenPipeError:
+                self._died = True
+            while not self._died and not (self._so.started or self._se.started):
+                self._pump_binary(_POLL)
+        except BaseException:
+            self._unregister_write()
+            if self._sent >= self._total:
+                w.stale = True
+            else:
+                #: The worker may hold part of a frame.
+                self._brish._request_restart(p.gen)
+            self._release()
+            raise
+        if self._died and not (self._so.started or self._se.started):
+            self._unregister_write()
+            self._pending.clear()
+            return _NEVER_RAN
+        return None
+
+    def _start_legacy(self, p, index, cmd_b, stdin_b, fork):
+        """Learn the worker's PID if needed, write the request and start the
+        reader threads. Returns _NEVER_RAN if the worker could not take it;
+        then the lock is still held."""
+        b = self._brish
+        if p.legacy_pids[index] is None:
+            outcome = b._legacy_transact(
+                p, index, _LEGACY_PID_CMD + b"\0\0\0\n", _LEGACY_PID_CMD, ""
+            )
+            if outcome is _NEVER_RAN:
+                return _NEVER_RAN
+            res, restart = outcome
+            if restart:
+                b._request_restart(p.gen)
+                return _NEVER_RAN
+            pid = res.outb.strip()
+            #: Only a child of this instance's bootstrap is ever signalled.
+            if pid.isdigit() and int(pid) in _child_pids(p.pid):
+                p.legacy_pids[index] = int(pid)
+        self._worker_pid = p.legacy_pids[index]
+        if _legacy_busy(p, index):
+            return _NEVER_RAN
+        frame = b"".join((cmd_b, b"\0", stdin_b, b"\0", b"y" if fork else b"", b"\0\n"))
+        try:
+            f = p.brish_stdins[index]
+            f.write(frame)
+            f.flush()
+        except BrokenPipeError:
+            return _NEVER_RAN
+        except BaseException:
+            p.interrupted = True
+            b._request_restart(p.gen)
+            self._release()
+            raise
+        #: A bounded queue: when the caller stops reading, the readers stop,
+        #: the FIFOs fill up and the command blocks.
+        self._q = queue.Queue(maxsize=16)
+        self._rout = _LegacyStreamReader(p.brish_stdouts[index], "out", True, self._q)
+        self._rerr = _LegacyStreamReader(p.brish_stderrs[index], "err", False, self._q)
+        p.out_readers[index] = self._rout
+        p.err_readers[index] = self._rerr
+        self._pump = self._pump_legacy
+        return None
+
+    # Reading
+
+    def _pump_binary(self, timeout):
+        """One select round on the worker's pipes. Returns whether anything
+        was read."""
+        w = self._w
+        sel = w.sel
+        if self._sent < self._total and not self._wreg:
+            sel.register(w.req, selectors.EVENT_WRITE)
+            self._wreg = True
+        events = sel.select(timeout)
+        if not events:
+            if time.monotonic() - self._last_io >= _POLL and not _alive(w.pid):
+                self._binary_died()
+            return False
+        self._last_io = time.monotonic()
+        for key, _ in events:
+            fd = key.fd
+            if fd == w.req:
+                try:
+                    self._sent += os.write(fd, self._frame[self._sent : self._sent + _READ_CHUNK])
+                except BlockingIOError:
+                    continue
+                except BrokenPipeError:
+                    self._binary_died()
+                    return True
+                if self._sent >= self._total:
+                    self._unregister_write()
+                continue
+            name, st = self._streams[fd]
+            try:
+                chunk = os.read(fd, _READ_CHUNK)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                self._binary_died()
+                return True
+            out = st.feed(chunk)
+            if out:
+                self._pending.append((name, out))
+        if self._so.done and self._se.done and not self._finished:
+            retcode, exited = _parse_trailer(self._so.trailer)
+            self._w.stale = False
+            self._finish(retcode, restart=exited)
+        return True
+
+    def _unregister_write(self):
+        if self._wreg:
+            try:
+                self._w.sel.unregister(self._w.req)
+            except (KeyError, ValueError, OSError):
+                pass
+            self._wreg = False
+
+    def _binary_died(self):
+        """The worker is gone: collect what it wrote (START and END may still
+        be in the pipes), then finish."""
+        self._died = True
+        self._unregister_write()
+        for fd, (name, st) in self._streams.items():
+            for _ in range(64):  # a background job may keep writing
+                if st.done:
+                    break
+                try:
+                    chunk = os.read(fd, _READ_CHUNK)
+                except (BlockingIOError, OSError):
+                    break
+                if not chunk:
+                    break
+                out = st.feed(chunk)
+                if out:
+                    self._pending.append((name, out))
+            out = st.flush()
+            if out:
+                self._pending.append((name, out))
+        if not (self._so.started or self._se.started):
+            return  # it never ran: _start_binary handles that
+        if self._so.done:
+            retcode, _ = _parse_trailer(self._so.trailer)
+            note = False
+        elif self._se.done:
+            retcode, _ = _parse_trailer(self._se.trailer)
+            note = False
+        else:
+            retcode, note = RETCODE_WORKER_DIED, True
+        self._finish(retcode, restart=True, note=note)
+
+    def _pump_legacy(self, timeout):
+        """Take what the reader threads have read. Returns whether anything
+        was read."""
+        try:
+            item = self._q.get(timeout=timeout) if timeout > 0 else self._q.get_nowait()
+        except queue.Empty:
+            item = None
+        if item is not None and item[0] is not None:
+            self._pending.append(item)
+            self._last_io = time.monotonic()
+            return True
+        rout, rerr = self._rout, self._rerr
+        if rout.done and rerr.done:
+            self._legacy_drain_queue()
+            self._legacy_complete()
+            return item is not None
+        now = time.monotonic()
+        if rout.done and self._legacy_rc()[1]:
+            #: The worker is gone. Its stderr ends soon, unless a background
+            #: job holds the FIFO open: then stop waiting after 2 s.
+            dead = False
+        elif now - self._last_io >= _POLL and self._worker_pid and not _alive(self._worker_pid):
+            #: No reply from the bootstrap (it is gone too, and a background
+            #: job holds the FIFOs open): the same 2 s.
+            dead = not rout.done
+        else:
+            self._dead_since = None
+            return item is not None
+        if self._dead_since is None:
+            self._dead_since = now
+        elif now - self._dead_since > 2:
+            self._legacy_drain_queue()
+            self._legacy_complete(dead=dead)
+        return item is not None
+
+    def _legacy_drain_queue(self):
+        while True:
+            try:
+                item = self._q.get_nowait()
+            except queue.Empty:
+                return
+            if item[0] is not None:
+                self._pending.append(item)
+
+    def _legacy_rc(self):
+        """(retcode, died, exited) from the stdout reader, which is done."""
+        rout = self._rout
+        if rout.exc is not None or rout.eof or rout.parser.rc is None:
+            return None, True, False
+        line = rout.parser.rc
+        try:
+            retcode = int(line)
+        except ValueError:
+            #: The output forged the end of the reply (see docs/protocol.org).
+            return None, True, False
+        #: "+N": the command exited the worker; "09001": the bootstrap
+        #: answered for a worker that died (see _legacy_transact).
+        return retcode, line == _LEGACY_DEATH_LINE, line.startswith(b"+")
+
+    def _legacy_complete(self, dead=False):
+        rout, rerr = self._rout, self._rerr
+        p, index = self._p, self.server_index
+        if dead:
+            retcode, died, exited = None, True, False
+        else:
+            retcode, died, exited = self._legacy_rc()
+        if not rerr.done or rerr.exc is not None or rerr.eof:
+            died = True
+        if rout.done and not died:
+            p.out_readers[index] = None
+        if rerr.done and not died:
+            p.err_readers[index] = None
+        if died:
+            #: Readers that are still running keep their files (cleanup hands
+            #: them over), and the instance restarts before its next use.
+            for r in (rout, rerr):
+                if not r.done:
+                    r.abandoned = True
+                else:
+                    if p.out_readers[index] is r:
+                        p.out_readers[index] = None
+                    if p.err_readers[index] is r:
+                        p.err_readers[index] = None
+            if rout.exc is not None and not isinstance(rout.exc, OSError):
+                p.interrupted = True
+        if retcode is None:
+            retcode = RETCODE_WORKER_DIED
+            note = True
+        else:
+            note = died
+        self._finish(retcode, restart=died or exited, note=note)
+
+    # Finishing
+
+    def _finish(self, retcode, restart=False, note=False):
+        with self._mu:
+            self._finished = True
+            self.retcode = retcode
+        if note:
+            msg = (WORKER_DIED_NOTE + "\n").encode()
+            if not self._err_nl_after_pending():
+                msg = b"\n" + msg
+            self._pending.append(("err", msg))
+        self._release(restart)
+
+    def _err_nl_after_pending(self):
+        nl = self._err_nl
+        for name, chunk in self._pending:
+            if name == "err":
+                nl = chunk.endswith(b"\n")
+        return nl
+
+    def _release(self, restart=False):
+        """Free the worker. Only in the owner thread."""
+        if self._released:
+            return
+        self._released = True
+        p = self._p
+        p.free_server_count += 1
+        self._lock.release()
+        if restart:
+            self._brish._request_restart(p.gen)
+
+    def _abandon(self):
+        """Give the worker up without waiting for the reply: after an
+        exception while reading, or when the object is collected unclosed.
+        The command is interrupted; binary mode skips the rest of its reply
+        on the next request (a stale worker), legacy mode restarts."""
+        if self._released:
+            return
+        pid = self._worker_pid
+        try:
+            pids = _descendants(pid) if pid else []
+        except BaseException:
+            pids = []
+        with self._mu:
+            already = self._finished
+            self._finished = True
+            if not already:
+                _signal_pids(pids, signal.SIGINT)
+                if pid:
+                    _signal_pids([pid], signal.SIGINT)
+        p = self._p
+        if p.binary:
+            self._unregister_write()
+            if already:
+                restart = False
+            elif self._sent >= self._total:
+                self._w.stale = True
+                restart = False
+            else:
+                restart = True
+        else:
+            restart = not already
+            if restart:
+                p.interrupted = True
+                for r in (self._rout, self._rerr):
+                    if not r.done:
+                        r.abandoned = True
+        self._release(restart)
+
+    def _check_owner(self):
+        if threading.get_ident() != self._owner:
+            raise RuntimeError(
+                "a BrishPopen is read, waited for and closed in the thread that created it "
+                "(it holds that thread's worker lock); kill() works from any thread"
+            )
+
+    def _next_event(self):
+        """The next (stream, chunk), or None once the output is complete."""
+        self._check_owner()
+        while True:
+            if self._pending:
+                ev = self._pending.popleft()
+                if ev[0] == "err":
+                    self._err_nl = ev[1].endswith(b"\n")
+                if self._buffer is not None:
+                    self._buffer[0 if ev[0] == "out" else 1].append(ev[1])
+                return ev
+            if self._finished:
+                return None
+            try:
+                self._step()
+            except BaseException:
+                self._abandon()
+                raise
+
+    def _step(self):
+        timeout = _POLL
+        if self._stage:
+            due = self._stage_t + self.kill_grace
+            timeout = max(0.0, min(timeout, due - time.monotonic()))
+        got = self._pump(timeout)
+        if self._stage and not self._finished:
+            now = time.monotonic()
+            due = self._stage_t + self.kill_grace
+            #: Escalate once the pipes are drained, or a grace later if output
+            #: keeps coming (a command that ignores the signal and prints).
+            if now >= due and (not got or now >= due + self.kill_grace):
+                self._escalate()
+
+    def _escalate(self):
+        pid = self._worker_pid
+        stage = self._stage + 1
+        if stage <= 4:
+            pids = _descendants(pid) if pid else []
+            with self._mu:
+                if self._finished:
+                    return
+                self._stage = stage
+                self._stage_t = time.monotonic()
+                if stage == 2:
+                    _signal_pids(pids, signal.SIGTERM)
+                    #: Again, in case the first one landed before the
+                    #: command started.
+                    if pid:
+                        _signal_pids([pid], signal.SIGINT)
+                elif stage == 3 and pids:
+                    _signal_pids(pids, signal.SIGKILL)
+                else:
+                    #: Last resort, also at stage 3 when nothing runs below
+                    #: the worker (the worker itself ignores the signals).
+                    self._stage = 4
+                    _signal_pids(pids + ([pid] if pid else []), signal.SIGKILL)
+            return
+        #: The worker was killed a grace ago and its death went unnoticed
+        #: (or its PID is unknown): stop waiting for it.
+        with self._mu:
+            self._stage = 5
+        if self._p.binary:
+            self._binary_died()
+        else:
+            self._legacy_drain_queue()
+            self._p.interrupted = True
+            self._legacy_complete(dead=True)
+
+    # Public API
+
+    def kill(self):
+        """Interrupt the command (not the worker). Thread-safe and idempotent;
+        returns at once. See Brish.popen for the escalation."""
+        with self._mu:
+            if self._finished or self._stage:
+                return
+            self._stage = 1
+            self._stage_t = time.monotonic()
+            delay = max(0.0, getattr(self, "_started_at", 0.0) + _KILL_SETTLE - self._stage_t)
+        threading.Thread(
+            target=self._interrupt, args=(delay,), daemon=True, name="brish-popen-kill"
+        ).start()
+
+    terminate = kill
+
+    def _interrupt(self, delay):
+        if delay:
+            time.sleep(delay)
+        pid = self._worker_pid
+        pids = _descendants(pid) if pid else []
+        with self._mu:
+            if self._finished:
+                return
+            _signal_pids(pids, signal.SIGINT)
+            if pid:
+                _signal_pids([pid], signal.SIGINT)
+
+    def __iter__(self):
+        return self._iterate()
+
+    def _iterate(self):
+        complete = False
+        try:
+            while True:
+                ev = self._next_event()
+                if ev is None:
+                    complete = True
+                    return
+                yield ev
+        finally:
+            if not complete and not self._released:
+                if threading.get_ident() == self._owner:
+                    self.close()
+                else:
+                    self.kill()
+
+    def __next__(self):
+        ev = self._next_event()
+        if ev is None:
+            raise StopIteration
+        return ev
+
+    def wait(self):
+        """Read the rest of the output (kept only with buffer=True) and
+        return the retcode."""
+        while self._next_event() is not None:
+            pass
+        return self.retcode
+
+    def close(self):
+        """Kill the command if it is still running, drain its output and free
+        the worker. Idempotent."""
+        if self._released and not self._pending:
+            return
+        self.kill()
+        self.wait()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            if self._released:
+                return
+            if threading.get_ident() == self._owner:
+                self._abandon()
+            else:
+                self.kill()
+        except Exception:
+            pass
+
+    @property
+    def result(self):
+        """With buffer=True: the CmdResult (from_bytes, as send_cmd returns
+        it) once the command has ended, else None."""
+        if self._buffer is None:
+            raise ValueError("BrishPopen.result needs popen(..., buffer=True)")
+        if self.retcode is None:
+            return None
+        if self._result is None:
+            outs, errs = list(self._buffer[0]), list(self._buffer[1])
+            for name, chunk in self._pending:
+                (outs if name == "out" else errs).append(chunk)
+            b = self._brish
+            self._result = CmdResult.from_bytes(
+                self.retcode, b"".join(outs), b"".join(errs), self.cmd, self.cmd_stdin,
+                encoding=b.encoding, errors=b.decoding_errors,
+            )
+        return self._result
 
 
 _TEMPLATE_UNSAFE = re.compile("[\r\0\ud800-\udfff]")
@@ -827,6 +1564,10 @@ class Brish:
         p.brish_stdouts = []
         p.brish_stderrs = []
         p.err_readers = [None] * server_count
+        #: Helper threads of BrishPopen that own a stdout FIFO (see
+        #: _LegacyStreamReader), and each worker's PID, learned on demand.
+        p.out_readers = [None] * server_count
+        p.legacy_pids = [None] * server_count
         try:
             BRISH_STDIN = "\n".join(brish_stdin_paths)
             BRISH_STDOUT = "\n".join(brish_stdout_paths)
@@ -1022,8 +1763,9 @@ class Brish:
         if self._holds_worker_lock():
             self._request_restart(p.gen)
             raise BrishWorkerDiedException(
-                f"worker {index} is dead, and this thread holds a worker lock, so the "
-                "instance cannot restart now; release the lock (it restarts before its next use)"
+                f"worker {index} cannot take a command (it died, or an abandoned reply is "
+                "still being read), and this thread holds a worker lock, so the instance "
+                "cannot restart now; release the lock (it restarts before its next use)"
             )
         self._restart_now(p.gen)
 
@@ -1172,6 +1914,50 @@ class Brish:
         if self.binary:
             return self._send_binary(cmd, cmd_stdin, fork, server_index, lock_sleep)
         return self._send_legacy(cmd, cmd_stdin, fork, server_index, lock_sleep)
+
+    def popen(
+        self, cmd, cmd_stdin="", fork=False, server_index=None, lock_sleep=1, buffer=False
+    ):
+        """Run `cmd` in a worker and stream its output while it runs.
+
+        Returns a BrishPopen once the command has started. Iterating it
+        yields (stream, chunk) pairs: `stream` is "out" or "err", `chunk` is
+        non-empty bytes, as read. Only the bytes that could start the end of
+        the reply are held back until the next read: in binary mode a suffix
+        that starts at a NUL, in legacy mode a trailing newline (or newline
+        and NUL). `retcode` is None until the command has ended.
+
+        The arguments are those of send_cmd. With buffer=True, the chunks
+        that iteration or wait() consumed are also kept, and `result` gives
+        the CmdResult that send_cmd would have returned.
+
+        The worker's lock is held from the call until the reply has been
+        read, so the object is read, waited for and closed in the thread that
+        made it; a thread that holds the lock (acquire_lock) can pass its
+        `server_index`. Use it as a context manager: leaving the block early,
+        by break or by an exception, kills the command, drains its output
+        and frees the worker.
+
+        `kill()` (alias `terminate()`) works from any thread, is idempotent,
+        and interrupts the command, not the worker: SIGINT to the worker and
+        its descendants (the worker aborts the command as a terminal Ctrl-C
+        would, and its retcode is 130 unless the command traps INT); after
+        `kill_grace` seconds (default 2) SIGTERM to the descendants; after
+        another, SIGKILL to them; after another, SIGKILL to the worker, which
+        gives the retcode 9001 and restarts the instance before its next use.
+        Background jobs of earlier commands are descendants of the worker
+        too, and are stopped by the later steps.
+        """
+        return BrishPopen(
+            self, cmd, cmd_stdin=cmd_stdin, fork=fork, server_index=server_index,
+            lock_sleep=lock_sleep, buffer=buffer,
+        )
+
+    def zpopen(self, template, locals_=None, getframe=2, **kwargs):
+        """popen() of `zstring(template)`, as z() is send_cmd() of it."""
+        return self.popen(
+            self.zstring(template, locals_=locals_, getframe=getframe), **kwargs
+        )
 
     def _to_bytes(self, x, what="value"):
         """The encoding boundary of both modes: any value to bytes."""
@@ -1418,6 +2204,11 @@ class Brish:
         Returns _NEVER_RAN if the request could not be written, or
         (CmdResult, restart). See docs/protocol.org, "Legacy mode".
         """
+        if _legacy_busy(p, index):
+            #: An abandoned reply still has a reader on this worker's FIFOs.
+            #: The instance restarts before its next use, but this thread
+            #: holds a worker lock and so got here first.
+            return _NEVER_RAN
         try:
             f = p.brish_stdins[index]
             f.write(frame)
@@ -1529,8 +2320,13 @@ class Brish:
                 close(f)
         for f in p.brish_stdins:
             close(f)
-        for f in p.brish_stdouts:
-            close(f)
+        out_readers = getattr(p, "out_readers", [])
+        for i, f in enumerate(p.brish_stdouts):
+            reader = out_readers[i] if i < len(out_readers) else None
+            if reader is not None:
+                reader.close_or_hand_over()
+            else:
+                close(f)
         readers = getattr(p, "err_readers", [])
         for i, f in enumerate(p.brish_stderrs):
             reader = readers[i] if i < len(readers) else None

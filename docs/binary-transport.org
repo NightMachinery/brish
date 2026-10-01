@@ -153,8 +153,8 @@ Code that builds on Brish can carry the same guarantees behind its own opt-in, s
 For a process that opted in through the environment, rollback is unsetting =BRISH_BINARY=. BrishGarden made binary mode its default and passes =binary== to =Brish= explicitly, so there the kill switch is =BRISH_BINARY=0= in the garden's environment, followed by a restart of the garden.
 
 * Non-goals
-- A per-request timeout or an interrupt API. An interrupt still does not stop the shell command.
-- Streaming stdin or output, and a cap on output size.
+- A per-request timeout. =BrishPopen.kill()= (added later, with output streaming; see the readme, "Streaming output") is the interrupt API, and a timeout can be built on it; a =KeyboardInterrupt= in =send_cmd= still does not stop the shell command.
+- Streaming stdin, and a cap on output size. Output streaming was added later, as =Brish.popen=.
 - Separating output that background jobs write /during/ a command. Per-command pipes read to EOF would block on =&= jobs, or kill them with SIGPIPE.
 - Changing zstring's double unescaping of the template.
 - Linux verification: the design was probed on macOS. Tests that would need non-UTF-8 file names are not included, because APFS rejects such names.
