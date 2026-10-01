@@ -1,7 +1,7 @@
 Related projects
 ================
 
--   [Brish](https://github.com/NightMachinary/brish) allows you to use persistent (or not) zsh sessions from Python. Brish uses Python's metaprogramming APIs to achieve near first-party interoperability between the two languages. 
+-   [Brish](https://github.com/NightMachinery/brish) allows you to use persistent (or not) zsh sessions from Python. Brish uses Python's metaprogramming APIs to achieve near first-party interoperability between the two languages. 
 
 -   [pysh](https://github.com/sharkdp/pysh) uses comments in bash scripts to switch the interpreter to Python, allowing variable reuse between the two.
 

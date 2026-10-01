@@ -25,7 +25,7 @@
 
 Or install the latest master (recommended, as I might have forgotten to push a new versioned update):
 
-~pip install git+https://github.com/NightMachinary/brish~
+~pip install git+https://github.com/NightMachinery/brish~
 
 You need a recent Python version, as Brish uses some of the newer metaprogramming APIs. Obviously, you also need zsh installed.
 
@@ -529,7 +529,7 @@ After restart:
 But the boot_cmd has run in the restarted instance, too: /Users/evar/tmp
 #+end_example
 
-~Brish~ is threadsafe. I have built [[https://github.com/NightMachinary/BrishGarden][BrishGarden]] on top of ~Brish~ to provide an HTTP REST API for executing zsh code (if wanted, in sessions). Using ~BrishGarden~, you can embed ~zsh~ in pretty much any programming language, and pay no cost whatsoever for its startup. It can also function as a remote code executor.
+~Brish~ is threadsafe. I have built [[https://github.com/NightMachinery/BrishGarden][BrishGarden]] on top of ~Brish~ to provide an HTTP REST API for executing zsh code (if wanted, in sessions). Using ~BrishGarden~, you can embed ~zsh~ in pretty much any programming language, and pay no cost whatsoever for its startup. It can also function as a remote code executor.
 
 **** Parallel Execution Using =server_count=
 =server_count= allows the underlying =zsh= instance of a =Brish= object to fork that many times, and so serve that many clients in parallel. This will not increase the startup time, as the forking happens after loading the =zsh= interpreter completely.

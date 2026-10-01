@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/NightMachinary/brish"
+Repository = "https://github.com/NightMachinery/brish"
 
 [tool.poetry]
 exclude = ["__pycache__"]
