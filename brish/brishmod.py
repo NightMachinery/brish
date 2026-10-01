@@ -730,14 +730,10 @@ class Brish:
                 )
             #: Open each request FIFO without blocking, so that a shell that
             #: dies before opening its end is noticed instead of hanging init.
+            #: Requests are encoded before they are written; see _send_legacy.
             for path in brish_stdin_paths:
                 p.brish_stdins.append(
-                    open(
-                        self._legacy_open_request_fifo(path, p, shell),
-                        "w",
-                        errors="strict",
-                        encoding=encoding,
-                    )
+                    open(self._legacy_open_request_fifo(path, p, shell), "wb")
                 )
             #: Replies are read as bytes and decoded once, in CmdResult.from_bytes.
             for path in brish_stdout_paths:
@@ -891,26 +887,24 @@ class Brish:
 
         typ = type(obj)
         if typ is CmdResult:
-            if self.binary:
-                return self._quote_bytes(obj.outrsb)
-            return self._quote_word(obj.outrs)
-        if self.binary:
-            #: Bytes-like values are quoted byte-exactly, before the Iterable
-            #: branch would turn them into ints.
-            if isinstance(obj, os.PathLike):
-                obj = os.fspath(obj)
-            if isinstance(obj, _BYTES_LIKE):
-                return self._quote_bytes(bytes(obj))
+            return self._quote_bytes(obj.outrsb)
+        #: Bytes-like values are quoted byte-exactly, before the Iterable
+        #: branch would turn them into ints. The quoted text is ASCII for
+        #: anything that is not printable UTF-8, so the legacy text wire
+        #: carries it too.
+        if isinstance(obj, os.PathLike):
+            obj = os.fspath(obj)
+        if isinstance(obj, _BYTES_LIKE):
+            return self._quote_bytes(bytes(obj))
         if not isinstance(obj, str) and isinstance(obj, Iterable):
             # zsh doesn't support nested arrays, so we str the inner object.
             words = []
             for i in iter(obj):
-                if self.binary:
-                    if isinstance(i, os.PathLike):
-                        i = os.fspath(i)
-                    if isinstance(i, _BYTES_LIKE):
-                        words.append(self._quote_bytes(bytes(i)))
-                        continue
+                if isinstance(i, os.PathLike):
+                    i = os.fspath(i)
+                if isinstance(i, _BYTES_LIKE):
+                    words.append(self._quote_bytes(bytes(i)))
+                    continue
                 words.append(self._quote_word(str(i)))
             return " ".join(words)
         else:
@@ -997,26 +991,26 @@ class Brish:
     ):
         """Run `cmd` in a worker and return its CmdResult.
 
-        In binary mode `cmd` and `cmd_stdin` may be bytes-like; `str` is
-        encoded with the instance encoding and surrogateescape, and
-        `cmd_stdin=None` means /dev/null.
+        `cmd` and `cmd_stdin` may be bytes-like; `str` is encoded with the
+        instance encoding and surrogateescape. `cmd_stdin=None` means
+        /dev/null in binary mode, and empty stdin in legacy mode, where a
+        NUL in `cmd` or `cmd_stdin` gives the retcode 9000 instead.
         """
         restart_cmd = cmd
-        if self.binary and isinstance(cmd, _BYTES_LIKE):
+        if isinstance(cmd, _BYTES_LIKE):
             restart_cmd = bytes(cmd).decode("utf-8", "surrogateescape")
         if restart_cmd == "%BRISH_RESTART":
             #: Handled before any worker lock is taken: restarting needs every
             #: worker lock, so holding one here could deadlock with another
             #: thread's restart().
             self.restart()
-            stored = self._stored_stdin(cmd_stdin) if self.binary else str(cmd_stdin)
-            return CmdResult(0, "Restarted succesfully.", "", cmd, stored)
+            return CmdResult(0, "Restarted succesfully.", "", cmd, self._stored_stdin(cmd_stdin))
         if self.binary:
             return self._send_binary(cmd, cmd_stdin, fork, server_index, lock_sleep)
         return self._send_legacy(cmd, cmd_stdin, fork, server_index, lock_sleep)
 
     def _to_bytes(self, x, what="value"):
-        """The encoding boundary of binary mode: any value to bytes."""
+        """The encoding boundary of both modes: any value to bytes."""
         if isinstance(x, _BYTES_LIKE):
             return bytes(x)
         if isinstance(x, CmdResult):
@@ -1209,28 +1203,30 @@ class Brish:
         return retcode, so.payload(), se.payload(), exited
 
     def _send_legacy(self, cmd, cmd_stdin, fork, server_index, lock_sleep):
-        cmd_stdin = str(cmd_stdin)
-        # assert  isinstance(cmd, str)
-        if any(self.MARKER in input for input in (cmd, cmd_stdin)):
+        #: Encode everything first, with the same rules as binary mode: an
+        #: encoding error must leave the worker untouched.
+        cmd_b = self._to_bytes(cmd, "cmd")
+        stdin_b = b"" if cmd_stdin is None else self._to_bytes(cmd_stdin, "cmd_stdin")
+        stored_stdin = self._stored_stdin(cmd_stdin)
+        #: The legacy wire separates fields with NUL, so a NUL cannot travel.
+        if b"\0" in cmd_b or b"\0" in stdin_b:
             return CmdResult(
                 9000,
                 "",
                 "Illegal input: Input contained the Brish marker (currently the NUL character).",
                 cmd,
-                cmd_stdin,
+                stored_stdin,
             )
-        cmd_processed = (
-            cmd + self.MARKER + cmd_stdin + self.MARKER + boolsh(fork) + self.MARKER
-        )
-        #: Fail on unencodable input before anything reaches a worker.
-        (cmd_processed + "\n").encode(self.encoding)
+        #: cmd NUL stdin NUL fork NUL, and the newline that print() used to
+        #: add (it becomes a leading newline of the next command).
+        frame = b"".join((cmd_b, b"\0", stdin_b, b"\0", b"y" if fork else b"", b"\0\n"))
 
         for attempt in range(2):
             lock, index, p = self._acquire(server_index, lock_sleep)
             outcome = None
             try:
                 p.free_server_count -= 1
-                outcome = self._legacy_transact(p, index, cmd_processed, cmd, cmd_stdin)
+                outcome = self._legacy_transact(p, index, frame, cmd, stored_stdin)
             except BaseException:
                 #: An interrupt leaves a half-written request or a half-read
                 #: reply, and possibly a helper thread that would consume the
@@ -1258,18 +1254,11 @@ class Brish:
             "a worker died before running the command, twice"
         )
 
-    def _legacy_transact(self, p, index, cmd_processed, cmd, cmd_stdin):
+    def _legacy_transact(self, p, index, frame, cmd, cmd_stdin):
         try:
-            ##
-            # trying to open the stdin as binary. It didn't work, idk why.
-            # cmd_processed = cmd_processed.encode()
-            # self.p.brish_stdins[server_index].write(cmd_processed)
-            ##
-            print(
-                cmd_processed,
-                file=p.brish_stdins[index],
-                flush=True,
-            )
+            f = p.brish_stdins[index]
+            f.write(frame)
+            f.flush()
         except BrokenPipeError:
             #: The worker is gone; it cannot have read the whole request.
             return _NEVER_RAN
@@ -1454,8 +1443,7 @@ class Brish:
                 format_spec = list(filter(lambda a: a != code, flags))
             return ":".join(format_spec), res
 
-        if self.binary:
-            template = _escape_template_literals(template)
+        template = _escape_template_literals(template)
         p = ast.parse(f"f''' {template} '''")  # The whitespace is necessary
         result = []
         parts = p.body[0].value.values
@@ -1492,7 +1480,7 @@ class Brish:
 
                 if not fmt_eval:
                     value = self.zsh_quote(value)
-                elif self.binary:
+                else:
                     #: `:e` inserts the value itself; bytes decode losslessly
                     #: and are encoded back to the same bytes by send_cmd.
                     if isinstance(value, os.PathLike):
@@ -1512,16 +1500,15 @@ class Brish:
     def z_print(self, *args, getframe=3, file=None, **kwargs):
         res = self.z(*args, getframe=getframe, **kwargs)
 
-        if self.binary:
-            #: Pass the bytes through when the target has a binary buffer;
-            #: flush the text layer first so the output stays in order.
-            target = sys.stdout if file is None else file
-            buffer = getattr(target, "buffer", None)
-            if buffer is not None:
-                target.flush()
-                buffer.write(res.outerrb)
-                buffer.flush()
-                return res
+        #: Pass the bytes through when the target has a binary buffer; flush
+        #: the text layer first so the output stays in order.
+        target = sys.stdout if file is None else file
+        buffer = getattr(target, "buffer", None)
+        if buffer is not None:
+            target.flush()
+            buffer.write(res.outerrb)
+            buffer.flush()
+            return res
 
         print_opts = dict()
         if file is not None:

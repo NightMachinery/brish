@@ -13,13 +13,13 @@ import pytest
 from tests.conftest import BINARY, check
 
 #: Findings still open in this mode. Keyed by finding id. Legacy mode keeps
-#: its wire format and text semantics, so the transport findings stay open
-#: there; binary mode fixes them.
+#: its frozen wire format (see docs/protocol.org), so the findings that need
+#: a different wire stay open there; binary mode fixes them.
 OPEN = {} if BINARY else {
-    "F3": "legacy NUL framing: output can forge the terminator",
-    "F4": "legacy stdin travels as str(cmd_stdin) through a text FIFO",
-    "F5": "legacy mode interpolates bytes values as ints or reprs",
-    "F7": "legacy zstring rewrites CR in the template's literal text",
+    "F3": "legacy NUL framing: a NUL at the start of an output line forges the terminator",
+    "F4-nul": "legacy NUL framing: a NUL cannot travel in the command or stdin",
+    "F12": "legacy stdin is read with `read -d`, one syscall per byte",
+    "F13": "legacy replies have no per-request marker, so output written between requests joins the next reply",
 }
 
 
@@ -53,10 +53,24 @@ def test_f4_stdin_carries_bytes():
     check(
         r'''
         b = Brish(server_count=1)
-        r = b.send_cmd("cat", cmd_stdin=b"abc")
-        assert (r.retcode, r.out) == (0, "abc"), repr(r)
+        r = b.send_cmd("cat", cmd_stdin=b"abc\xff\r\n")
+        assert (r.retcode, r.outb) == (0, b"abc\xff\r\n"), repr(r)
+        r = b.send_cmd("cat", cmd_stdin=None)
+        assert (r.retcode, r.out, r.cmd_stdin) == (0, "", None), repr(r)
+        ''',
+        timeout=20,
+    )
+
+
+@open_defect("F4-nul")
+def test_f4_nul_travels_in_stdin_and_command():
+    check(
+        r'''
+        b = Brish(server_count=1)
         r = b.send_cmd("cat", cmd_stdin="a\0b")
         assert (r.retcode, r.out) == (0, "a\0b"), repr(r)
+        r = b.send_cmd(b"print -rn -- 'x\0y'")
+        assert (r.retcode, r.outb) == (0, b"x\0y"), repr(r)
         ''',
         timeout=20,
     )
@@ -241,4 +255,37 @@ def test_f11_concurrent_restart_never_leaks_uninitialized():
         b.cleanup()
         ''',
         timeout=40,
+    )
+
+
+@open_defect("F12")
+def test_f12_large_stdin_is_fast():
+    check(
+        r'''
+        b = Brish(server_count=1)
+        data = b"x" * (2 << 20)
+        t = time.time()
+        r = b.send_cmd("wc -c", cmd_stdin=data)
+        dt = time.time() - t
+        assert int(r.out) == len(data), repr(r)
+        assert dt < 1, dt
+        b.cleanup()
+        ''',
+        timeout=60,
+    )
+
+
+@open_defect("F13")
+def test_f13_output_between_requests_is_discarded():
+    check(
+        r'''
+        b = Brish(server_count=1)
+        r = b.send_cmd("{ sleep 0.3; print -r late; print -ru2 late2 } &")
+        assert r.retcode == 0 and r.outb == b"", repr(r)
+        time.sleep(0.8)
+        r = b.send_cmd("print -r next")
+        assert (r.retcode, r.outb, r.errb) == (0, b"next\n", b""), repr(r)
+        b.cleanup()
+        ''',
+        timeout=30,
     )

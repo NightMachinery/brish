@@ -116,7 +116,7 @@ def test_legacy_wire_bytes_are_unchanged():
         r = b.send_cmd("cat", cmd_stdin="in")
         r2 = b.send_cmd("print -r x", fork=True)
         assert r.out == "in" and r2.out == "x\n", (r, r2)
-        assert "".join(seen) == "cat\0in\0\0\nprint -r x\0\0y\0\n", seen
+        assert b"".join(seen) == b"cat\0in\0\0\nprint -r x\0\0y\0\n", seen
         b.p.brish_stdins[0] = f
         b.cleanup()
         ''',
