@@ -2,23 +2,16 @@
 
 import copy
 import dataclasses
-import hashlib
 import json
 import pickle
 
 import pytest
 
 from brish.brishmod import CmdResult
-from tests.conftest import ROOT, check
+from tests.conftest import check
 
-#: sha256 of brish/brish2.zsh at the last release before binary mode. Old
-#: Python processes spawn this file by path, so it must never change.
-BRISH2_SHA256 = "27d19373a02ec331e5d8f5ab5fb0470a9273c0d86c41e4242771904033c6c967"
-
-
-def test_brish2_zsh_is_unchanged():
-    data = (ROOT / "brish" / "brish2.zsh").read_bytes()
-    assert hashlib.sha256(data).hexdigest() == BRISH2_SHA256
+#: brish2.zsh itself is checked against the original worker, reply by reply,
+#: in test_wire_compat.py.
 
 
 def test_five_fields_and_repr():
