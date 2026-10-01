@@ -7,13 +7,13 @@ Brish moves three payloads between Python and its zsh workers: the command text,
 
 The outcome:
 - an opt-in *binary mode* where bytes are the source of truth at every hop;
-- Python-side fixes for hangs in the default *legacy mode*;
+- fixes for the default *legacy mode*, first for its hangs and later every binary-mode fix that fits its frozen wire format;
 - a safe, pure-Python quoter in both modes;
 - a path for downstream HTTP servers and shell clients to carry the same guarantees, behind their own opt-in.
 
 * Terms
 - *Worker*: one zsh subshell that serves requests. A *bootstrap* zsh process forks the workers after loading the startup files once.
-- *Legacy mode*: the original code path, with the worker script =brish/brish2.zsh= (kept byte-identical), text-mode FIFOs and NUL framing, plus Python-only fixes.
+- *Legacy mode*: the original code path, with the worker script =brish/brish2.zsh=, FIFOs and NUL framing. Its wire format is frozen (see protocol.org, "Legacy mode"); within it, legacy mode now has most of binary mode's fixes (see Legacy mode fixes).
 - *Binary mode*: the new transport, with the worker script =brish/brish3.zsh= speaking protocol BRISH3 over anonymous pipes. It is selected by the env var =BRISH_BINARY= (parsed like other Brish booleans) or by =Brish(binary=True)=.
 - *Markers*: in-band lines a worker writes into its response pipes: =\0BRISH3-HELLO:<pid>\n= once, then =\0BRISH3-START:<nonce>\n= and =\0BRISH3-END:<nonce>:<retcode>[:exit]\n= around every request.
 - *Byte view* / *text view*: a result's raw bytes (=outb=, =errb=) versus the =str= decoded from them (=out=, =err=).
@@ -38,28 +38,28 @@ The outcome:
 - *Dead code.* =brish/brish.zsh= was no longer used but still shipped.
 
 * Decisions
-- Binary mode is opt-in through one env var, which gates the whole new transport. Legacy mode keeps its wire format and =brish2.zsh=, and gets Python-only fixes: EOF becomes a result instead of a spin, stderr is read concurrently, and restarts are safe.
-- Text views are exact in binary mode: no newline translation, and =decoding_errors= (default =backslashreplace=) still applies to invalid bytes. Legacy text is unchanged.
+- Binary mode is opt-in through one env var, which gates the whole new transport. Legacy mode keeps its wire format. It first got Python-only fixes (EOF becomes a result instead of a spin, stderr is read concurrently, restarts are safe), and later every fix that fits the frozen format, on both sides of the wire.
+- Text views are exact: no newline translation, and =decoding_errors= (default =backslashreplace=) still applies to invalid bytes. Legacy mode builds its results the same way since the backports.
 - Quoting is pure Python in both modes, and landed first, as a security fix.
 - *Worker death follows =subprocess.run= semantics.* A command that kills its own shell is a failed command, not an API error; Brish being unable to run anything is the unexpected condition, and that one raises.
   - If the command ran (START seen), return a =CmdResult=: the END retcode if the EXIT trap reported one, otherwise the reserved retcode 9001 with =brish: worker died during this command= appended to =.err=. The instance restarts before its next use.
   - If the command never ran (START not seen), restart and retry once. If the retry fails too, raise =BrishWorkerDiedException=.
   - Legacy mode applies the same rule, keyed on whether the request write succeeded, since it has no START marker.
-- A new worker file with a HELLO handshake, and =brish2.zsh= left byte-identical, because versions mix in both directions: long-running processes with older Python code spawn the on-disk worker by path on every restart, and a worker that does not match its Python either hangs or misparses commands.
+- A new worker file with a HELLO handshake, and =brish2.zsh= left wire-compatible (at first byte-identical; since the backports, every reply is checked against the original worker's), because versions mix in both directions: long-running processes with older Python code spawn the on-disk worker by path on every restart, and a worker that does not match its Python either hangs or misparses commands.
 - Transport: anonymous pipes via =Popen(pass_fds=...)=, with fd numbers passed in argv. This drops the FIFO failure modes (see protocol.org).
-- Empty stdin is one always-EOF pipe per worker, opened once, so a call without stdin forks nothing. Non-empty stdin is one pipeline whose writer ignores SIGPIPE. =cmd_stdin=None= means =/dev/null= in binary mode; in legacy mode it stays the text "None".
-- The zstring literal-text fix is binary-mode only: before =ast.parse=, CR, NUL and lone surrogates are rewritten as Python escapes, which decode back to themselves.
+- Empty stdin is one always-EOF pipe per worker, opened once, so a call without stdin forks nothing. Non-empty stdin is one pipeline whose writer ignores SIGPIPE. =cmd_stdin=None= means =/dev/null= in binary mode; in legacy mode it is an empty stdin, since that wire cannot say "no stdin".
+- The zstring literal-text fix applies in both modes (at first in binary mode only): before =ast.parse=, CR, NUL and lone surrogates are rewritten as Python escapes, which decode back to themselves. A NUL that ends up in the command is then refused by the legacy wire.
 - One worker's death recycles every worker of that instance, as before. Per-worker respawn is a possible follow-up.
 
 * Encoding boundary
-In binary mode every value becomes bytes in one place:
+In both modes every value becomes bytes in one place:
 - bytes-like values pass through (=bytearray= and =memoryview= become =bytes=);
 - =str= is encoded with the instance encoding and =surrogateescape=;
 - a =CmdResult= becomes its =outrsb=;
 - =os.PathLike= values go through =os.fspath= first;
 - anything else becomes =str(x)= and is encoded.
 
-A lone surrogate that =surrogateescape= cannot encode raises =UnicodeEncodeError= with a clear message before anything is written. The whole frame is built before the first write, so an encoding error leaves the worker untouched. Text views are =outb.decode(encoding, decoding_errors)=. =encoding=, =decoding_errors= and =binary= are stored on the instance, also when initialisation is delayed, and reused by =restart()=.
+A lone surrogate that =surrogateescape= cannot encode raises =UnicodeEncodeError= with a clear message before anything is written. In legacy mode a NUL in the encoded command or stdin gives the retcode 9000 result instead, also before any worker is touched. The whole frame is built before the first write, so an encoding error leaves the worker untouched. Text views are =outb.decode(encoding, decoding_errors)=. =encoding=, =decoding_errors= and =binary= are stored on the instance, also when initialisation is delayed, and reused by =restart()=.
 
 Interpolation in =zstring= follows the same boundary. The check order is: =None= gives an empty expansion; an exact =CmdResult= quotes =outrsb= (a subclass keeps its per-line iteration); =os.PathLike= goes through =os.fspath=; bytes-like values are handled before the generic iterable branch; list items that are bytes-like are quoted as bytes, never =str()='d; and =:e= with bytes inserts a lossless decode, which the encoding boundary turns back into the same bytes.
 
@@ -70,7 +70,7 @@ Interpolation in =zstring= follows the same boundary. The check order is: =None=
 - =outrsb=, =outerrb=, =iterb()= and =iter0b()= mirror =outrs=, =outerr=, =__iter__= and =iter0()=, including =[b'']= for empty output.
 - Bytes-like =out= / =err= passed positionally become the byte views; bytes-like =cmd_stdin= is stored as =bytes=.
 - =__eq__= also compares the bytes; =__hash__= still derives from the five fields. =pickle= and =copy= keep the bytes; =dataclasses.replace= derives fresh ones.
-- Stored =cmd_stdin= in binary mode: =str= and =bytes= as passed, =None= as =None=, anything else as =str(x)=.
+- Stored =cmd_stdin= (both modes): =str= and =bytes= as passed, bytes-like values as =bytes=, =None= as =None=, anything else as =str(x)=.
 
 * Quoting (both modes)
 =brish.quoting.zsh_quote_bytes= quotes any byte string as one word:
@@ -82,18 +82,31 @@ Interpolation in =zstring= follows the same boundary. The check order is: =None=
 For printable valid UTF-8 the text is the same as =(q+)= produced, apart from code points whose printability differs between Python's Unicode data and the platform's =iswprint=. The result is a surrogate-free =str=; printable non-ASCII stays literal only when the instance encoding is UTF-8, and the quoter is ASCII-only otherwise. NUL does not survive under =emulate sh=, whose =posix_strings= option ends a =$'...'= string at a NUL.
 
 * Legacy mode fixes
+The first round was Python-only:
 - EOF on a reply FIFO returns =CmdResult(9001)= (or the reported retcode, if it arrived) and marks the instance for restart. A broken pipe on the request write means the command never ran: restart, retry once, and raise if the retry fails too.
 - stderr is read in a helper thread with blocking reads. (kqueue and poll are unreliable on FIFOs on macOS.)
 - Any interrupt marks the instance for restart, because a live helper thread could otherwise consume the next reply's stderr. The restart stops the workers first when a request may be truncated, so a truncated command never runs, and it does not wait long for a running command.
 - The restart fixes and the encoding persistence below.
-- Nothing else changes: framing, error 9000, =str(cmd_stdin)= and text decoding are as before.
+
+The second round backported every binary-mode fix that fits the frozen wire format, on both sides of it. Python:
+- Replies are read in binary, split on =\n= only, and built with =CmdResult.from_bytes=, so =outb= and =errb= are exact and the text views keep CR.
+- Commands and stdin go through the encoding boundary above, and the request FIFO is written in binary.
+- Quoting of bytes-like and path-like values, the zstring literal-text fix, and =zp= / =zpe= byte pass-through apply in legacy mode too.
+
+The worker (=brish2.zsh=), with every reply still in the frozen format:
+- the protected run loop of binary mode: no re-run after a syntax error, NOMATCH returns 1, =break= and =continue= end only the command, =errexit= and =errreturn= do not persist;
+- =exit N= is answered with N by an EXIT trap, and a worker that dies silently is answered with 9001 by the bootstrap, so neither old nor new Python waits on a background job that holds the reply FIFOs;
+- no fork for an empty stdin, which cuts the per-call latency of =send_cmd("true")= in a real environment from about 4.8 ms to about 0.3 ms;
+- the same defences against user state as binary mode.
+
+What the frozen format still rules out (NUL in commands and stdin, a NUL-only output line, output between requests, slow large stdin, =None= stdin, resynchronisation after an interrupt) is listed, with the reasons, in protocol.org, "What the frozen format rules out". The matching findings stay strict =xfail= in legacy mode in =tests/test_defects.py=.
 
 * Restart safety (both modes)
 - =%BRISH_RESTART= is handled before any worker lock is taken.
 - Pending restarts run in =acquire_lock=, under the instance lock, before a worker lock is taken, with a generation counter so that several threads noticing the same death restart only once.
 - A failed restart leaves the instance to be initialised again on its next use, instead of raising =UninitializedBrishException= forever.
 
-* Behaviour changes in binary mode
+* Behaviour changes in binary mode, and in legacy mode since the backports
 For non-fork commands:
 - persistent =errexit= and =errreturn= are cleared after each request;
 - a bare =break= or =continue= ends the request with status 0;
@@ -102,22 +115,22 @@ For non-fork commands:
 - =errexit=, =${x:?}= or a kill, where no END marker arrives, return retcode 9001, and the instance restarts;
 - a syntax error no longer re-runs the previous command.
 
-For all commands, text views are exact (=\r= is kept), =cmd_stdin=None= is =/dev/null=, and =zp= / =zpe= write the bytes to the target's binary buffer when it has one.
+For all commands, text views are exact (=\r= is kept), and =zp= / =zpe= write the bytes to the target's binary buffer when it has one. =cmd_stdin=None= is =/dev/null= in binary mode only.
 
 * Goals (acceptance criteria)
 Every goal has a test. "Both modes" means the suite runs with =BRISH_BINARY= on and off.
 - *G1. Byte-exact output (binary).* =z("cat", cmd_stdin=data).outb == data=, and the same for stderr with =cat >&2=, for all 256 byte values, NUL-heavy and CR-heavy edge cases, and 1 MiB of random bytes.
 - *G2. Byte-exact stdin (binary).* =cmd_stdin= accepts bytes-like values, =str=, =None= and other objects; NUL is allowed; =$brish_stdin= holds the exact bytes.
 - *G3. Command text (binary).* Bytes-like commands work and =%BRISH_RESTART= matches after normalisation; interpolated values are byte-exact in the order above; template literal text keeps CR, NUL and lone surrogates.
-- *G4. Quoting (both modes).* Every byte with a set of hostile suffixes round-trips through a worker (binary; valid UTF-8 in legacy); random round trips hold under the default options, =rc_quotes=, =no_multibyte=, =extended_glob= with =glob_subst=, and the C locale; the text matches =(q+)= for printable valid UTF-8, including the readme examples; no process is started for quoting.
+- *G4. Quoting (both modes).* Every byte with a set of hostile suffixes round-trips through a worker (in legacy mode, every value but a lone NUL, which is the reply delimiter); random round trips hold under the default options, =rc_quotes=, =no_multibyte=, =extended_glob= with =glob_subst=, and the C locale; the text matches =(q+)= for printable valid UTF-8, including the readme examples; no process is started for quoting.
 - *G5. Unforgeable framing and resync (binary).* No output can end a result early, fake a retcode or leak into the next result, unless a command deliberately reads or clobbers worker internals. Output written between requests is discarded.
 - *G6. No deadlock (both modes).* More than 8 KiB of stderr before or after stdout, single 100 KB writes, and a pipeline element writing 300 KB all complete.
 - *G7. No hang or spin on worker death (both modes).* NOMATCH, =exit 3=, =errexit=, a bare =break=, a syntax error followed by another command, and a kill of the worker during a command each return a result within a bound, and the next command works. A worker killed between requests is invisible. Only a shell that cannot run commands at all raises =BrishWorkerDiedException=.
 - *G8. Interrupt safety (binary; legacy best effort).* After an interrupt anywhere in =send_cmd=, including during a multi-megabyte stdin write, the next call returns its own result and stdin is never executed as code; =restart()= returns in under 5 seconds.
 - *G9. Restart under concurrency (both modes).* Killing two of three workers while threads keep sending finishes every thread without =UninitializedBrishException=; a delayed instance keeps its encoding across =%BRISH_RESTART=.
-- *G10. Hostile user state (binary).* Shadowed builtins, clobbered worker variables, =set --=, =exec >/dev/null= with a background job holding the stream, =ksh_arrays=, =sh_word_split=, =no_multibyte=, =nounset=, =emulate sh=, and DEBUG and ZERR traps all leave the next request working.
-- *G11. Compatibility.* =brish2.zsh= is byte-identical; the legacy wire bytes are unchanged; =CmdResult= keeps its fields, repr, =asdict=, JSON, hash, pickle, copy and =replace= behaviour; subclasses that add attributes still work; the worker-side contracts (=$brish_server_index=, =$cmd=, =$brish_stdin=, the zsh shebang that loads startup files, the argv reservation, non-fork commands inside =tmp_block_8182782=, an empty pipe as default stdin) hold in binary mode.
-- *G12. Performance (binary against legacy, interleaved in one process).* Per-call latency does not regress (binary mode is several times faster, since an empty stdin forks nothing); 50 MiB of stdin takes under 2 seconds and scales linearly; many-line stdout is faster; single-line stdout does not regress.
+- *G10. Hostile user state (both modes).* Shadowed builtins, clobbered worker variables, =set --=, =exec >/dev/null= with a background job holding the stream, =ksh_arrays=, =sh_word_split=, =no_multibyte=, =nounset=, =emulate sh=, and DEBUG and ZERR traps all leave the next request working.
+- *G11. Compatibility.* =brish2.zsh= answers the pre-binary and master Python byte for byte like the original worker, apart from the intended error-handling differences (=tests/test_wire_compat.py=); the legacy wire bytes are unchanged; =CmdResult= keeps its fields, repr, =asdict=, JSON, hash, pickle, copy and =replace= behaviour; subclasses that add attributes still work; the worker-side contracts (=$brish_server_index=, =$cmd=, =$brish_stdin=, the zsh shebang that loads startup files, the argv reservation, non-fork commands inside =tmp_block_8182782=, an empty pipe as default stdin) hold in both modes.
+- *G12. Performance (binary against legacy, interleaved in one process).* Per-call latency does not regress against the original legacy worker (binary mode is several times faster, since an empty stdin forks nothing; today's legacy worker forks nothing either and is about as fast); 50 MiB of stdin takes under 2 seconds and scales linearly; many-line stdout is faster; single-line stdout does not regress.
 - *G13. =zp= byte pass-through (binary).* =zp= of a binary file yields identical bytes, stays in order with surrounding prints, falls back to text for a target without a binary buffer, and =zpe= writes to stderr's buffer.
 - *G14. Mixed-version safety.* The pre-binary =brishmod.py= still works from the new tree (it spawns =brish2.zsh=); a legacy frame sent to =brish3.zsh= makes the worker exit without running anything; new Python facing a worker without HELLO raises "not a BRISH3 worker" within the startup timeout.
 
@@ -128,7 +141,11 @@ Code that builds on Brish can carry the same guarantees behind its own opt-in, s
 - =brish.brishz= has an opt-in bytes mode (=binary=True= or its env var): it runs the client in bytes mode and returns =CmdResult.from_bytes=. Its text mode is unchanged.
 
 * Rollout and versioning
-1. Ship both workers with binary mode off by default. For existing importers the update is a no-op except for three additive or protective changes: the quoting fix, the legacy EOF, stderr and restart fixes, and the new =CmdResult= byte views.
+1. Ship both workers with binary mode off by default. For existing importers the update is a no-op except for additive or protective changes: the quoting fix, the legacy EOF, stderr and restart fixes, the new =CmdResult= byte views, and the legacy backports. Of those, the backports are the ones existing code can notice:
+   - text views keep =\r= (=\r\n= is no longer turned into =\n=);
+   - bytes stdin and interpolated bytes are exact instead of reprs or integers, and =cmd_stdin=None= is empty instead of the text "None";
+   - a syntax error returns 1 instead of re-running the previous command, NOMATCH returns 1, and =exit N= returns N;
+   - =zp= writes to =sys.stdout.buffer= when there is one.
 2. Enable =BRISH_BINARY= in chosen processes. Long-running processes pick up new Python code only when they restart; respawning workers inside an old process keeps the old Python code.
 3. Flip the default in a later release.
 4. Remove the legacy path, and then delete =brish2.zsh= in its own commit, once a release has shipped both workers, no process started before the switch is still running, and nothing else spawns =brish2.zsh=.

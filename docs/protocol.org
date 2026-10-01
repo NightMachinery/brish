@@ -1,6 +1,6 @@
 #+TITLE: Protocol BRISH3
 
-This is the wire protocol of Brish's binary mode, spoken between =brish/brishmod.py= and the worker script =brish/brish3.zsh=. Legacy mode (=brish/brish2.zsh=) is described at the end for contrast; its wire format is frozen.
+This is the wire protocol of Brish's binary mode, spoken between =brish/brishmod.py= and the worker script =brish/brish3.zsh=. Legacy mode (=brish/brish2.zsh=, the default) is described at the end: its wire format is frozen, and the section says what its worker does within that format and what the format rules out.
 
 * Terms
 - *Bootstrap*: the zsh process Python starts. It loads the startup files once and forks the workers.
@@ -151,5 +151,36 @@ The legacy transport uses named FIFOs. Binary mode uses anonymous pipes passed w
 - parse frames and write START and END markers exactly as above, each marker in a single write shorter than =PIPE_BUF=, on both response pipes;
 - exit when its stdin (the bootstrap's) reaches EOF, or at least not hold the pipes open forever.
 
-* Legacy mode, for contrast
-=brish2.zsh= reads three NUL-terminated lists of FIFO paths from its stdin. Each request is =cmd NUL stdin NUL fork NUL newline= on the request FIFO, and the reply is the output followed by =\n NUL \n <retcode> \n= on stdout and =\n NUL \n= on stderr, all read as text. Output that contains a NUL between two line boundaries forges the terminator, and the text layer translates newlines and cannot carry arbitrary bytes. This format is frozen: long-running processes with older Python code spawn =brish2.zsh= by path, so it stays byte-identical until the legacy path is removed.
+* Legacy mode
+=brish2.zsh= is the worker of legacy mode. Its wire format is *frozen*: Python processes that still run older Brish code (the pre-binary release, in a long-lived server or an IPython kernel, say) spawn the on-disk =brish2.zsh= by path on every =init()= and =restart()=, so whatever worker is on disk must answer them exactly as the original did. =tests/test_wire_compat.py= checks this. It loads the old =brishmod.py= sources from git, with =__file__= pointing into the tree so that they spawn today's worker, runs a corpus through them and through a raw FIFO driver, and compares every reply byte for byte with the original worker's, both with an empty =ZDOTDIR= and with the real startup files. The intended differences (the error handling below) are asserted separately.
+
+** Wire format
+- *Bootstrap.* Python creates three FIFOs per worker (request, stdout, stderr) and writes to the bootstrap's stdin: the request FIFO paths, NUL, the stdout FIFO paths, NUL, the stderr FIFO paths, NUL, and a newline. Each list is newline-separated.
+- *Request*, on the request FIFO: =cmd NUL stdin NUL fork NUL newline=, where =fork= is =y= or empty. The newline is what Python's =print()= added in the original code. The worker reads it as a leading newline of the next command, where it is harmless, so today's Python still writes it.
+- *Reply*, on the stdout FIFO: the command's output, =\n NUL \n=, the decimal retcode and a newline. On the stderr FIFO: the output, then =\n NUL \n=.
+- Python reads each FIFO line by line (today's Python in binary, with lines ending at =\n= only) until a line equal to =NUL \n=, and drops the one newline the worker wrote before it. stderr is read in a helper thread, so a command that fills the stderr FIFO before finishing its stdout cannot deadlock.
+
+Two kinds of retcode line are newer than the original worker, and both parse as integers in old Python:
+- =+N=, from the worker's EXIT trap: the command exited the worker with status N (=int("+3")= is 3);
+- =9001=, written by the bootstrap for a worker that died without answering.
+
+** Execution
+The bootstrap forks one subshell per worker after the startup files have run, with fd 0 on the request FIFO and fds 1 and 2 appending to the reply FIFOs. A non-fork command runs as the body of =tmp_block_8182782=, and a fork command in a subshell, as in binary mode (see Execution above): =eval= defines the function, =&&= keeps a syntax error from re-running the previous body, and the same =repeat 1= / =always= construct absorbs =break=, =continue=, NOMATCH and other shell errors, and clears =err_exit= and =err_return=. The reply is written at the top of the read loop, so a command's =continue 2= still gets one, and an outer loop absorbs =break 2=.
+
+stdin works as in binary mode: an empty stdin is an always-EOF pipe opened once per worker, so a command without stdin forks nothing, and a non-empty stdin is a pipeline whose writer ignores SIGPIPE and always succeeds. The worker's fd 0 is the request FIFO, and no command may inherit it: it would eat the next request, and a background job holding it would keep a dead worker's FIFO open. Every command therefore gets its stdin from a call-site redirection, so zsh moves the request FIFO to an internal fd while the command runs, and closes that fd in every child. A test checks every fd of processes that commands start, in each shape (plain, background, subshell, command and process substitution, pipeline).
+
+The defences against user state follow binary mode's: the script is parsed with aliases off, every internal command is prefixed with =builtin=, framing uses private constants computed once at startup (a =$'\0'= literal evaluates to the empty string while a command's =posix_strings= is on), and =>&1 2>&2= at the call site undoes a command's =exec >file=. =$MARKER= is still defined, for commands that read it, but nothing depends on it. One quirk needs its own fix: zsh skips an EXIT trap that was set while =posix_traps= was off if a command later turns it on (=emulate sh= does) and then exits from inside a function. So the worker sets its EXIT trap again before every request.
+
+** Worker death
+- *=exit=* in a non-fork command runs the EXIT trap, which writes =\n NUL \n +N \n= on stdout. A helper process writes the stderr delimiter once the worker has fully exited (its parent PID changes then), so by the time Python has the whole reply, the request FIFO has no reader. The next write then fails with =EPIPE=: today's and master's Python restart and retry, and the pre-binary Python raises =BrokenPipeError= (with the original worker, it spun on EOF forever). Today's Python reads the =+= and restarts before its next use, without trying the dead worker first.
+- *=errexit=, =${x:?}=, signals* end the worker without running EXIT traps. The bootstrap notices in a CHLD trap, opens the worker's reply FIFOs without blocking and, if a reader is there, writes =\n NUL \n 9001 \n= and =\n NUL \n=. So the caller gets retcode 9001 even while a background job holds the reply FIFOs open (no EOF can arrive then), and old Python gets a reply instead of spinning on EOF. If the worker had already answered, or was idle, nobody reads those bytes: the next request finds the request FIFO without a reader, and the instance restarts with new FIFOs.
+- Today's Python appends =brish: worker died during this command= to stderr for 9001, and also returns 9001 on EOF of a reply FIFO.
+
+** What the frozen format rules out
+Each of these would need a change the old Python cannot parse. Binary mode has none of them.
+- *A NUL cannot travel in a command or its stdin.* The fields are NUL-terminated. Such a request returns retcode 9000 without touching a worker. A NUL inside an interpolated value works, because the quoter writes it as =$'\x00'=.
+- *An output line that is only a NUL ends the reply early.* That includes output that is just a NUL, or ends in =\n NUL=, on stdout or stderr. The delimiter carries no nonce, and old Python must keep recognising it. The rest of the output is then read as the next reply, so results lag one behind, or, when the line after the forged delimiter is not a number, =send_cmd= raises =ValueError= and the instance restarts. A NUL anywhere else in a line is carried exactly.
+- *Output written between requests* (by a background job) joins the next reply, since there is no START marker to skip it.
+- *Large stdin is slow.* The worker reads requests with =read -d=, which makes one syscall per byte on a FIFO: about 1.5 seconds per MiB. A buffered =sysread= reader would fit the format, since only the worker reads the request FIFO, but is not done yet.
+- *=cmd_stdin=None= is an empty stdin*, not =/dev/null=: the wire has no way to say "no stdin".
+- *An interrupt restarts the instance.* Without a per-request marker a worker cannot be resynchronised.

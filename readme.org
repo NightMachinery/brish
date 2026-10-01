@@ -859,7 +859,7 @@ for future in concurrent.futures.as_completed(futures):
 
 
 ** Binary Data
-By default Brish talks to zsh through a text transport (/legacy mode/): output is decoded as text, newlines are translated, and stdin and interpolated values must be text. /Binary mode/ carries exact bytes in every direction. Turn it on per instance, or for a whole process with the env var =BRISH_BINARY= (read when each =Brish= is created, including the module-level =z=, =zp= and friends at import):
+Brish has two transports. /Binary mode/ carries exact bytes in every direction. /Legacy mode/, the default, does too, except where its frozen wire format cannot: a NUL in a command or its stdin is refused with retcode 9000, and an output line that holds only a NUL ends the reply early (see Known Issues). Turn binary mode on per instance, or for a whole process with the env var =BRISH_BINARY= (read when each =Brish= is created, including the module-level =z=, =zp= and friends at import):
 
 #+begin_example
 from brish import Brish
@@ -869,7 +869,7 @@ b = Brish(binary=True)
 #   BRISH_BINARY=1 python3 my_script.py
 #+end_example
 
-Every =CmdResult= has byte views next to its text fields: =outb=, =errb=, =outrsb= (=outb= without trailing newlines), =outerrb=, =iterb()= (lines) and =iter0b()= (NUL-separated items). In binary mode they hold exactly what the command wrote, and the text views are decoded from those bytes without any newline translation:
+Every =CmdResult= has byte views next to its text fields: =outb=, =errb=, =outrsb= (=outb= without trailing newlines), =outerrb=, =iterb()= (lines) and =iter0b()= (NUL-separated items). They hold exactly what the command wrote, and the text views are decoded from those bytes without any newline translation:
 
 #+begin_src python :exports both
 r = b.send_cmd("print -rn -- $'caf\\xc3\\xa9\\r\\n\\xff\\0'")
@@ -881,7 +881,7 @@ r = b.send_cmd("print -rn -- $'caf\\xc3\\xa9\\r\\n\\xff\\0'")
 (b'caf\xc3\xa9\r\n\xff\x00', 'café\r\n\\xff\x00')
 #+end_example
 
-stdin and commands can be bytes. A =str= is encoded with the instance encoding (UTF-8 by default) and =surrogateescape=, so file names from =os.listdir= round-trip. =cmd_stdin=None= gives the command =/dev/null= instead of an empty pipe:
+stdin and commands can be bytes. A =str= is encoded with the instance encoding (UTF-8 by default) and =surrogateescape=, so file names from =os.listdir= round-trip. In binary mode, =cmd_stdin=None= gives the command =/dev/null= instead of an empty pipe (legacy mode cannot tell the two apart):
 
 #+begin_src python :exports both
 (b.send_cmd("cat", cmd_stdin=b"\xff\xfe").outb,
@@ -907,26 +907,30 @@ name = b"report \xff.txt"
 
 =zp= and =zpe= write the bytes to =sys.stdout.buffer= and =sys.stderr.buffer= (flushing the text layer first, so output stays in order). A script that runs =zp("cat some.png")= with its stdout redirected to a file makes an identical copy. For a target without a binary buffer, such as =io.StringIO=, they print the text views.
 
-Binary mode also changes a few behaviours of non-fork commands, because each one now runs in a protected loop:
+Non-fork commands run in a protected loop, in both modes (legacy mode got it later, so older releases behave differently):
 - =exit N= returns a normal result with retcode N, and the instance restarts before its next use;
 - NOMATCH and other shell errors return retcode 1 instead of killing the worker;
 - a bare =break= or =continue= ends the command with status 0;
 - =setopt errexit= and =errreturn= do not persist to the next command;
 - a syntax error no longer re-runs the previous command.
 
-Binary mode is also faster: a command without stdin forks nothing, and large stdin is read in 64 KiB chunks. The wire protocol is documented in [[file:docs/protocol.org][docs/protocol.org]], and the design in [[file:docs/binary-transport.org][docs/binary-transport.org]].
+In both modes a command without stdin forks nothing. Binary mode is faster with large data: it reads stdin in 64 KiB chunks, where legacy mode reads one byte per syscall (about 1.5 seconds per MiB), and it parses large many-line output much faster. The wire protocols, including what legacy mode's frozen format rules out and why, are documented in [[file:docs/protocol.org][docs/protocol.org]], and the design in [[file:docs/binary-transport.org][docs/binary-transport.org]].
 
 ** When a Worker Dies
-If the command ran and killed its shell (with =exit= in legacy mode, =errexit=, =${x:?}=, a signal, ...), you get a =CmdResult= like from =subprocess.run=: the command's status if the worker reported it, otherwise the reserved retcode 9001 with =brish: worker died during this command= appended to =.err=. The instance restarts before its next use. If a worker died before it could run the command (killed between two commands, say), Brish restarts it and retries once; only when that fails too does it raise =BrishWorkerDiedException=.
+If the command ran and killed its shell (with =exit=, =errexit=, =${x:?}=, a signal, ...), you get a =CmdResult= like from =subprocess.run=: the command's status if the worker reported it (=exit N= reports N, in both modes), otherwise the reserved retcode 9001 with =brish: worker died during this command= appended to =.err=. A background job that keeps the dead shell's output open does not delay the result. The instance restarts before its next use. If a worker died before it could run the command (killed between two commands, say), Brish restarts it and retries once; only when that fails too does it raise =BrishWorkerDiedException=.
 
 A =KeyboardInterrupt= in =send_cmd= abandons the reply but does not stop the shell command. In binary mode the next command on that worker waits for it and then gets its own result, and other idle workers are preferred meanwhile. In legacy mode the instance restarts before its next use.
 
 * Security Considerations
 Interpolated values are quoted in pure Python (see =brish/quoting.py=), and zsh reads each quoted word back as exactly the original bytes. So a value from an untrusted source is safe to interpolate as ={value}=, as long as nothing evaluates it as code a second time. The template's literal text is code, and so are values inserted with =:e=.
 
+This holds in both modes, for every byte: in legacy mode a NUL inside a value is written as =$'\x00'=, so it reaches the command intact.
+
 Earlier versions quoted values with zsh's =${(q+)...}= flag, which mis-escapes some bytes and code points. Several of them are valid UTF-8 (U+001C, U+0080 to U+009F and U+00AD), and the broken escape can end the quoted word early, so the rest of the value ran as shell code. Upgrade if you interpolate untrusted text.
 
 I am not a security expert, and feedback by security experts will be appreciated.
+
+In legacy mode, a command's output can forge the end of its reply: an output line holding only a NUL ends the reply there, and the line after it is read as the retcode. So a command that prints untrusted data (the contents of a downloaded file, say) can make its result report any status and shift the results of later commands by one. Use binary mode for such commands, whose replies are framed with a fresh random nonce the command never sees.
 
 Note that you can create security holes for yourself, by, e.g., running =eval= on user input:
 
@@ -952,9 +956,13 @@ z("echo {untrusted_input}") # safe
 # One thing to keep in mind is that Brish purposely uses the zsh from your PATH. That zsh will load its dotfiles as usual.
 
 * Known Issues
-- In legacy mode (the default), piping binary (non-text) output from zsh to Python does not work, =\r= is translated, and a NUL at a line boundary in the output desynchronises the instance. Use binary mode (see Binary Data).
-
-- In legacy mode, a command with a syntax error re-runs the previous command, and returns status 0.
+- Legacy mode (the default) keeps a wire format that older Brish code still speaks, so it cannot carry everything (details in [[file:docs/protocol.org][docs/protocol.org]]). Binary mode has none of these limits:
+  - a NUL in a command or in its stdin gives retcode 9000 (a NUL inside an interpolated value works);
+  - an output line that holds only a NUL, on stdout or stderr, ends the reply early and desynchronises the instance (see Security Considerations);
+  - output that a background job writes between two commands joins the next command's result;
+  - large stdin is slow, about 1.5 seconds per MiB;
+  - =cmd_stdin=None= is the same as an empty stdin;
+  - an interrupt restarts the instance.
 
 - Nonstandard encodings (non UTF-8) are corrupted
   #+begin_src python :session p1 :results value :exports both
@@ -966,7 +974,7 @@ z("echo {untrusted_input}") # safe
   sth Ã\xb7 another (ver.-)
   #+end_example
 
-- There is always sth piped to the standard input (an empty string by default). This can alter the behavior of some commands such as =ripgrep=; Using =</dev/null= or =<&-= can be a suitable workaround. In binary mode, =cmd_stdin=None= gives the command =/dev/null=.
+- A command's standard input is always a pipe (an empty one by default). This can alter the behavior of some commands such as =ripgrep=; Using =</dev/null= or =<&-= can be a suitable workaround. In binary mode, =cmd_stdin=None= gives the command =/dev/null=.
 
 - An interrupt (=KeyboardInterrupt=) does not stop the shell command, and there is no per-command timeout.
 
