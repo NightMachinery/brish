@@ -162,7 +162,7 @@ Two more differences show up only with unusual user state, and are not in the co
 - *Bootstrap.* Python creates three FIFOs per worker (request, stdout, stderr) and writes to the bootstrap's stdin: the request FIFO paths, NUL, the stdout FIFO paths, NUL, the stderr FIFO paths, NUL, and a newline. Each list is newline-separated.
 - *Request*, on the request FIFO: =cmd NUL stdin NUL fork NUL newline=, where =fork= is =y= or empty. The newline is what Python's =print()= added in the original code. The worker reads it as a leading newline of the next command, where it is harmless, so today's Python still writes it.
 - *Reply*, on the stdout FIFO: the command's output, =\n NUL \n=, the decimal retcode and a newline. On the stderr FIFO: the output, then =\n NUL \n=.
-- Python reads each FIFO line by line (today's Python in binary, with lines ending at =\n= only) until a line equal to =NUL \n=, and drops the one newline the worker wrote before it. stderr is read in a helper thread, so a command that fills the stderr FIFO before finishing its stdout cannot deadlock.
+- Python reads each FIFO until the first line equal to =NUL \n=, and drops the one newline the worker wrote before it. Older Python reads line by line; today's Python reads bytes (lines end at =\n= only) with a parser that searches the buffered bytes for =\n NUL \n= (or =NUL \n= at the very start), gives the same split, and consumes nothing past the reply. stderr is read in a helper thread, so a command that fills the stderr FIFO before finishing its stdout cannot deadlock.
 
 Two kinds of retcode line are newer than the original worker, and both parse as integers in old Python:
 - =+N=, from the worker's EXIT trap: the command exited the worker with status N (=int("+3")= is 3);

@@ -2,8 +2,12 @@
 backports from binary mode. Every test here is skipped in binary mode, which
 has its own, stronger tests in test_binary.py."""
 
+import io
 import os
 
+import pytest
+
+from brish.brishmod import _LegacyReplyParser, _legacy_read_reply
 from tests.conftest import check, legacy_only
 
 pytestmark = legacy_only
@@ -365,3 +369,85 @@ def test_startup_files_cannot_break_the_worker(tmp_path):
         env={"ZDOTDIR": str(zdot)},
         timeout=60,
     )
+
+
+def _original_read_reply(f):
+    """The line reader of every earlier release (7172256 and before): the
+    reference for the frozen legacy wire."""
+    lines = []
+    while True:
+        line = f.readline()
+        if line == b"\0\n":
+            return b"".join(lines)[:-1], False
+        if not line:
+            return b"".join(lines), True
+        lines.append(line)
+
+
+class _Chunked(io.RawIOBase):
+    """A raw file that returns the given chunks, one per read."""
+
+    def __init__(self, chunks):
+        self.chunks = [c for c in chunks if c]
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        if not self.chunks:
+            return 0
+        c = self.chunks[0]
+        n = min(len(b), len(c))
+        b[:n] = c[:n]
+        if n == len(c):
+            self.chunks.pop(0)
+        else:
+            self.chunks[0] = c[n:]
+        return n
+
+
+LEGACY_REPLIES = [
+    b"", b"a", b"a\n", b"\n", b"\n\n", b"\0", b"\0\n", b"a\0\n", b"a\n\0", b"x\r\0\r",
+    b"\n\0", b"\0\0\n\0", b"a\n\0b\n", b"\n\0\n", b"a\n\0\n5\nzz", b"\0\nrest",
+    bytes(range(1, 256)), b"line\n" * 40,
+]
+
+
+@pytest.mark.parametrize("with_rc", [False, True])
+def test_legacy_parser_matches_the_original_reader(with_rc):
+    #: Every reply as the worker frames it, followed by a second reply, cut at
+    #: every point (and byte by byte): the byte parser, used whole by
+    #: _legacy_read_reply or chunk by chunk, finds the same output, retcode
+    #: line and EOF as the original reader, and consumes exactly as much.
+    for out in LEGACY_REPLIES:
+        reply = out + b"\n\0\n" + (b"+13\n" if with_rc else b"")
+        stream = reply + b"next\n\0\n" + (b"0\n" if with_rc else b"")
+        for chunks in [[stream[:k], stream[k:]] for k in range(len(stream) + 1)] + [
+            [stream[i : i + 1] for i in range(len(stream))],
+            [stream[:k] for k in (len(reply) - 2,)],  # EOF inside the end
+        ]:
+            ref = io.BufferedReader(_Chunked(chunks))
+            want = _original_read_reply(ref)
+            want_rc = ref.readline() if with_rc and not want[1] else None
+            want_rest = ref.read()
+            f = io.BufferedReader(_Chunked(chunks))
+            got, eof, rc = _legacy_read_reply(f, with_rc=with_rc)
+            assert (got, eof) == want, (out, chunks)
+            if with_rc and not eof:
+                assert rc == want_rc, (out, chunks)
+            assert f.read() == want_rest, (out, chunks)
+            #: Chunk by chunk, as BrishPopen's reader feeds it.
+            p = _LegacyReplyParser(with_rc)
+            acc, used_total, data = b"", 0, b"".join(chunks)
+            for c in chunks:
+                if p.done:
+                    break
+                payload, used = p.feed(c)
+                acc += payload
+                used_total += used
+                assert used <= len(c)
+            if not p.done:
+                acc += p.flush()
+            assert acc == want[0], (out, chunks)
+            if p.done:
+                assert data[used_total:] == want_rest, (out, chunks)

@@ -347,9 +347,8 @@ class _ErrReader:
     blocked on, because closing a buffered file waits for its lock.
     """
 
-    def __init__(self, f, delim):
+    def __init__(self, f):
         self.f = f
-        self.delim = delim
         self.data = b""
         self.eof = False
         self.exc = None
@@ -361,7 +360,7 @@ class _ErrReader:
 
     def _run(self):
         try:
-            self.data, self.eof = _legacy_read_reply(self.f, self.delim)
+            self.data, self.eof, _ = _legacy_read_reply(self.f)
         except BaseException as e:
             self.exc = e
         finally:
@@ -527,26 +526,109 @@ class _Worker:
                 pass
 
 
-#: The legacy reply delimiter: a line holding only NUL (see docs/protocol.org).
-_LEGACY_DELIM = b"\0\n"
 #: The retcode line the bootstrap writes for a worker that died without
 #: answering. Every Python parses it as 9001; no command's status prints so.
 _LEGACY_DEATH_LINE = b"09001\n"
 
 
-def _legacy_read_reply(f, delim=_LEGACY_DELIM):
-    """Read lines from the binary file `f` until the line `delim`, and drop
-    the newline the worker writes before it. Lines end at b"\n" only, so CR
-    and every other byte are kept. Returns (bytes, eof)."""
-    lines = []
-    readline = f.readline
-    while True:
-        line = readline()
-        if line == delim:
-            return b"".join(lines)[:-1], False
-        if not line:
-            return b"".join(lines), True
-        lines.append(line)
+def _legacy_read_reply(f, with_rc=False):
+    """Read one legacy reply from the binary file `f` (a reply FIFO), with
+    _LegacyReplyParser, consuming nothing after it.
+
+    Returns (payload, eof, rc_line): `eof` when the file ended before the
+    delimiter, and with `with_rc` the retcode line (b"" or a partial line
+    when the file ended inside it, as readline() would return it).
+    """
+    parser = _LegacyReplyParser(with_rc)
+    chunks = []
+    peek, read = f.peek, f.read
+    while not parser.done:
+        #: peek() returns the buffered bytes, after one raw read when the
+        #: buffer is empty; only the bytes of this reply are consumed.
+        buf = peek(1)
+        if not buf:
+            tail = parser.flush()
+            if tail:
+                chunks.append(tail)
+            return b"".join(chunks), not parser.in_rc, parser.rc_buf
+        payload, used = parser.feed(buf)
+        read(used)
+        if payload:
+            chunks.append(payload)
+    return b"".join(chunks), False, parser.rc
+
+
+#: A legacy reply ends at the first line that is just NUL; the worker writes
+#: a newline before it, which is not output.
+_LEGACY_END = b"\n\0\n"
+
+
+class _LegacyReplyParser:
+    """Splits one legacy reply stream as it arrives, and can be fed
+    chunk by chunk. send_cmd uses it through _legacy_read_reply.
+
+    A reply is the output, the newline the worker writes, a line holding only
+    NUL, and on stdout the retcode line. The first line that is just NUL ends
+    the output, as in the original line-by-line reader: the output ends at
+    the first newline-NUL-newline, or at a NUL-newline at its very start
+    (a virtual newline in `held` stands for the line start there).
+
+    `feed(buf)` returns (payload, used): the output bytes that are now
+    certain, and how many bytes of `buf` belong to this reply, so that the
+    rest stays in the file's buffer for the next reply. Only a possible start
+    of the end is held back: a trailing newline or newline-NUL.
+    """
+
+    __slots__ = ("with_rc", "held", "skip", "in_rc", "rc_buf", "rc", "done")
+
+    def __init__(self, with_rc):
+        self.with_rc = with_rc
+        self.held = b"\n"
+        self.skip = 1  # held[0] is the virtual newline, not output
+        self.in_rc = False
+        self.rc_buf = b""
+        self.rc = None  # the retcode line, with its newline
+        self.done = False
+
+    def feed(self, buf):
+        if self.in_rc:
+            k = buf.find(b"\n")
+            if k < 0:
+                self.rc_buf += buf
+                return b"", len(buf)
+            self.rc = self.rc_buf + buf[: k + 1]
+            self.done = True
+            return b"", k + 1
+        held, skip = self.held, self.skip
+        window = held + buf
+        j = window.find(_LEGACY_END)
+        if j >= 0:
+            payload = window[skip:j] if j > skip else b""
+            used = j + len(_LEGACY_END) - len(held)
+            self.held, self.skip = b"", 0
+            if not self.with_rc:
+                self.done = True
+                return payload, used
+            self.in_rc = True
+            _, more = self.feed(buf[used:])
+            return payload, used + more
+        if window.endswith(b"\n\0"):
+            cut = len(window) - 2
+        elif window.endswith(b"\n"):
+            cut = len(window) - 1
+        else:
+            cut = len(window)
+        payload = window[skip:cut] if cut > skip else b""
+        self.held = window[cut:]
+        self.skip = 1 if (skip and cut == 0) else 0
+        return payload, len(buf)
+
+    def flush(self):
+        """At EOF: the held bytes are output (the original reader kept every
+        line it read before EOF)."""
+        out = self.held[self.skip :]
+        self.held, self.skip = b"", 0
+        return out
 
 
 _TEMPLATE_UNSAFE = re.compile("[\r\0\ud800-\udfff]")
@@ -1286,13 +1368,12 @@ class Brish:
 
         #: Read stderr concurrently: a command that fills the stderr FIFO
         #: before finishing its stdout would otherwise deadlock.
-        err_reader = _ErrReader(p.brish_stderrs[index], _LEGACY_DELIM)
+        err_reader = _ErrReader(p.brish_stderrs[index])
         p.err_readers[index] = err_reader
-        outb, died = _legacy_read_reply(p.brish_stdouts[index])
+        outb, died, rc_line = _legacy_read_reply(p.brish_stdouts[index], with_rc=True)
         return_code = None
         exited = False
         if not died:
-            rc_line = p.brish_stdouts[index].readline()
             if not rc_line:
                 died = True
             else:
