@@ -2,7 +2,7 @@
 name = "brish"
 version = "0.3.6"
 description = "A bridge between zsh and Python."
-authors = [{ name = "NightMachinary", email = "rudiwillalwaysloveyou@gmail.com" }]
+authors = [{ name = "NightMachinery", email = "rudiwillalwaysloveyou@gmail.com" }]
 # The published Python floor. poetry.lock is resolved for the narrower
 # range in [tool.poetry.dependencies]; see docs/development.org.
 requires-python = ">=3.7.0,<4"
