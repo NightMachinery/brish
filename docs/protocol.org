@@ -95,8 +95,10 @@ brish3_run() {  # $1 nonce, $2 fork, $3 stdin mode; no locals: user code runs in
       ...run the command as above...
     done
   } always {
-    BRISH3_RET=$? BRISH3_NONCE=$1
-    TRY_BLOCK_ERROR=0  # NOMATCH and other shell errors do not end the serve loop
+    BRISH3_RET=${BRISH3_INT:-$?} BRISH3_NONCE=$1
+    TRY_BLOCK_ERROR=0      # NOMATCH and other shell errors do not end the serve loop
+    TRY_BLOCK_INTERRUPT=0  # nor does an interrupt (see Interrupts below)
+    builtin trap '' INT
     builtin unsetopt err_exit err_return
   }
   builtin true         # a failing status must not reach the user's ZERR trap
@@ -116,6 +118,18 @@ done
 - The worker's EXIT trap writes =END:<nonce>:<status>:exit= when a request is open, so =exit N= returns a normal result with retcode N. Python restarts the instance before its next use.
 - =errexit=, =${x:?}= and similar fatal errors end the worker without an END. Python then returns retcode 9001 (see below).
 - Header parsing, both payload reads and the START write happen in one =emulate -LR zsh= function, since every =emulate= and every function call costs tens of microseconds.
+
+** Interrupts
+SIGINT aborts the running command, the way Ctrl-C does in an interactive shell, and the worker goes on serving. It reaches a worker from a terminal Ctrl-C (Brish's processes share the terminal's process group), or from anything that signals the worker.
+
+- While idle or framing (reading a request, writing a marker), the worker ignores SIGINT (=trap '' INT=), so a signal can never cut its own reads and writes short. The bootstrap ignores it too.
+- Just before a non-fork command runs, =brish3_run= defines a =TRAPINT= function. Returning 128+signal from it makes zsh unwind the command as interrupted: the running external command dies of the signal, and zsh breaks out of the command's loops and functions. The =always= block sets =TRY_BLOCK_INTERRUPT=0=, which stops the unwinding there, and then ignores SIGINT again. The status of an interrupted function return is 1, so the trap records 128+signal in =BRISH3_INT=, and END carries that: 130 for SIGINT.
+- The trap acts only while the command's function is on the stack (=${#funcstack}= deeper than the trap, =brish3_run= and =brish3_serve=). Above that level an interrupt would break the serve loop itself.
+- A fork command defines its own =TRAPINT= in the subshell, which exits with 128+signal; the worker keeps ignoring SIGINT, and END carries the subshell's status.
+- zsh runs a trap only once the foreground child has exited (unless =trapsasync= is on), so a signal meant to interrupt a command must reach its processes as well as the worker (a terminal Ctrl-C reaches them all).
+- A command may set its own INT trap (=trap 'print caught' INT=), which then runs instead, as in an interactive shell; it lasts until the command ends. A command that ignores SIGINT (=trap '' INT=) and loops in the shell cannot be interrupted.
+
+Older Python, such as master's binary mode (6e97135), reads such a reply like any other: the retcode is 130. =tests/test_binary_compat.py= runs master's Python against this worker.
 
 ** Defences against user state
 User commands run in the worker, so they can change its state. The worker is written to survive that:
@@ -174,6 +188,8 @@ The bootstrap forks one subshell per worker after the startup files have run, wi
 stdin works as in binary mode: an empty stdin is an always-EOF pipe opened once per worker, so a command without stdin forks nothing, and a non-empty stdin is a pipeline whose writer ignores SIGPIPE and always succeeds. The worker's fd 0 is the request FIFO, and no command may inherit it: it would eat the next request, and a background job holding it would keep a dead worker's FIFO open. Every command therefore gets its stdin from a call-site redirection, so zsh moves the request FIFO to an internal fd while the command runs, and closes that fd in every child. A test checks every fd of processes that commands start, in each shape (plain, background, subshell, command and process substitution, pipeline).
 
 The defences against user state follow binary mode's: the script is parsed with aliases off, every internal command is prefixed with =builtin=, framing uses private constants computed once at startup (a =$'\0'= literal evaluates to the empty string while a command's =posix_strings= is on), and =>&1 2>&2= at the call site undoes a command's =exec >file=. =$MARKER= is still defined, for commands that read it, but nothing depends on it. One quirk needs its own fix: zsh skips an EXIT trap that was set while =posix_traps= was off if a command later turns it on (=emulate sh= does) and then exits from inside a function. So the worker sets its EXIT trap again before every request.
+
+SIGINT is handled as in binary mode (see Interrupts above): ignored while idle and framing, a =TRAPINT= that records 128+signal while a non-fork command runs (acting only inside =tmp_block_8182782=, since an interrupt at the worker's top level would break its read loop and end it), a trap that exits with 128+signal in a fork command's subshell, and =TRY_BLOCK_INTERRUPT=0= in =always=. The retcode line is then a plain =130=, which every Python parses, and the worker lives on; the original worker died instead. =test_sigint_aborts_only_the_command= checks this under the pre-binary, master and today's Python.
 
 ** Worker death
 - *=exit=* in a non-fork command runs the EXIT trap, which writes =\n NUL \n +N \n= on stdout. A helper process writes the stderr delimiter once the worker has fully exited (its parent PID changes then), so by the time Python has the whole reply, the request FIFO has no reader. The next write then fails with =EPIPE=: today's and master's Python restart and retry, and the pre-binary Python raises =BrokenPipeError= (with the original worker, it spun on EOF forever). Today's Python reads the =+= and restarts before its next use, without trying the dead worker first.

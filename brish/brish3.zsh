@@ -12,7 +12,7 @@
 builtin zmodload zsh/system || builtin exit 70
 
 typeset -g BRISH3_NONCE= BRISH3_FORK=0 BRISH3_STDIN_MODE= BRISH3_INREQ= BRISH3_EOF=
-typeset -g BRISH3_CMD= BRISH3_RET=0 brish_stdin= cmd=
+typeset -g BRISH3_CMD= BRISH3_RET=0 BRISH3_INT= brish_stdin= cmd=
 typeset -g __brish3_req= __brish3_out= __brish3_err= __brish3_empty=
 typeset -g __brish3_nul= __brish3_nl= __brish3_startp= __brish3_endp=
 typeset -ga __brish3_specs __brish3_pids
@@ -116,19 +116,37 @@ function brish3_recv {
 #: Run the request. No locals and no emulate here: user code runs inside and
 #: must see the user's options. The nonce is kept only in $1 while user code
 #: runs; `always` restores it from there.
+#:
+#: SIGINT is ignored while the worker is idle or framing, so that it never
+#: interrupts the worker's own reads and writes. While a command runs, a
+#: TRAPINT makes SIGINT act like an interactive Ctrl-C: returning 128+signal
+#: unwinds the command as interrupted. A fork command sets a trap in its
+#: subshell that exits with 128+signal; the worker keeps ignoring SIGINT. A
+#: non-fork command gets the worker's trap: `always` stops the unwinding
+#: (TRY_BLOCK_INTERRUPT=0), and END carries the status the trap records
+#: (returning through a function turns it into 1). The worker's trap acts
+#: only inside the command's function (deeper than TRAPINT, brish3_run and
+#: brish3_serve); between the worker's own commands it is ignored. A command
+#: may set its own INT trap, which lasts until the command ends.
 function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data)
-  BRISH3_NONCE=
+  BRISH3_NONCE= BRISH3_INT=
   {
     repeat 1 do  # absorbs a bare break or continue
       if [[ $2 == 1 ]]; then
         if [[ $3 == data ]]; then
-          ( builtin set --; { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | builtin eval "$BRISH3_CMD" ) >&$__brish3_out 2>&$__brish3_err
+          ( function TRAPINT { builtin exit $(( 128 + $1 )) }; builtin set --; { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | builtin eval "$BRISH3_CMD" ) >&$__brish3_out 2>&$__brish3_err
         elif [[ $3 == null ]]; then
-          ( builtin set --; builtin eval "$BRISH3_CMD" ) </dev/null >&$__brish3_out 2>&$__brish3_err
+          ( function TRAPINT { builtin exit $(( 128 + $1 )) }; builtin set --; builtin eval "$BRISH3_CMD" ) </dev/null >&$__brish3_out 2>&$__brish3_err
         else
-          ( builtin set --; builtin eval "$BRISH3_CMD" ) <&$__brish3_empty >&$__brish3_out 2>&$__brish3_err
+          ( function TRAPINT { builtin exit $(( 128 + $1 )) }; builtin set --; builtin eval "$BRISH3_CMD" ) <&$__brish3_empty >&$__brish3_out 2>&$__brish3_err
         fi
       else
+        function TRAPINT {
+          if (( ${#funcstack} > 3 )); then
+            BRISH3_INT=$(( 128 + $1 ))
+            builtin return $BRISH3_INT
+          fi
+        }
         #: A function body lets the command `return`. `functions[...]=` would
         #: corrupt NUL and the bytes 0x83 to 0x9D, so the body goes through
         #: eval. `&&`: after a syntax error the old body must not run again.
@@ -145,11 +163,11 @@ function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data
       fi
     done
   } always {
-    #: Runs after normal completion, shell errors (NOMATCH and the like) and
-    #: err_return unwinding. While `exit` unwinds, $? is 0 here and the EXIT
-    #: trap reports the status instead.
-    BRISH3_RET=$? BRISH3_NONCE=$1
-    TRY_BLOCK_ERROR=0
+    #: Runs after normal completion, shell errors (NOMATCH and the like),
+    #: err_return unwinding and interrupts. While `exit` unwinds, $? is 0
+    #: here and the EXIT trap reports the status instead.
+    BRISH3_RET=${BRISH3_INT:-$?} BRISH3_NONCE=$1 TRY_BLOCK_ERROR=0 TRY_BLOCK_INTERRUPT=0
+    builtin trap '' INT
     builtin unsetopt err_exit err_return
   }
   builtin true  # a failing status must not reach the user's ZERR trap here
@@ -196,12 +214,16 @@ typeset -g brish_server_index
 for (( brish_server_index = 1; brish_server_index <= $#__brish3_specs; brish_server_index++ )); do
   (
     builtin trap 'brish3_on_exit $?' EXIT
+    builtin trap '' INT  # until a command runs; see brish3_run
     brish3_setup $brish_server_index
     brish3_serve
   ) &
   __brish3_pids+=( $! )
 done
 brish3_close_specs 0
+#: A terminal Ctrl-C reaches the whole process group. The bootstrap ignores
+#: it, and each worker aborts only its current command (see brish3_run).
+builtin trap '' INT
 
 function brish3_bootstrap_wait {
   builtin emulate -LR zsh

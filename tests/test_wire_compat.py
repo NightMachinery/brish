@@ -278,3 +278,58 @@ def test_a_dying_worker_leaves_the_others_alone(sources, python, real_env):
         real_env=real_env,
         timeout=180,
     )
+
+
+@pytest.mark.parametrize("python", ["original", "master", "tree"])
+def test_sigint_aborts_only_the_command(sources, python):
+    #: The intended difference: SIGINT to a worker (a terminal Ctrl-C, or
+    #: BrishPopen.kill) aborts the running command, which reports 130 as a
+    #: plain retcode line, and the worker lives on with its state. While idle
+    #: the worker ignores it. The original worker died instead.
+    check(
+        r"""
+        from tests.conftest import descendants
+        mod = {"original": lambda: original_on(TREE_FILE, "t"),
+               "master": lambda: master_on(TREE_FILE, "t"),
+               "tree": lambda: bm}[PY]()
+        kw = {"binary": False} if PY == "master" else {}
+        b = mod.Brish(server_count=2, **kw)
+        c = b.send_cmd
+        r = c("v=kept; zmodload zsh/system; print -r -- $sysparams[pid]", server_index=0)
+        pid = int(r.out)
+        assert pid > 1 and pid != b.p.pid, repr(r)
+        for cmd, stdin, fork in [
+            ("print -r before; sleep 100", "", False),
+            ("print -r before; while :; do :; done", "", False),
+            ("f() { while :; do :; done }; print -r before; f", "", False),
+            ("print -r before; sleep 100", "", True),
+            ("print -r before; cat >/dev/null; sleep 100", "in", False),
+            ("print -r before; while :; do :; done", "in", True),
+        ]:
+            got = {}
+            t = threading.Thread(target=lambda: got.update(r=c(cmd, cmd_stdin=stdin, fork=fork, server_index=0)))
+            t.start()
+            time.sleep(0.5)
+            pids = descendants(pid) + [pid]
+            print(f"[test] SIGINT {pids}", file=sys.stderr)
+            for x in pids:
+                os.kill(x, signal.SIGINT)
+            t.join(10)
+            assert not t.is_alive(), (PY, cmd)
+            r = got["r"]
+            assert (r.retcode, r.out, r.err) == (130, "before\n", ""), (PY, cmd, fork, repr(r))
+            r = c("print -r -- $v", server_index=0)
+            assert (r.retcode, r.out, r.err) == (0, "kept\n", ""), (PY, cmd, repr(r))
+        os.kill(pid, signal.SIGINT)  # idle
+        time.sleep(0.2)
+        for i in (0, 1):
+            r = c("print -r -- ${v-unset}", server_index=i)
+            assert (r.retcode, r.out) == (0, ("kept\n", "unset\n")[i]), (PY, repr(r))
+        r = c("zmodload zsh/system; print -r -- $sysparams[pid]", server_index=0)
+        assert int(r.out) == pid, (PY, repr(r))
+        b.cleanup()
+        """,
+        setup=LOADERS.format(sources=str(sources)) + f"PY = {python!r}\n",
+        env={"BRISH_BINARY": None},
+        timeout=90,
+    )

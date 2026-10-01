@@ -57,12 +57,13 @@ for brish_server_index in {1..${#stdins}} ; do
         #: fd 0 is the request FIFO. Commands never inherit it: they run with
         #: stdin redirected at the call site, so zsh keeps fd 0 in a private
         #: copy that it closes in every child process.
-        builtin typeset -g __brish2_inreq= __brish2_ret=0 __brish2_eof= __brish2_x=
+        builtin typeset -g __brish2_inreq= __brish2_ret=0 __brish2_eof= __brish2_x= __brish2_int=
         builtin typeset -g __brish2_level=$ZSH_SUBSHELL
         #: This worker's PID, from a child, so the worker itself does not
         #: load zsh/system.
         builtin typeset -g __brish2_pid=$(builtin zmodload zsh/system 2>/dev/null && builtin print -r -- ${sysparams[ppid]})
         builtin trap '__brish2_on_exit $?' EXIT
+        builtin trap '' INT  # until a command runs; see TRAPINT below
         #: An always-EOF pipe, opened once: the stdin of every command that
         #: gets no stdin, so such a command forks nothing.
         builtin typeset -g __brish2_empty=
@@ -88,8 +89,22 @@ for brish_server_index in {1..${#stdins}} ; do
                 #: set while POSIX_TRAPS was off, if a command turned it on and a
                 #: later command exits from inside a function.
                 builtin trap '__brish2_on_exit $?' EXIT
-                __brish2_inreq=1 __brish2_ret=
+                __brish2_inreq=1 __brish2_ret= __brish2_int=
                 {
+                    #: SIGINT is ignored while the worker is idle or framing,
+                    #: so that it never interrupts the worker's own reads and
+                    #: writes. While a command runs, a TRAPINT makes SIGINT act
+                    #: like an interactive Ctrl-C: returning 128+signal unwinds
+                    #: the command as interrupted. A fork command sets a trap in
+                    #: its subshell that exits with 128+signal. A non-fork
+                    #: command gets the worker's trap: `always` stops the
+                    #: unwinding (TRY_BLOCK_INTERRUPT=0), and the reply carries
+                    #: the status the trap records (returning through a
+                    #: function turns it into 1). The worker's trap acts only
+                    #: inside the command's function: at this level an
+                    #: interrupt would break every loop of the worker, which
+                    #: ends it, so here it is ignored. A command may set its
+                    #: own INT trap, which lasts until the command ends.
                     repeat 1 do  # absorbs a bare break or continue
                         #: Call-site redirections: `>&1 2>&2` also undo a
                         #: command's `exec >file`, which would hide the replies.
@@ -99,13 +114,19 @@ for brish_server_index in {1..${#stdins}} ; do
                         #: </dev/null so that it never holds the request FIFO.
                         if [[ -n $brish_fork ]]; then
                             if [[ -n $brish_stdin ]]; then
-                                ( { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | builtin eval "$cmd" ) </dev/null
+                                ( function TRAPINT { builtin exit $(( 128 + $1 )) }; { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | builtin eval "$cmd" ) </dev/null
                             else
                                 #: `true` first: the command starts with $? = 0,
                                 #: as it did in the original pipeline.
-                                ( builtin true; builtin eval "$cmd" ) <&$__brish2_empty
+                                ( function TRAPINT { builtin exit $(( 128 + $1 )) }; builtin true; builtin eval "$cmd" ) <&$__brish2_empty
                             fi
                         else
+                            function TRAPINT {
+                                if (( ${#funcstack} > 1 )); then
+                                    __brish2_int=$(( 128 + $1 ))
+                                    builtin return $__brish2_int
+                                fi
+                            }
                             #: Running the code wrapped in a function block lets it
                             #: use 'return'. `functions[tmp_block_8182782]="$cmd"`
                             #: would corrupt unicode characters (it does not
@@ -127,13 +148,13 @@ for brish_server_index in {1..${#stdins}} ; do
                     __brish2_ret=$?
                 } always {
                     #: Runs after normal completion, after shell errors (NOMATCH
-                    #: and the like), and when a `break N` or `continue N` from
-                    #: the command unwinds. `exit` skips it.
-                    __brish2_x=$?
+                    #: and the like), after an interrupt, and when a `break N`
+                    #: or `continue N` from the command unwinds. `exit` skips it.
+                    __brish2_x=${__brish2_int:-$?} TRY_BLOCK_ERROR=0 TRY_BLOCK_INTERRUPT=0
+                    builtin trap '' INT
                     if [[ -z $__brish2_ret ]]; then
                         __brish2_ret=$__brish2_x
                     fi
-                    TRY_BLOCK_ERROR=0
                     builtin unsetopt err_exit err_return
                 }
             done
@@ -177,8 +198,10 @@ function __brish2_reap {
   done
 }
 #: Set after the workers are forked, so they do not see the module or the
-#: traps. A reader that goes away must not kill the bootstrap with SIGPIPE.
-builtin trap '' PIPE
+#: traps. A reader that goes away must not kill the bootstrap with SIGPIPE,
+#: and a terminal Ctrl-C, which reaches the whole process group, must not
+#: kill it either (each worker aborts only its current command).
+builtin trap '' PIPE INT
 if builtin zmodload zsh/system 2>/dev/null; then
   builtin trap __brish2_reap CHLD
 fi
