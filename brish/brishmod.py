@@ -125,8 +125,9 @@ class CmdResult:
     """The result of one command.
 
     The five fields are text. `outb` and `errb` are the byte views: the exact
-    bytes the command wrote when the result came from `from_bytes` (as in
-    binary mode), and otherwise the text views encoded back as UTF-8.
+    bytes the command wrote when the result came from `from_bytes` (as every
+    result from a worker does, in both modes), and otherwise the text views
+    encoded back as UTF-8.
     """
 
     retcode: int
@@ -338,7 +339,7 @@ def _alive(pid):
 
 
 class _ErrReader:
-    """Reads one legacy stderr reply in a helper thread.
+    """Reads one legacy stderr reply (bytes) in a helper thread.
 
     If the reply never completes (an interrupt, or a dead worker whose stderr
     FIFO is still held open by a background job), the thread is left running
@@ -349,7 +350,7 @@ class _ErrReader:
     def __init__(self, f, delim):
         self.f = f
         self.delim = delim
-        self.text = ""
+        self.data = b""
         self.eof = False
         self.exc = None
         self.done = False
@@ -360,7 +361,7 @@ class _ErrReader:
 
     def _run(self):
         try:
-            self.text, self.eof = _legacy_read_reply(self.f, self.delim)
+            self.data, self.eof = _legacy_read_reply(self.f, self.delim)
         except BaseException as e:
             self.exc = e
         finally:
@@ -515,15 +516,22 @@ class _Worker:
                 pass
 
 
-def _legacy_read_reply(f, delim):
-    """Read lines until `delim`. Returns (text, eof)."""
+#: The legacy reply delimiter: a line holding only NUL (see docs/protocol.org).
+_LEGACY_DELIM = b"\0\n"
+
+
+def _legacy_read_reply(f, delim=_LEGACY_DELIM):
+    """Read lines from the binary file `f` until the line `delim`, and drop
+    the newline the worker writes before it. Lines end at b"\n" only, so CR
+    and every other byte are kept. Returns (bytes, eof)."""
     lines = []
+    readline = f.readline
     while True:
-        line = f.readline()
+        line = readline()
         if line == delim:
-            return "".join(lines)[:-1], False
-        if line == "":
-            return "".join(lines), True
+            return b"".join(lines)[:-1], False
+        if not line:
+            return b"".join(lines), True
         lines.append(line)
 
 
@@ -731,14 +739,11 @@ class Brish:
                         encoding=encoding,
                     )
                 )
+            #: Replies are read as bytes and decoded once, in CmdResult.from_bytes.
             for path in brish_stdout_paths:
-                p.brish_stdouts.append(
-                    open(path, "r", errors=decoding_errors, encoding=encoding)
-                )
+                p.brish_stdouts.append(open(path, "rb"))
             for path in brish_stderr_paths:
-                p.brish_stderrs.append(
-                    open(path, "r", errors=decoding_errors, encoding=encoding)
-                )
+                p.brish_stderrs.append(open(path, "rb"))
         except BaseException:
             self._cleanup_legacy(p)
             raise
@@ -1254,7 +1259,6 @@ class Brish:
         )
 
     def _legacy_transact(self, p, index, cmd_processed, cmd, cmd_stdin):
-        delim = self.MARKER + "\n"
         try:
             ##
             # trying to open the stdin as binary. It didn't work, idk why.
@@ -1272,20 +1276,20 @@ class Brish:
 
         #: Read stderr concurrently: a command that fills the stderr FIFO
         #: before finishing its stdout would otherwise deadlock.
-        err_reader = _ErrReader(p.brish_stderrs[index], delim)
+        err_reader = _ErrReader(p.brish_stderrs[index], _LEGACY_DELIM)
         p.err_readers[index] = err_reader
-        stdout, died = _legacy_read_reply(p.brish_stdouts[index], delim)
+        outb, died = _legacy_read_reply(p.brish_stdouts[index])
         return_code = None
         if not died:
             rc_line = p.brish_stdouts[index].readline()
-            if rc_line == "":
+            if not rc_line:
                 died = True
             else:
                 return_code = int(rc_line)
         err_reader.thread.join(2 if died else None)
         if err_reader.exc is not None:
             raise err_reader.exc
-        stderr = err_reader.text
+        errb = err_reader.data
         if err_reader.done:
             p.err_readers[index] = None
             died = died or err_reader.eof
@@ -1296,17 +1300,17 @@ class Brish:
             #: The caller restarts the instance before its next use.
             if return_code is None:
                 return_code = RETCODE_WORKER_DIED
-            return (
-                CmdResult(
-                    return_code,
-                    stdout,
-                    _with_note(stderr, WORKER_DIED_NOTE),
-                    cmd,
-                    cmd_stdin,
-                ),
-                True,
-            )
-        return CmdResult(return_code, stdout, stderr, cmd, cmd_stdin), False
+            errb = _with_note(errb.decode("latin-1"), WORKER_DIED_NOTE).encode("latin-1")
+        res = CmdResult.from_bytes(
+            return_code,
+            outb,
+            errb,
+            cmd,
+            cmd_stdin,
+            encoding=self.encoding,
+            errors=self.decoding_errors,
+        )
+        return res, died
 
     def cleanup(self):
         with self.lock:
