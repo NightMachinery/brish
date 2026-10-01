@@ -101,7 +101,9 @@ for brish_server_index in {1..${#stdins}} ; do
                             if [[ -n $brish_stdin ]]; then
                                 ( { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | builtin eval "$cmd" ) </dev/null
                             else
-                                ( builtin eval "$cmd" ) <&$__brish2_empty
+                                #: `true` first: the command starts with $? = 0,
+                                #: as it did in the original pipeline.
+                                ( builtin true; builtin eval "$cmd" ) <&$__brish2_empty
                             fi
                         else
                             #: Running the code wrapped in a function block lets it

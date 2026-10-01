@@ -29,6 +29,10 @@ RAW = [
     (b"false", b"", False, 0),
     (b"(exit 7)", b"", False, 0),
     (b"print -r -- $?", b"", False, 0),
+    (b"false", b"", False, 0),
+    (b"print -r -- $?", b"", True, 0),  # a fork starts with $? = 0
+    (b"false", b"", False, 0),
+    (b"print -r -- $?", b"x", True, 0),
     (b"return 3", b"", False, 0),
     (b"print -r -- before; return 4; print -r -- after", b"", False, 0),
     (b'print -r -- "$cmd"', b"", False, 0),
