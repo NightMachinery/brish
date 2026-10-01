@@ -334,6 +334,9 @@ def test_startup_files_cannot_break_the_worker(tmp_path):
             assert (r.retcode, r.out, r.err) == (0, f"{i + 1}\n", ""), repr(r)
         r = b.send_cmd("zz")
         assert r.out == "aliased\n", repr(r)
+        #: The argv reservation is kept, so tools can rewrite the process title.
+        r = b.send_cmd("zmodload zsh/system; command ps -ww -o command= -p $sysparams[pid]")
+        assert "BR" + "I" * 2048 + "SH" in r.out, r.out[:200]
         r = b.send_cmd("cat", cmd_stdin="in")
         assert r.out == "in", repr(r)
         r = b.send_cmd("\\builtin exit 4")
