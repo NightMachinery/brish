@@ -922,6 +922,8 @@ finally:
 
 So the retcode after a kill is 130 for a command that dies of the interrupt, the command's own status when it traps INT or when one of its processes was stopped by step 2 or 3 (143 or 137 for a fork command whose subshell is), and 9001 only when the worker had to go. Background jobs that earlier commands left running on that worker are below it too: step 1 does not affect them (they ignore SIGINT), but steps 2 to 4 stop them.
 
+Step 1 also works for a non-fork command that runs under =set -e=, =set -euo pipefail= or =emulate sh=: options with which zsh would exit instead of unwinding are turned off for the rest of the interrupted command (see [[file:docs/protocol.org][docs/protocol.org]], Interrupts). One case still costs the worker: =err_exit= set outside a function that the interrupt unwinds and that restores options on return, as in =set -e; f() { emulate -L zsh; sleep 100 }; f=. The retcode is then 9001, as in step 4. A command that resets INT to its default (=trap - INT=) dies of the signal with its worker too.
+
 ** Binary Data
 Brish has two transports. /Binary mode/ carries exact bytes in every direction. /Legacy mode/, the default, does too, except where its frozen wire format cannot: a NUL in a command or its stdin is refused with retcode 9000, and an output line that holds only a NUL ends the reply early (see Known Issues). Turn binary mode on per instance, or for a whole process with the env var =BRISH_BINARY= (read when each =Brish= is created, including the module-level =z=, =zp= and friends at import):
 

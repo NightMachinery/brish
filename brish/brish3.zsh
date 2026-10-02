@@ -12,7 +12,7 @@
 builtin zmodload zsh/system || builtin exit 70
 
 typeset -g BRISH3_NONCE= BRISH3_FORK=0 BRISH3_STDIN_MODE= BRISH3_INREQ= BRISH3_EOF=
-typeset -g BRISH3_CMD= BRISH3_RET=0 BRISH3_INT= brish_stdin= cmd=
+typeset -g BRISH3_CMD= BRISH3_RET=0 BRISH3_INT= BRISH3_PB= brish_stdin= cmd=
 typeset -g __brish3_req= __brish3_out= __brish3_err= __brish3_empty=
 typeset -g __brish3_nul= __brish3_nl= __brish3_startp= __brish3_endp=
 typeset -ga __brish3_specs __brish3_pids
@@ -129,7 +129,7 @@ function brish3_recv {
 #: brish3_serve); between the worker's own commands it is ignored. A command
 #: may set its own INT trap, which lasts until the command ends.
 function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data)
-  BRISH3_NONCE= BRISH3_INT=
+  BRISH3_NONCE= BRISH3_INT= BRISH3_PB=
   {
     repeat 1 do  # absorbs a bare break or continue
       if [[ $2 == 1 ]]; then
@@ -141,9 +141,22 @@ function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data
           ( function TRAPINT { builtin exit $(( 128 + $1 )) }; builtin set --; builtin eval "$BRISH3_CMD" ) <&$__brish3_empty >&$__brish3_out 2>&$__brish3_err
         fi
       else
+        #: The trap turns off the options that would make zsh exit the
+        #: worker instead of unwinding: err_exit and err_return, which
+        #: `always` turns off anyway, and posix_builtins (`emulate sh`), under
+        #: which an interrupt inside a special builtin such as `:` or `eval`
+        #: is fatal; `always` turns that back on when the change was global
+        #: (no local_options where the trap ran). Turning off local_options
+        #: keeps these changes when the trap returns into a function that set
+        #: it. `[@]`: the element count, also under ksh_arrays.
         function TRAPINT {
-          if (( ${#funcstack} > 3 )); then
+          if (( ${#funcstack[@]} > 3 )); then
             BRISH3_INT=$(( 128 + $1 ))
+            if [[ -o posix_builtins ]]; then
+              [[ -o local_options ]] || BRISH3_PB=1
+              builtin unsetopt posix_builtins
+            fi
+            builtin unsetopt local_options err_exit err_return
             builtin return $BRISH3_INT
           fi
         }
@@ -169,6 +182,9 @@ function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data
     BRISH3_RET=${BRISH3_INT:-$?} BRISH3_NONCE=$1 TRY_BLOCK_ERROR=0 TRY_BLOCK_INTERRUPT=0
     builtin trap '' INT
     builtin unsetopt err_exit err_return
+    if [[ -n $BRISH3_PB ]]; then
+      builtin setopt posix_builtins
+    fi
   }
   builtin true  # a failing status must not reach the user's ZERR trap here
 }

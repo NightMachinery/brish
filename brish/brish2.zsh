@@ -57,7 +57,7 @@ for brish_server_index in {1..${#stdins}} ; do
         #: fd 0 is the request FIFO. Commands never inherit it: they run with
         #: stdin redirected at the call site, so zsh keeps fd 0 in a private
         #: copy that it closes in every child process.
-        builtin typeset -g __brish2_inreq= __brish2_ret=0 __brish2_eof= __brish2_x= __brish2_int=
+        builtin typeset -g __brish2_inreq= __brish2_ret=0 __brish2_eof= __brish2_x= __brish2_int= __brish2_pb=
         builtin typeset -g __brish2_level=$ZSH_SUBSHELL
         #: This worker's PID, from a child, so the worker itself does not
         #: load zsh/system.
@@ -89,7 +89,7 @@ for brish_server_index in {1..${#stdins}} ; do
                 #: set while POSIX_TRAPS was off, if a command turned it on and a
                 #: later command exits from inside a function.
                 builtin trap '__brish2_on_exit $?' EXIT
-                __brish2_inreq=1 __brish2_ret= __brish2_int=
+                __brish2_inreq=1 __brish2_ret= __brish2_int= __brish2_pb=
                 {
                     #: SIGINT is ignored while the worker is idle or framing,
                     #: so that it never interrupts the worker's own reads and
@@ -121,9 +121,26 @@ for brish_server_index in {1..${#stdins}} ; do
                                 ( function TRAPINT { builtin exit $(( 128 + $1 )) }; builtin true; builtin eval "$cmd" ) <&$__brish2_empty
                             fi
                         else
+                            #: The trap turns off the options that would make zsh
+                            #: exit the worker instead of unwinding: err_exit
+                            #: and err_return (at this top level err_return acts
+                            #: as err_exit), which `always` turns off anyway, and
+                            #: posix_builtins (`emulate sh`), under which an
+                            #: interrupt inside a special builtin such as `:` or
+                            #: `eval` is fatal; `always` turns that back on when
+                            #: the change was global (no local_options where the
+                            #: trap ran). Turning off local_options keeps these
+                            #: changes when the trap returns into a function that
+                            #: set it. `[@]`: the element count, also under
+                            #: ksh_arrays.
                             function TRAPINT {
-                                if (( ${#funcstack} > 1 )); then
+                                if (( ${#funcstack[@]} > 1 )); then
                                     __brish2_int=$(( 128 + $1 ))
+                                    if [[ -o posix_builtins ]]; then
+                                        [[ -o local_options ]] || __brish2_pb=1
+                                        builtin unsetopt posix_builtins
+                                    fi
+                                    builtin unsetopt local_options err_exit err_return
                                     builtin return $__brish2_int
                                 fi
                             }
@@ -156,6 +173,9 @@ for brish_server_index in {1..${#stdins}} ; do
                         __brish2_ret=$__brish2_x
                     fi
                     builtin unsetopt err_exit err_return
+                    if [[ -n $__brish2_pb ]]; then
+                        builtin setopt posix_builtins
+                    fi
                 }
             done
             if [[ -z $__brish2_inreq ]]; then

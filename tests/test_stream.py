@@ -233,6 +233,53 @@ def test_kill_an_in_shell_loop_and_a_fork():
     )
 
 
+def test_kill_under_errexit_and_sh_emulation():
+    #: zsh exits instead of unwinding when an interrupt meets err_exit (or
+    #: err_return at the legacy worker's top level), or a special builtin
+    #: under posix_builtins (`emulate sh`). The worker's trap turns those off,
+    #: so the worker survives with its state; options that the command set
+    #: globally stay as it left them.
+    run(
+        r'''
+        b = Brish(server_count=1)
+        opts = "${options[errexit]} ${options[errreturn]} ${options[posixbuiltins]} ${options[ksharrays]}"
+        cases = [
+            ("set -e; print -r x; sleep 100", "off off off off"),
+            ("set -euo pipefail; print -r x; sleep 100", "off off off off"),
+            ("setopt err_return; print -r x; sleep 100", "off off off off"),
+            ("set -e; print -r x; while :; do :; done", "off off off off"),
+            ("f() { emulate -L zsh; setopt err_exit; print -r x; sleep 100 }; f", "off off off off"),
+            ("f() { emulate -L sh; print -r x; while :; do :; done }; f", "off off off off"),
+            ("emulate sh; print -r x; eval 'while :; do :; done'", "off off on on"),
+        ]
+        #: The sh cases die only when the signal lands inside a special
+        #: builtin, so they run several times.
+        cases += [("emulate sh; set -e; print -r x; while :; do :; done", "off off on on")] * 4
+        for cmd, want_opts in cases:
+            b.send_cmd("emulate zsh; v=kept")
+            with b.popen(cmd) as p:
+                kill_later(p, 0.3)
+                evs = collect(p)
+            assert (p.retcode, joined(evs), joined(evs, "err")) == (130, b"x\n", b""), (cmd, p.retcode, evs)
+            r = b.send_cmd("print -r -- ok-$v " + opts)
+            assert r.out == f"ok-kept {want_opts}\n", (cmd, r)
+        b.send_cmd("emulate zsh")
+        #: A terminal-style Ctrl-C (the whole process group) during send_cmd.
+        signal.signal(signal.SIGINT, lambda *a: None)
+        got = {}
+        t = threading.Thread(target=lambda: got.update(r=b.send_cmd("set -e; print -r x; sleep 100; print -r after")))
+        t.start()
+        time.sleep(0.5)
+        os.killpg(os.getpgrp(), signal.SIGINT)
+        t.join(10)
+        assert (got["r"].retcode, got["r"].out) == (130, "x\n"), got
+        same_server_ok(b, 0)
+        b.cleanup()
+        ''',
+        timeout=120,
+    )
+
+
 def test_kill_with_a_user_int_trap():
     run(
         r'''
