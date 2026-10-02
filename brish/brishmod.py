@@ -764,8 +764,12 @@ class _LegacyStreamReader:
 
 
 def _legacy_busy(p, index):
-    """Whether a helper thread of an abandoned reply still reads one of
-    legacy worker `index`'s reply FIFOs."""
+    """Whether legacy worker `index` cannot take a request: a reply on it was
+    abandoned (see Brish._legacy_abandon), or a helper thread of such a reply
+    still reads one of its reply FIFOs."""
+    stale = getattr(p, "legacy_stale", None)
+    if stale and stale[index]:
+        return True
     for readers in (p.err_readers, getattr(p, "out_readers", None)):
         if readers:
             r = readers[index]
@@ -857,10 +861,18 @@ class BrishPopen:
             start = self._start_legacy
         for attempt in range(2):
             lock, index, p = b._acquire(server_index, lock_sleep)
-            p.free_server_count -= 1
-            self._lock, self.server_index, self._p = lock, index, p
-            self._released = False
-            if start(p, index, cmd_b, stdin_b, fork) is not _NEVER_RAN:
+            try:
+                self._lock, self.server_index, self._p = lock, index, p
+                self._released = False
+                p.free_server_count -= 1
+                outcome = start(p, index, cmd_b, stdin_b, fork)
+            except BaseException:
+                #: An interrupt while starting (the start methods leave the
+                #: worker resynchronisable or due for a restart) must not
+                #: leak the worker lock.
+                self._release()
+                raise
+            if outcome is not _NEVER_RAN:
                 return
             self._release()
             b._never_ran(p, index)
@@ -925,19 +937,8 @@ class BrishPopen:
         then the lock is still held."""
         b = self._brish
         if p.legacy_pids[index] is None:
-            outcome = b._legacy_transact(
-                p, index, _LEGACY_PID_CMD + b"\0\0\0\n", _LEGACY_PID_CMD, ""
-            )
-            if outcome is _NEVER_RAN:
+            if self._learn_legacy_pid(p, index) is _NEVER_RAN:
                 return _NEVER_RAN
-            res, restart = outcome
-            if restart:
-                b._request_restart(p.gen)
-                return _NEVER_RAN
-            found = _LEGACY_PID_RE.findall(res.outb)
-            #: Only a child of this instance's bootstrap is ever signalled.
-            if found and int(found[-1]) in _child_pids(p.pid):
-                p.legacy_pids[index] = int(found[-1])
         self._worker_pid = p.legacy_pids[index]
         if _legacy_busy(p, index):
             return _NEVER_RAN
@@ -949,18 +950,48 @@ class BrishPopen:
         except BrokenPipeError:
             return _NEVER_RAN
         except BaseException:
-            p.interrupted = True
-            b._request_restart(p.gen)
-            self._release()
+            b._legacy_abandon(p, index)
             raise
-        #: A bounded queue: when the caller stops reading, the readers stop,
-        #: the FIFOs fill up and the command blocks.
-        self._q = queue.Queue(maxsize=16)
-        self._rout = _LegacyStreamReader(p.brish_stdouts[index], "out", True, self._q)
-        self._rerr = _LegacyStreamReader(p.brish_stderrs[index], "err", False, self._q)
-        p.out_readers[index] = self._rout
-        p.err_readers[index] = self._rerr
+        try:
+            #: A bounded queue: when the caller stops reading, the readers
+            #: stop, the FIFOs fill up and the command blocks.
+            self._q = queue.Queue(maxsize=16)
+            self._rout = _LegacyStreamReader(p.brish_stdouts[index], "out", True, self._q)
+            self._rerr = _LegacyStreamReader(p.brish_stderrs[index], "err", False, self._q)
+            p.out_readers[index] = self._rout
+            p.err_readers[index] = self._rerr
+        except BaseException:
+            b._legacy_abandon(p, index)
+            raise
         self._pump = self._pump_legacy
+        return None
+
+    def _learn_legacy_pid(self, p, index):
+        """Ask legacy worker `index` for its PID, once per generation (see
+        _LEGACY_PID_CMD). Returns _NEVER_RAN if the worker could not answer.
+        An interrupt while the request is in flight leaves its reply unread,
+        so the worker is given up (Brish._legacy_abandon)."""
+        b = self._brish
+        complete = False
+        try:
+            outcome = b._legacy_transact(
+                p, index, _LEGACY_PID_CMD + b"\0\0\0\n", _LEGACY_PID_CMD, ""
+            )
+            complete = True
+            if outcome is _NEVER_RAN:
+                return _NEVER_RAN
+            res, restart = outcome
+            if restart:
+                b._request_restart(p.gen)
+                return _NEVER_RAN
+            found = _LEGACY_PID_RE.findall(res.outb)
+            #: Only a child of this instance's bootstrap is ever signalled.
+            if found and int(found[-1]) in _child_pids(p.pid):
+                p.legacy_pids[index] = int(found[-1])
+        except BaseException:
+            if not complete:
+                b._legacy_abandon(p, index)
+            raise
         return None
 
     # Reading
@@ -1124,7 +1155,10 @@ class BrishPopen:
             p.err_readers[index] = None
         if died:
             #: Readers that are still running keep their files (cleanup hands
-            #: them over), and the instance restarts before its next use.
+            #: them over). The worker is gone, or out of sync after a forged
+            #: delimiter, so it takes no more requests, and the instance
+            #: restarts before its next use.
+            self._brish._legacy_abandon(p, index)
             for r in (rout, rerr):
                 if not r.done:
                     r.abandoned = True
@@ -1177,39 +1211,42 @@ class BrishPopen:
         """Give the worker up without waiting for the reply: after an
         exception while reading, or when the object is collected unclosed.
         The command is interrupted; binary mode skips the rest of its reply
-        on the next request (a stale worker), legacy mode restarts."""
+        on the next request (a stale worker), legacy mode restarts. The lock
+        is released even if this is interrupted itself."""
         if self._released:
             return
-        pid = self._worker_pid
-        try:
-            pids = _descendants(pid) if pid else []
-        except BaseException:
-            pids = []
-        with self._mu:
-            already = self._finished
-            self._finished = True
-            if not already:
-                _signal_pids(pids, signal.SIGINT)
-                if pid:
-                    _signal_pids([pid], signal.SIGINT)
         p = self._p
-        if p.binary:
-            self._unregister_write()
-            if already:
-                restart = False
-            elif self._sent >= self._total:
-                self._w.stale = True
-                restart = False
-            else:
-                restart = True
-        else:
-            restart = not already
-            if restart:
-                p.interrupted = True
-                for r in (self._rout, self._rerr):
-                    if not r.done:
+        already = self._finished
+        try:
+            pid = self._worker_pid
+            try:
+                pids = _descendants(pid) if pid else []
+            except BaseException:
+                pids = []
+            with self._mu:
+                already = self._finished
+                self._finished = True
+                if not already:
+                    _signal_pids(pids, signal.SIGINT)
+                    if pid:
+                        _signal_pids([pid], signal.SIGINT)
+        finally:
+            restart = False
+            if p.binary:
+                if getattr(self, "_w", None) is not None:
+                    self._unregister_write()
+                    if already:
+                        pass
+                    elif self._sent >= self._total:
+                        self._w.stale = True
+                    else:
+                        restart = True
+            elif not already:
+                for r in (getattr(self, "_rout", None), getattr(self, "_rerr", None)):
+                    if r is not None and not r.done:
                         r.abandoned = True
-        self._release(restart)
+                self._brish._legacy_abandon(p, self.server_index)
+            self._release(restart)
 
     def _check_owner(self):
         if threading.get_ident() != self._owner:
@@ -1571,6 +1608,8 @@ class Brish:
         #: _LegacyStreamReader), and each worker's PID, learned on demand.
         p.out_readers = [None] * server_count
         p.legacy_pids = [None] * server_count
+        #: Workers whose reply was abandoned (see _legacy_abandon).
+        p.legacy_stale = [False] * server_count
         try:
             BRISH_STDIN = "\n".join(brish_stdin_paths)
             BRISH_STDOUT = "\n".join(brish_stdout_paths)
@@ -1766,8 +1805,8 @@ class Brish:
         if self._holds_worker_lock():
             self._request_restart(p.gen)
             raise BrishWorkerDiedException(
-                f"worker {index} cannot take a command (it died, or an abandoned reply is "
-                "still being read), and this thread holds a worker lock, so the instance "
+                f"worker {index} cannot take a command (it died, or a reply on it was "
+                "abandoned), and this thread holds a worker lock, so the instance "
                 "cannot restart now; release the lock (it restarts before its next use)"
             )
         self._restart_now(p.gen)
@@ -2182,8 +2221,7 @@ class Brish:
                 #: An interrupt leaves a half-written request or a half-read
                 #: reply, and possibly a helper thread that would consume the
                 #: next reply's stderr. Restart before the next use.
-                p.interrupted = True
-                self._request_restart(p.gen)
+                self._legacy_abandon(p, index)
                 raise
             finally:
                 p.free_server_count += 1
@@ -2200,6 +2238,16 @@ class Brish:
         raise BrishWorkerDiedException(
             "a worker died before running the command, twice"
         )
+
+    def _legacy_abandon(self, p, index):
+        """A request to legacy worker `index` was cut short, or its reply was
+        left half-read. The frozen wire has no marker to resynchronise on, so
+        no request may reach that worker again in this generation (even from
+        a thread that holds its lock: it gets BrishWorkerDiedException), and
+        the instance restarts before its next use."""
+        p.interrupted = True
+        p.legacy_stale[index] = True
+        self._request_restart(p.gen)
 
     def _legacy_transact(self, p, index, frame, cmd, cmd_stdin):
         """One request/reply exchange with legacy worker `index`.

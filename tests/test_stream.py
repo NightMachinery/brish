@@ -589,3 +589,70 @@ def test_legacy_pid_survives_background_output():
         '''
     )
 
+
+@legacy_only
+def test_legacy_interrupt_while_learning_the_pid():
+    #: An interrupt during the first popen's internal PID request (injected
+    #: here; a Ctrl-C in the main thread in real life) must not leak the
+    #: worker lock, and a reply it leaves unread must never be read as the
+    #: answer to a later request, also not by a thread that holds the lock.
+    run(
+        r'''
+        b = Brish(server_count=2)
+        def lock_free(i):
+            got = []
+            def other():
+                ok = b.locks[i].acquire(timeout=2)
+                if ok:
+                    b.locks[i].release()
+                got.append(ok)
+            t = threading.Thread(target=other)
+            t.start()
+            t.join()
+            return got == [True]
+        b.send_cmd("v=kept", server_index=0)
+        #: 1. After the reply was read (in the ps call that checks the PID).
+        real_child_pids = bm._child_pids
+        def in_ps(pid):
+            raise KeyboardInterrupt("in ps")
+        bm._child_pids = in_ps
+        try:
+            b.popen("print -r x", server_index=0)
+            raise SystemExit("no KeyboardInterrupt")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            bm._child_pids = real_child_pids
+        assert lock_free(0) and not b._holds_worker_lock(), b.locks
+        assert b.p.free_server_count == 2, b.p.free_server_count
+        #: The reply was complete: the worker is in sync and keeps its state.
+        assert b.send_cmd("print -r -- ok-$v", server_index=0).out == "ok-kept\n"
+        #: 2. While the PID reply is read, under the caller's own lock.
+        real_read = bm._legacy_read_reply
+        def in_read(f, with_rc=False):
+            if with_rc:
+                raise KeyboardInterrupt("in read")
+            return real_read(f, with_rc)
+        lock, _ = b.acquire_lock(server_index=0)
+        try:
+            bm._legacy_read_reply = in_read
+            try:
+                b.popen("print -r y", server_index=0)
+                raise SystemExit("no KeyboardInterrupt")
+            except KeyboardInterrupt:
+                pass
+            finally:
+                bm._legacy_read_reply = real_read
+            try:
+                r = b.send_cmd("print -r z", server_index=0)
+                raise SystemExit(f"the out-of-sync worker answered: {r!r}")
+            except bm.BrishWorkerDiedException as e:
+                assert "abandoned" in str(e), e
+        finally:
+            lock.release()
+        assert lock_free(0) and not b._holds_worker_lock(), b.locks
+        r = b.send_cmd("print -r -- ok-${v-unset}", server_index=0)
+        assert r.out == "ok-unset\n", repr(r)  # the instance restarted
+        b.cleanup()
+        '''
+    )
