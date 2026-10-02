@@ -724,3 +724,61 @@ def test_same_thread_calls_skip_a_streaming_worker():
         b.cleanup()
         '''
     )
+
+
+def test_kill_goes_by_the_command_not_the_reader():
+    #: A reader that takes long over each chunk (a chat bot that edits a
+    #: message per chunk, say) must not make kill() escalate past a command
+    #: that ended at the first SIGINT, and must not keep one that ignores the
+    #: signals from being stopped.
+    run(
+        r'''
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        for cmd in ("integer i; while :; do print -r -- line $((i++)); done", "yes"):
+            t0 = time.monotonic()
+            with b.popen(cmd) as p:
+                p.kill_grace = 0.5
+                kill_later(p, 0.3)
+                n = 0
+                for s, c in p:
+                    n += 1
+                    if time.monotonic() - t0 > 0.3:
+                        time.sleep(0.2)
+            dt = time.monotonic() - t0
+            #: Before, the slow reader made each step look ignored: stage 4,
+            #: and in legacy mode a SIGKILLed worker.
+            assert (p.retcode, p._stage) == (130, 1), (cmd, p.retcode, p._stage, n, dt)
+            same_server_ok(b, 0)
+        #: Ignores INT and TERM and floods: still stopped, with a slow reader.
+        t0 = time.monotonic()
+        with b.popen("trap '' INT TERM; while :; do print -r -- 0123456789abcdef; done") as p:
+            p.kill_grace = 0.5
+            kill_later(p, 0.3)
+            evs = []
+            for s, c in p:
+                evs.append((s, c))
+                if time.monotonic() - t0 > 0.3:
+                    time.sleep(0.1)
+                assert time.monotonic() - t0 < 40, "never stopped"
+        assert (p.retcode, p._stage) == (9001, 4), (p.retcode, p._stage)
+        assert joined([(0,) + e for e in evs], "err").endswith(
+            bm.WORKER_DIED_NOTE.encode() + b"\n"), evs[-3:]
+        r = b.send_cmd("print -r -- ok-${v-unset}")
+        assert r.out == "ok-unset\n", repr(r)  # restarted
+        #: Once step 4 is taken, the result says the worker died, also when
+        #: the reply came anyway (white box: the step is only recorded).
+        b.send_cmd("v=kept")
+        with b.popen("sleep 0.3; print -r done") as p:
+            with p._mu:
+                p._stage = 4
+            evs = collect(p)
+        assert p.retcode == 9001, (p.retcode, evs)
+        assert joined(evs) == b"done\n", evs
+        assert joined(evs, "err").endswith(bm.WORKER_DIED_NOTE.encode() + b"\n"), evs
+        r = b.send_cmd("print -r -- ok-${v-unset}")
+        assert r.out == "ok-unset\n", repr(r)  # restarted
+        b.cleanup()
+        ''',
+        timeout=120,
+    )

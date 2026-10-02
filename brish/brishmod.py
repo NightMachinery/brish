@@ -30,7 +30,6 @@ import selectors
 import secrets
 import re
 import tempfile
-import queue
 import collections
 from collections.abc import Iterable
 from typing import Union, Any
@@ -693,9 +692,99 @@ class _Abandoned(Exception):
     pass
 
 
+#: How far the legacy reader threads may run ahead of the caller: at most
+#: this many chunks and bytes are queued. A reader that finds the queue at
+#: its chunk limit appends to the last chunk instead, up to _MERGE_MAX bytes,
+#: so a caller that falls behind gets fewer, larger chunks (as a pipe would
+#: give them) and the bytes, not the chunk count, stop the readers. The
+#: chunks that BrishPopen holds for the caller are merged the same way.
+_QUEUE_CHUNKS = 4
+_LEGACY_QUEUE_BYTES = 65536
+_MERGE_MAX = 65536
+#: Once kill() has sent its first signal, Brish reads up to this many bytes
+#: more ahead of the caller, in both modes, so that it sees the command end
+#: however slowly the caller reads (see BrishPopen._kill_step).
+_KILL_READ_AHEAD = 256 * 1024
+#: More than the pipes can hold: output read after a step's signal beyond
+#: this was written after the signal.
+_PIPE_SLACK = 128 * 1024
+
+
+class _ChunkQueue:
+    """The queue between the legacy reader threads and BrishPopen: when the
+    caller stops reading, the readers stop, the FIFOs fill up and the
+    command blocks. Bounded in chunks and in bytes (see _QUEUE_CHUNKS);
+    kill() raises the byte bound (see BrishPopen._kill_step)."""
+
+    def __init__(self, chunks, limit):
+        self.chunks = chunks
+        self.limit = limit
+        self.size = 0
+        #: [stream, [parts], nbytes], or [None, None, 0] at the end.
+        self.items = collections.deque()
+        self.cond = threading.Condition(Lock())
+        #: Readers waiting for room.
+        self.waiting = 0
+
+    def put(self, stream, payload, abandoned):
+        """Queue `payload`, waiting while there is no room. An empty queue
+        takes any payload. Returns False, without queueing, once
+        `abandoned()` is true."""
+        n = len(payload)
+        items = self.items
+        with self.cond:
+            while True:
+                if not items or self.size + n <= self.limit:
+                    if not items or len(items) < self.chunks:
+                        items.append([stream, [payload], n])
+                        break
+                    last = items[-1]
+                    if last[0] == stream and last[2] + n <= _MERGE_MAX:
+                        last[1].append(payload)
+                        last[2] += n
+                        break
+                if abandoned():
+                    return False
+                self.waiting += 1
+                try:
+                    self.cond.wait(_POLL)
+                finally:
+                    self.waiting -= 1
+            self.size += n
+            self.cond.notify_all()
+        return True
+
+    def put_end(self):
+        """Queue the end-of-stream item (None, None), which never waits."""
+        with self.cond:
+            self.items.append([None, None, 0])
+            self.cond.notify_all()
+
+    def get(self, timeout=0):
+        """The next (stream, chunk), or None after `timeout` seconds without
+        one."""
+        with self.cond:
+            if not self.items and timeout > 0:
+                self.cond.wait_for(lambda: self.items, timeout)
+            if not self.items:
+                return None
+            stream, parts, n = self.items.popleft()
+            self.size -= n
+            self.cond.notify_all()
+        if stream is None:
+            return (None, None)
+        return (stream, parts[0] if len(parts) == 1 else b"".join(parts))
+
+    def raise_limit(self, limit):
+        with self.cond:
+            if limit > self.limit:
+                self.limit = limit
+                self.cond.notify_all()
+
+
 class _LegacyStreamReader:
     """Reads one legacy reply stream for BrishPopen in a helper thread and
-    puts (stream, payload) items on a bounded queue, so a reader that stops
+    puts (stream, payload) items on a _ChunkQueue, so a reader that stops
     reading stops the command too. kqueue and poll are unreliable on FIFOs
     on macOS, hence the thread. Like _ErrReader, it owns the file while it
     runs: cleanup() hands the file over instead of closing it under a
@@ -712,6 +801,10 @@ class _LegacyStreamReader:
         self.done = False
         self.abandoned = False
         self.close_when_done = False
+        #: When the FIFO last gave bytes, and how many it gave in all (see
+        #: BrishPopen._kill_step).
+        self.last_read = time.monotonic()
+        self.nread = 0
         self._lock = Lock()
         self.thread = threading.Thread(
             target=self._run, daemon=True, name=f"brish-popen-{stream}"
@@ -719,13 +812,8 @@ class _LegacyStreamReader:
         self.thread.start()
 
     def _put(self, item):
-        while True:
-            try:
-                self.q.put(item, timeout=_POLL)
-                return
-            except queue.Full:
-                if self.abandoned:
-                    raise _Abandoned
+        if not self.q.put(item[0], item[1], lambda: self.abandoned):
+            raise _Abandoned
 
     def _run(self):
         try:
@@ -740,8 +828,10 @@ class _LegacyStreamReader:
                     if tail:
                         self._put((self.stream, tail))
                     break
+                self.last_read = time.monotonic()
                 payload, used = parser.feed(buf)
                 f.read(used)
+                self.nread += used
                 if payload:
                     self._put((self.stream, payload))
         except _Abandoned:
@@ -757,10 +847,7 @@ class _LegacyStreamReader:
                     self.f.close()
                 except Exception:
                     pass
-            try:
-                self.q.put_nowait((None, None))  # wakes the reader up
-            except queue.Full:
-                pass
+            self.q.put_end()  # wakes the reader up
 
     def close_or_hand_over(self):
         self.abandoned = True
@@ -831,6 +918,12 @@ class BrishPopen:
         self._stage = 0  # 0: not killed; 1: SIGINT; 2: SIGTERM; 3, 4: SIGKILL
         self._stage_t = 0.0
         self._pending = collections.deque()
+        self._pending_bytes = 0
+        #: Set once kill() has sent its first signal; then Brish reads
+        #: ahead. _step_nread: the bytes read when the last step was taken.
+        self._ahead = False
+        self._nread = 0  # binary mode; legacy readers count their own
+        self._step_nread = 0
         self._buffer = ([], []) if buffer else None
         self._result = None
         self._err_nl = True  # the err stream so far is empty or ends in a newline
@@ -892,9 +985,9 @@ class BrishPopen:
 
     def _finish_without_worker(self, retcode, outb, errb):
         if outb:
-            self._pending.append(("out", outb))
+            self._push("out", outb)
         if errb:
-            self._pending.append(("err", errb))
+            self._push("err", errb)
         self._finished = True
         self.retcode = retcode
 
@@ -940,6 +1033,7 @@ class BrishPopen:
         if self._died and not (self._so.started or self._se.started):
             self._unregister_write()
             self._pending.clear()
+            self._pending_bytes = 0
             return _NEVER_RAN
         return None
 
@@ -965,9 +1059,7 @@ class BrishPopen:
             b._legacy_abandon(p, index)
             raise
         try:
-            #: A bounded queue: when the caller stops reading, the readers
-            #: stop, the FIFOs fill up and the command blocks.
-            self._q = queue.Queue(maxsize=16)
+            self._q = _ChunkQueue(_QUEUE_CHUNKS, _LEGACY_QUEUE_BYTES)
             self._rout = _LegacyStreamReader(p.brish_stdouts[index], "out", True, self._q)
             self._rerr = _LegacyStreamReader(p.brish_stderrs[index], "err", False, self._q)
             p.out_readers[index] = self._rout
@@ -1043,9 +1135,10 @@ class BrishPopen:
             if not chunk:
                 self._binary_died()
                 return True
+            self._nread += len(chunk)
             out = st.feed(chunk)
             if out:
-                self._pending.append((name, out))
+                self._push(name, out)
         if self._so.done and self._se.done and not self._finished:
             retcode, exited = _parse_trailer(self._so.trailer)
             self._w.stale = False
@@ -1077,10 +1170,10 @@ class BrishPopen:
                     break
                 out = st.feed(chunk)
                 if out:
-                    self._pending.append((name, out))
+                    self._push(name, out)
             out = st.flush()
             if out:
-                self._pending.append((name, out))
+                self._push(name, out)
         if not (self._so.started or self._se.started):
             return  # it never ran: _start_binary handles that
         if self._so.done:
@@ -1096,12 +1189,9 @@ class BrishPopen:
     def _pump_legacy(self, timeout):
         """Take what the reader threads have read. Returns whether anything
         was read."""
-        try:
-            item = self._q.get(timeout=timeout) if timeout > 0 else self._q.get_nowait()
-        except queue.Empty:
-            item = None
+        item = self._q.get(timeout)
         if item is not None and item[0] is not None:
-            self._pending.append(item)
+            self._push(*item)
             self._last_io = time.monotonic()
             return True
         rout, rerr = self._rout, self._rerr
@@ -1130,12 +1220,11 @@ class BrishPopen:
 
     def _legacy_drain_queue(self):
         while True:
-            try:
-                item = self._q.get_nowait()
-            except queue.Empty:
+            item = self._q.get()
+            if item is None:
                 return
             if item[0] is not None:
-                self._pending.append(item)
+                self._push(*item)
 
     def _legacy_rc(self):
         """(retcode, died, exited) from the stdout reader, which is done."""
@@ -1190,15 +1279,35 @@ class BrishPopen:
 
     # Finishing
 
+    def _push(self, name, chunk):
+        pending = self._pending
+        self._pending_bytes += len(chunk)
+        if len(pending) >= _QUEUE_CHUNKS:
+            last_name, last = pending[-1]
+            if last_name == name and len(last) + len(chunk) <= _MERGE_MAX:
+                if not isinstance(last, bytearray):
+                    last = bytearray(last)
+                    pending[-1] = (name, last)
+                last += chunk
+                return
+        pending.append((name, chunk))
+
     def _finish(self, retcode, restart=False, note=False):
         with self._mu:
             self._finished = True
+            #: Step 4 SIGKILLed the worker (perhaps only after the command
+            #: had ended): its state is gone, whatever the reply says.
+            killed = self._stage >= 4
+            if killed:
+                retcode, restart, note = RETCODE_WORKER_DIED, True, True
             self.retcode = retcode
+        if killed and not self._p.binary:
+            self._brish._legacy_abandon(self._p, self.server_index)
         if note:
             msg = (WORKER_DIED_NOTE + "\n").encode()
             if not self._err_nl_after_pending():
                 msg = b"\n" + msg
-            self._pending.append(("err", msg))
+            self._push("err", msg)
         self._release(restart)
 
     def _err_nl_after_pending(self):
@@ -1272,8 +1381,17 @@ class BrishPopen:
         """The next (stream, chunk), or None once the output is complete."""
         self._check_owner()
         while True:
+            if self._stage and not self._finished:
+                try:
+                    self._kill_step()
+                except BaseException:
+                    self._abandon()
+                    raise
             if self._pending:
                 ev = self._pending.popleft()
+                self._pending_bytes -= len(ev[1])
+                if isinstance(ev[1], bytearray):
+                    ev = (ev[0], bytes(ev[1]))
                 if ev[0] == "err":
                     self._err_nl = ev[1].endswith(b"\n")
                 if self._buffer is not None:
@@ -1290,16 +1408,76 @@ class BrishPopen:
     def _step(self):
         timeout = _POLL
         if self._stage:
+            #: Wake up for the next step; past it, while output still
+            #: flows, check again every 50 ms.
+            left = self._stage_t + self.kill_grace - time.monotonic()
+            timeout = min(timeout, left if left > 0 else 0.05)
+        self._pump(timeout)
+
+    def _kill_step(self):
+        """After kill(), on every read: notice that the command has ended, or
+        take the next step when it is due. Both go by what the command does,
+        not by how fast the caller reads: once the first signal is out, Brish
+        reads up to _KILL_READ_AHEAD bytes ahead of the caller, so it sees
+        the end of the reply early."""
+        if self._p.binary:
+            if self._ahead:
+                for _ in range(64):
+                    if self._finished or self._pending_bytes >= _KILL_READ_AHEAD:
+                        break
+                    if not self._pump_binary(0):
+                        break
+        elif self._rout.done and self._rerr.done:
+            self._legacy_drain_queue()
+            self._legacy_complete()
+        if self._finished:
+            return
+        with self._mu:
+            if not self._ahead:
+                return  # the first signal is not out yet
             due = self._stage_t + self.kill_grace
-            timeout = max(0.0, min(timeout, due - time.monotonic()))
-        got = self._pump(timeout)
-        if self._stage and not self._finished:
-            now = time.monotonic()
-            due = self._stage_t + self.kill_grace
-            #: Escalate once the pipes are drained, or a grace later if output
-            #: keeps coming (a command that ignores the signal and prints).
-            if now >= due and (not got or now >= due + self.kill_grace):
-                self._escalate()
+            since = self._nread_total() - self._step_nread
+        now = time.monotonic()
+        if now < due:
+            return
+        if self._blocked():
+            #: Brish is as far ahead of the caller as it reads, so the end of
+            #: the reply may be waiting behind the caller. Go on only once
+            #: the command has visibly written since the last step.
+            if since <= _PIPE_SLACK:
+                return
+            flows = True
+        else:
+            flows = self._output_flows(now)
+        #: The next step comes once the command is quiet, or a grace later if
+        #: its output keeps coming (it ignores the signal and prints).
+        if not flows or now >= due + self.kill_grace:
+            self._escalate()
+
+    def _nread_total(self):
+        if self._p.binary:
+            return self._nread
+        return self._rout.nread + self._rerr.nread
+
+    def _blocked(self):
+        """Whether reading ahead has stopped because the caller is behind."""
+        if self._p.binary:
+            return self._pending_bytes >= _KILL_READ_AHEAD
+        return self._q.waiting > 0
+
+    def _output_flows(self, now):
+        """Whether the command wrote within the last _POLL seconds."""
+        if self._p.binary:
+            return now - self._last_io < _POLL
+        return any(now - r.last_read < _POLL for r in (self._rout, self._rerr) if not r.done)
+
+    def _signalled(self):
+        """A step's signal is out (under _mu)."""
+        self._step_nread = self._nread_total()
+        if not self._ahead:
+            self._ahead = True
+            if not self._p.binary:
+                self._q.raise_limit(_LEGACY_QUEUE_BYTES + _KILL_READ_AHEAD)
 
     def _escalate(self):
         pid = self._worker_pid
@@ -1324,6 +1502,7 @@ class BrishPopen:
                     #: the worker (the worker itself ignores the signals).
                     self._stage = 4
                     _signal_pids(pids + ([pid] if pid else []), signal.SIGKILL)
+                self._signalled()
             return
         #: The worker was killed a grace ago and its death went unnoticed
         #: (or its PID is unknown): stop waiting for it.
@@ -1344,8 +1523,8 @@ class BrishPopen:
         with self._mu:
             if self._finished or self._stage:
                 return
-            self._stage = 1
             self._stage_t = time.monotonic()
+            self._stage = 1
             delay = max(0.0, getattr(self, "_started_at", 0.0) + _KILL_SETTLE - self._stage_t)
         threading.Thread(
             target=self._interrupt, args=(delay,), daemon=True, name="brish-popen-kill"
@@ -1364,6 +1543,7 @@ class BrishPopen:
             _signal_pids(pids, signal.SIGINT)
             if pid:
                 _signal_pids([pid], signal.SIGINT)
+            self._signalled()
 
     def __iter__(self):
         return self._iterate()

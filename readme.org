@@ -898,7 +898,7 @@ err b'done\n'
   err b'\n'
   #+end_example
 - In legacy mode, output containing newline, NUL, newline ends the stream early, exactly as it ends a =send_cmd= reply (see Known Issues).
-- Brish never buffers more than a few chunks: when you stop reading, the pipes fill up and the command blocks.
+- Brish reads at most about 64 KiB per stream ahead of you: when you stop reading, the pipes fill up and the command blocks. A reader that falls behind gets fewer, larger chunks (up to 64 KiB each), as the pipes would merge them.
 
 *Threads.* A =BrishPopen= holds its worker's lock from =popen= until the output has been read to the end, so read it, wait for it and close it in the thread that created it; a read from another thread raises =RuntimeError=. =kill()= works from any thread. Calls that the same thread makes before then (=send_cmd=, another =popen=, =acquire_lock=, inside the =for= loop say) never land on that busy worker: with =server_index=None= they take another worker, and when they name the busy worker, or every worker is busy with this thread's =BrishPopen= objects, they raise =BrishWorkerBusyException= (a =RuntimeError=) at once, and nothing is restarted. A thread that already holds the lock (from =acquire_lock=) passes its =server_index=, and can go on using that worker afterwards:
 
@@ -914,11 +914,13 @@ finally:
     lock.release()
 #+end_example
 
-*Killing.* =p.kill()= (or =p.terminate()=) interrupts the command, not the worker, so the worker keeps its state. It is idempotent, returns at once, and the reader sees the rest of the output and the end as usual. The steps, =p.kill_grace= seconds apart (2 by default), stop at the first one after which the command has ended:
+*Killing.* =p.kill()= (or =p.terminate()=) interrupts the command, not the worker, so the worker keeps its state. It is idempotent, returns at once, and the reader sees the rest of the output and the end as usual. The steps stop at the first one after which the command has ended. Each comes =p.kill_grace= seconds (2 by default) after the one before when the command has gone quiet, or two graces after it while its output keeps coming:
 1. SIGINT to the worker and every process below it. The worker treats it like Ctrl-C in an interactive shell: the command is aborted and the retcode is 130, unless the command traps INT itself (=trap 'print caught' INT=), and then the trap runs and the command goes on.
 2. SIGTERM to the processes below the worker, and SIGINT to the worker again.
 3. SIGKILL to the processes below the worker. If there are none (the worker itself runs a loop that ignores INT), go to step 4 at once.
-4. SIGKILL to the worker. The retcode is 9001 with =brish: worker died during this command= at the end of the stderr chunks, and the instance restarts before its next use, once every other thread's command has finished.
+4. SIGKILL to the worker. The retcode is 9001 with =brish: worker died during this command= at the end of the stderr chunks (also when the command happened to end just before), and the instance restarts before its next use, once every other thread's command has finished.
+
+The steps go by what the command does, not by how fast you read. Once the first signal is out, Brish reads up to 256 KiB further ahead of you, so it notices at your next read that the command has ended, and you still get the rest of its output. When you read slower than the command writes after a signal, Brish takes the next step only once it has read more than 128 KiB since that signal, more than the pipes could hold before it. So a command that ends at a signal is not killed further because you read slowly.
 
 So the retcode after a kill is 130 for a command that dies of the interrupt, the command's own status when it traps INT or when one of its processes was stopped by step 2 or 3 (143 or 137 for a fork command whose subshell is), and 9001 only when the worker had to go. Background jobs that earlier commands left running on that worker are below it too: step 1 does not affect them (they ignore SIGINT), but steps 2 to 4 stop them.
 
