@@ -282,6 +282,17 @@ class BrishWorkerDiedException(Exception):
     pass
 
 
+class BrishWorkerBusyException(RuntimeError):
+    """A call from a thread needs a worker that a BrishPopen of the same
+    thread is still streaming from (inside its `for` loop, say). The worker
+    lock would let that thread in, since it is an RLock, but the worker is
+    busy: read the BrishPopen to its end or close it first, or leave
+    server_index=None so that the call picks another worker. Raised at once;
+    nothing is restarted."""
+
+    pass
+
+
 #: Return code of a command whose worker died before reporting a status.
 RETCODE_WORKER_DIED = 9001
 WORKER_DIED_NOTE = "brish: worker died during this command"
@@ -865,6 +876,7 @@ class BrishPopen:
                 self._lock, self.server_index, self._p = lock, index, p
                 self._released = False
                 p.free_server_count -= 1
+                p.popen_owner[index] = self._owner
                 outcome = start(p, index, cmd_b, stdin_b, fork)
             except BaseException:
                 #: An interrupt while starting (the start methods leave the
@@ -1203,6 +1215,7 @@ class BrishPopen:
         self._released = True
         p = self._p
         p.free_server_count += 1
+        p.popen_owner[self.server_index] = None
         self._lock.release()
         if restart:
             self._brish._request_restart(p.gen)
@@ -1597,6 +1610,8 @@ class Brish:
         p.binary = False
         p.server_count = server_count
         p.free_server_count = server_count
+        #: The thread whose running BrishPopen holds each worker, or None.
+        p.popen_owner = [None] * server_count
         p.brish_stdin_paths = brish_stdin_paths
         p.brish_stdout_paths = brish_stdout_paths
         p.brish_stderr_paths = brish_stderr_paths
@@ -1699,6 +1714,8 @@ class Brish:
         p.workers = workers
         p.server_count = server_count
         p.free_server_count = server_count
+        #: The thread whose running BrishPopen holds each worker, or None.
+        p.popen_owner = [None] * server_count
         try:
             for w in workers:
                 os.set_blocking(w.req, False)
@@ -1892,20 +1909,42 @@ class Brish:
                     locks = self.locks
 
             assert len(locks) >= 1
+            #: A worker that a running BrishPopen of this thread holds would
+            #: let this thread in (an RLock), but its command is still
+            #: streaming: skip it, or refuse an explicit server_index.
+            me = threading.get_ident()
+            busy = current_p.popen_owner
             lock = None
             if server_index is None:
                 for i in self._worker_order(current_p):
+                    if busy[i] == me:
+                        continue
                     if locks[i].acquire(blocking=False):
                         # https://docs.python.org/3/library/threading.html#threading.Lock.acquire
                         lock, index = locks[i], i
                         break
                 if lock is None:
+                    free = [i for i in range(len(locks)) if busy[i] != me]
+                    if not free:
+                        raise BrishWorkerBusyException(
+                            "every worker is streaming a BrishPopen of this thread; "
+                            "read one to its end or close it first"
+                        )
                     if lock_sleep is not None:
                         time.sleep(lock_sleep)
                         continue
-                    index = random.randrange(len(locks))
+                    index = random.choice(free)
             else:
                 index = server_index
+                try:
+                    mine = busy[index] == me
+                except (IndexError, TypeError):
+                    mine = False
+                if mine:
+                    raise BrishWorkerBusyException(
+                        f"worker {index} is streaming a BrishPopen of this thread; read it "
+                        "to its end or close it first, or use server_index=None"
+                    )
 
             if lock is None:
                 try:

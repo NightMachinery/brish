@@ -656,3 +656,71 @@ def test_legacy_interrupt_while_learning_the_pid():
         b.cleanup()
         '''
     )
+
+
+def test_same_thread_calls_skip_a_streaming_worker():
+    #: Inside the loop over a BrishPopen, the worker it streams from belongs
+    #: to the same thread (an RLock), so a call that took it would write into
+    #: a busy worker. Calls skip it, or refuse at once, and nothing restarts.
+    run(
+        r'''
+        Busy = bm.BrishWorkerBusyException
+        assert issubclass(Busy, RuntimeError)
+        def refused(call):
+            t0 = time.monotonic()
+            try:
+                call()
+            except Busy:
+                assert time.monotonic() - t0 < 1, "not at once"
+                return True
+            return False
+        b = Brish(server_count=2)
+        for i in (0, 1):
+            b.send_cmd(f"v=kept{i}", server_index=i)
+        got = []
+        with b.popen("print -r a; sleep 0.6; print -r b; return 7", server_index=0) as p:
+            for s, c in p:
+                got.append(c)
+                if len(got) > 1:
+                    continue
+                r = b.send_cmd("print -r -- inner-$v")
+                assert (r.retcode, r.out) == (0, "inner-kept1\n"), repr(r)
+                with b.popen("print -r -- nested-$v; sleep 0.3; print -r end") as q:
+                    assert q.server_index == 1, q.server_index
+                    first = True
+                    for _, c2 in q:
+                        if first:
+                            first = False
+                            #: Both workers are this thread's now.
+                            assert refused(lambda: b.send_cmd("true"))
+                            assert refused(lambda: b.popen("true"))
+                assert q.retcode == 0
+                assert refused(lambda: b.send_cmd("true", server_index=0))
+                assert refused(lambda: b.popen("true", server_index=0))
+                assert refused(lambda: b.acquire_lock(server_index=0))
+        assert (p.retcode, b"".join(got)) == (7, b"a\nb\n"), (p.retcode, got)
+        #: Nothing was restarted, and both workers take commands again.
+        same_server_ok(b, 0, "kept0")
+        same_server_ok(b, 1, "kept1")
+        #: Under the caller's own lock, as in the readme.
+        lock, i = b.acquire_lock()
+        try:
+            with b.popen("print -r x; sleep 0.3", server_index=i) as p:
+                for _ in p:
+                    assert refused(lambda: b.send_cmd("true", server_index=i))
+            same_server_ok(b, i, f"kept{i}")
+        finally:
+            lock.release()
+        b.cleanup()
+        #: One worker: refused at once instead of a deadlock or a restart.
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        with b.popen("print -r x; sleep 0.3; print -r y") as p:
+            for _ in p:
+                assert refused(lambda: b.send_cmd("true"))
+                assert refused(lambda: b.popen("true"))
+        assert p.retcode == 0
+        same_server_ok(b, 0)
+        b.cleanup()
+        '''
+    )
