@@ -285,7 +285,10 @@ def test_sigint_aborts_only_the_command(sources, python):
     #: The intended difference: SIGINT to a worker (a terminal Ctrl-C, or
     #: BrishPopen.kill) aborts the running command, which reports 130 as a
     #: plain retcode line, and the worker lives on with its state. While idle
-    #: the worker ignores it. The original worker died instead.
+    #: the worker ignores it. Workers, the original one included, used to
+    #: ignore SIGINT throughout (they start as background jobs of a
+    #: non-interactive zsh): a non-fork command ran on to its end, and only a
+    #: fork command's subshell died of it.
     check(
         r"""
         from tests.conftest import descendants

@@ -106,7 +106,8 @@ def test_master_python_on_this_worker(sources, real_env):
 
 def test_sigint_with_master_python(sources):
     #: The intended difference: SIGINT now aborts the running command (status
-    #: 130) and the worker lives on; while idle it is ignored.
+    #: 130) and the worker lives on; while idle it is ignored. Workers used to
+    #: ignore it throughout, so a non-fork command ran on to its end.
     check(
         r'''
         from tests.conftest import descendants
