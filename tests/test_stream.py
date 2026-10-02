@@ -808,3 +808,44 @@ def test_close_from_another_thread_changes_nothing():
         b.cleanup()
         '''
     )
+
+
+def test_a_popen_collected_in_another_thread():
+    #: An executor thread makes a BrishPopen and another thread drops the
+    #: last reference. The command is killed at once; the worker lock belongs
+    #: to the executor thread, which frees it at its next call (before, it
+    #: stayed taken for good, and that thread counted as a lock holder).
+    run(
+        r'''
+        import concurrent.futures as cf, gc
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        pool = cf.ThreadPoolExecutor(max_workers=1)
+        box = {}
+        def make():
+            box["p"] = b.popen("print -r a; sleep 100")
+        pool.submit(make).result()
+        pid = box["p"]._worker_pid
+        del box["p"]
+        gc.collect()
+        def lock_free():
+            ok = b.locks[0].acquire(timeout=0.5)
+            if ok:
+                b.locks[0].release()
+            return ok
+        assert not lock_free()
+        assert pool.submit(b._holds_worker_lock).result()
+        t0 = time.monotonic()
+        r = pool.submit(lambda: b.send_cmd("print -r -- ok-${v-unset}")).result(timeout=30)
+        assert time.monotonic() - t0 < 10, time.monotonic() - t0
+        #: Legacy mode restarts after an abandoned reply; binary mode skips it.
+        want = "ok-kept\n" if BINARY else "ok-unset\n"
+        assert (r.retcode, r.out) == (0, want), repr(r)
+        assert lock_free()
+        assert not pool.submit(b._holds_worker_lock).result()
+        if BINARY:
+            assert not bm._descendants(pid), bm._descendants(pid)  # the sleep was killed
+        pool.shutdown()
+        b.cleanup()
+        '''
+    )

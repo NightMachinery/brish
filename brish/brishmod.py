@@ -1607,7 +1607,12 @@ class BrishPopen:
             if threading.get_ident() == self._owner:
                 self._abandon()
             else:
+                #: Collected in another thread. Only the owner can release
+                #: its worker lock, so the command is killed now and the
+                #: owner gives the worker up at its next call to the
+                #: instance (Brish._reap_orphans).
                 self.kill()
+                self._brish._orphans.append(self)
         except Exception:
             pass
 
@@ -1700,6 +1705,9 @@ class Brish:
         self.last_server_count = server_count
         self.p = None
         self.locks = []
+        #: BrishPopen objects collected unclosed outside their own thread,
+        #: which still hold that thread's worker lock (see _reap_orphans).
+        self._orphans = collections.deque()
         #: Bumped by every init(); a restart requested for an older
         #: generation is already done.
         self._gen = 0
@@ -1966,6 +1974,7 @@ class Brish:
         """Restart every worker. In a thread that holds a worker lock, the
         restart is only scheduled: it runs before the next use by a thread
         that holds none (see `acquire_lock`). Returns whether it ran."""
+        self._reap_orphans()
         if self._holds_worker_lock():
             self._request_restart(self._gen)
             return False
@@ -1986,6 +1995,25 @@ class Brish:
         with self.lock:
             if gen == self._gen or self.p is None:
                 self.restart()
+
+    def _reap_orphans(self):
+        """Give up this thread's BrishPopen objects that were collected
+        unclosed in another thread: they still hold this thread's worker
+        locks, which no other thread can release. Called at the start of
+        every call that takes a worker."""
+        orphans = self._orphans
+        if not orphans:
+            return
+        me = threading.get_ident()
+        for _ in range(len(orphans)):
+            try:
+                popen = orphans.popleft()
+            except IndexError:
+                return
+            if popen._owner == me:
+                popen._abandon()
+            else:
+                orphans.append(popen)
 
     def _holds_worker_lock(self):
         """Whether this thread holds a worker lock of the current generation.
@@ -2077,6 +2105,7 @@ class Brish:
         send_cmd, say) skips both the restart and the instance lock: while it
         holds a lock of this generation, `self.p` cannot be replaced.
         """
+        self._reap_orphans()
         while True:
             if self._holds_worker_lock():
                 current_p = self.p
@@ -2206,7 +2235,9 @@ class Brish:
         nothing); a thread that holds the lock (acquire_lock) can pass its
         `server_index`. Use it as a context manager: leaving the block early,
         by break or by an exception, kills the command, drains its output
-        and frees the worker.
+        and frees the worker. An unclosed object that is collected in another
+        thread is killed, and its worker is freed only at the creating
+        thread's next call to this instance.
 
         `kill()` (alias `terminate()`) works from any thread, is idempotent,
         and interrupts the command, not the worker: SIGINT to the worker and
