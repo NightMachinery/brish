@@ -887,16 +887,17 @@ err b'done\n'
 - =p.wait()= reads the rest and returns the retcode. =p.close()= kills the command if it still runs, reads the rest and frees the worker; leaving the =with= block does that, also on =break= or an exception.
 - With =buffer=True=, the chunks are also kept, and =p.result= is the =CmdResult= that =send_cmd= would have returned (=None= until the end).
 - =b.zpopen(template, ...)= is =popen= of =zstring(template)=, as =z= is =send_cmd= of it.
-- Brish holds back only bytes that could be the start of the reply's end marker. In binary mode that is a suffix starting at a NUL byte, so output without NUL is never delayed. In legacy mode it is a trailing newline (or newline and NUL), so each line's newline arrives with the next chunk:
+- Brish holds back only bytes that could be the start of the reply's end marker. In binary mode that is a suffix starting at a NUL byte, so output without NUL is never delayed. In legacy mode it is a trailing newline (or newline and NUL), so each line's newline arrives with the next chunk. How output splits into chunks depends on timing in both modes; one run of the example above in legacy mode (=Brish()=) gave:
 
   #+begin_example
   out b'step 1'
   out b'\nstep 2'
   out b'\nstep 3'
-  err b'done'
+  err b'done\n'
   out b'\n'
-  err b'\n'
   #+end_example
+
+  (=err b'done\n'= arrives whole when the end of the stderr reply is read together with it; otherwise as =err b'done'= and =err b'\n'=.)
 - In legacy mode, output containing newline, NUL, newline ends the stream early, exactly as it ends a =send_cmd= reply (see Known Issues).
 - Brish reads at most about 64 KiB per stream ahead of you: when you stop reading, the pipes fill up and the command blocks. A reader that falls behind gets fewer, larger chunks (up to 64 KiB each), as the pipes would merge them.
 
@@ -913,6 +914,8 @@ try:
 finally:
     lock.release()
 #+end_example
+
+A restart waits for every =BrishPopen= in flight, since each holds its worker's lock until its output has been read to the end. So once a restart is due (=restart()= from a thread that holds no worker lock, or the one after a worker died), an endless stream such as =tail -f= holds up the restart, and every call from a thread that holds no worker lock, until the stream ends or is killed. =cleanup()= waits for it too.
 
 *Killing.* =p.kill()= (or =p.terminate()=) interrupts the command, not the worker, so the worker keeps its state. It is idempotent, returns at once, and the reader sees the rest of the output and the end as usual. The steps stop at the first one after which the command has ended. Each comes =p.kill_grace= seconds (2 by default) after the one before when the command has gone quiet, or two graces after it while its output keeps coming:
 1. SIGINT to the worker and every process below it. The worker treats it like Ctrl-C in an interactive shell: the command is aborted and the retcode is 130, unless the command traps INT itself (=trap 'print caught' INT=), and then the trap runs and the command goes on.
