@@ -559,3 +559,33 @@ def test_legacy_learns_each_worker_pid_once():
         b.cleanup()
         '''
     )
+
+
+@legacy_only
+def test_legacy_pid_survives_background_output():
+    #: A background job of an earlier command writes into every later reply,
+    #: also into the internal PID request's; kill() must still find the PID.
+    run(
+        r'''
+        b = Brish(server_count=1)
+        import re
+        r = b.send_cmd("v=kept; { repeat 3000 { print -r tick; sleep 0.005 } } &!; print -r -- job:$!")
+        job = int(re.search(r"job:(\d+)", r.out).group(1))
+        try:
+            time.sleep(0.2)
+            t0 = time.monotonic()
+            with b.popen("sleep 100") as p:
+                kill_later(p, 0.3)
+                evs = collect(p)
+            dt = time.monotonic() - t0
+            assert b.p.legacy_pids[0] and b.p.legacy_pids[0] != job, b.p.legacy_pids
+            #: The first SIGINT did it (without the PID, kill() signalled
+            #: nothing and ended in 9001 after three graces).
+            assert (p.retcode, p._stage) == (130, 1), (p.retcode, p._stage, dt)
+            assert "ok-kept" in b.send_cmd("print -r -- ok-$v").out.split()
+        finally:
+            os.kill(job, signal.SIGKILL)
+        b.cleanup()
+        '''
+    )
+

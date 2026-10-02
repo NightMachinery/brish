@@ -775,10 +775,13 @@ def _legacy_busy(p, index):
 
 
 #: Internal request that prints a legacy worker's PID: the parent of a
-#: command substitution. The worker itself does not load zsh/system.
+#: command substitution. The worker itself does not load zsh/system. The PID
+#: is bracketed by a marker, because a background job of an earlier command
+#: may write into the same reply (see docs/protocol.org); the last match wins.
 _LEGACY_PID_CMD = (
-    b"builtin print -r -- $(builtin zmodload zsh/system && builtin print -r -- ${sysparams[ppid]})"
+    b"builtin print -r -- brish-pid:$(builtin zmodload zsh/system && builtin print -r -- ${sysparams[ppid]}):"
 )
+_LEGACY_PID_RE = re.compile(rb"brish-pid:(\d+):")
 #: kill() sends its first SIGINT no sooner than this many seconds after the
 #: request was written, so that it reaches a command that has started.
 _KILL_SETTLE = 0.05
@@ -931,10 +934,10 @@ class BrishPopen:
             if restart:
                 b._request_restart(p.gen)
                 return _NEVER_RAN
-            pid = res.outb.strip()
+            found = _LEGACY_PID_RE.findall(res.outb)
             #: Only a child of this instance's bootstrap is ever signalled.
-            if pid.isdigit() and int(pid) in _child_pids(p.pid):
-                p.legacy_pids[index] = int(pid)
+            if found and int(found[-1]) in _child_pids(p.pid):
+                p.legacy_pids[index] = int(found[-1])
         self._worker_pid = p.legacy_pids[index]
         if _legacy_busy(p, index):
             return _NEVER_RAN
