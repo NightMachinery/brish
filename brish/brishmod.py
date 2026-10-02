@@ -2223,7 +2223,10 @@ class Brish:
         non-empty bytes, as read. Only the bytes that could start the end of
         the reply are held back until the next read: in binary mode a suffix
         that starts at a NUL, in legacy mode a trailing newline (or newline
-        and NUL). `retcode` is None until the command has ended.
+        and NUL). Brish reads at most about 64 KiB per stream ahead of the
+        caller, so a caller that stops reading blocks the command; one that
+        falls behind gets fewer, larger chunks (up to 64 KiB). `retcode` is
+        None until the command has ended.
 
         The arguments are those of send_cmd. With buffer=True, the chunks
         that iteration or wait() consumed are also kept, and `result` gives
@@ -2233,21 +2236,29 @@ class Brish:
         read, so the object is read, waited for and closed in the thread that
         made it (from another thread, these raise RuntimeError and change
         nothing); a thread that holds the lock (acquire_lock) can pass its
-        `server_index`. Use it as a context manager: leaving the block early,
-        by break or by an exception, kills the command, drains its output
-        and frees the worker. An unclosed object that is collected in another
-        thread is killed, and its worker is freed only at the creating
-        thread's next call to this instance.
+        `server_index`. Calls from the same thread meanwhile skip that busy
+        worker, or raise BrishWorkerBusyException when they name it or every
+        worker is busy that way. Use it as a context manager: leaving the
+        block early, by break or by an exception, kills the command, drains
+        its output and frees the worker. An unclosed object that is collected
+        in another thread is killed, and its worker is freed only at the
+        creating thread's next call to this instance.
 
         `kill()` (alias `terminate()`) works from any thread, is idempotent,
-        and interrupts the command, not the worker: SIGINT to the worker and
-        its descendants (the worker aborts the command as a terminal Ctrl-C
-        would, and its retcode is 130 unless the command traps INT); after
-        `kill_grace` seconds (default 2) SIGTERM to the descendants; after
-        another, SIGKILL to them; after another, SIGKILL to the worker, which
-        gives the retcode 9001 and restarts the instance before its next use.
+        and interrupts the command, not the worker. Step 1: SIGINT to the
+        worker and its descendants (the worker aborts the command as a
+        terminal Ctrl-C would, and its retcode is 130 unless the command
+        traps INT). Step 2: SIGTERM to the descendants and SIGINT to the
+        worker. Step 3: SIGKILL to the descendants, or step 4 at once if
+        there are none. Step 4: SIGKILL to the worker, which gives the
+        retcode 9001 with WORKER_DIED_NOTE and restarts the instance before
+        its next use. The steps stop once the command has ended; each comes
+        `kill_grace` seconds (default 2) after the previous one when the
+        command has gone quiet, or two graces after it while its output keeps
+        coming. After the first signal Brish reads up to 256 KiB ahead of the
+        caller, so the timing follows the command, not the caller's pace.
         Background jobs of earlier commands are descendants of the worker
-        too, and are stopped by the later steps.
+        too, and are stopped by steps 2 to 4.
         """
         return BrishPopen(
             self, cmd, cmd_stdin=cmd_stdin, fork=fork, server_index=server_index,
