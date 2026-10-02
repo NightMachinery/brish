@@ -782,3 +782,29 @@ def test_kill_goes_by_the_command_not_the_reader():
         ''',
         timeout=120,
     )
+
+
+def test_close_from_another_thread_changes_nothing():
+    #: Before, close() from another thread killed the command and then
+    #: raised; a read through iter() killed it too.
+    run(
+        r'''
+        b = Brish(server_count=1)
+        p = b.popen("print -r a; sleep 0.8; print -r done; return 3", buffer=True)
+        errs = []
+        def other():
+            for call in (p.close, p.wait, lambda: next(iter(p)), lambda: next(p)):
+                try:
+                    call()
+                except RuntimeError as e:
+                    errs.append(e)
+        t = threading.Thread(target=other)
+        t.start()
+        t.join()
+        assert len(errs) == 4 and all("thread" in str(e) for e in errs), errs
+        #: The command was not killed: it ends on its own, with its output.
+        assert (p.wait(), p._stage, p.result.out) == (3, 0, "a\ndone\n"), (p.retcode, p._stage, p.result)
+        p.close()
+        b.cleanup()
+        '''
+    )

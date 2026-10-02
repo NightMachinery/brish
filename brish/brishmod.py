@@ -1550,8 +1550,14 @@ class BrishPopen:
 
     def _iterate(self):
         complete = False
+        #: Whether the last thread that advanced the generator owns it. A
+        #: read from another thread raises (in _next_event) and changes
+        #: nothing; a generator of the owner's that is closed elsewhere (by
+        #: the garbage collector, say) kills the command.
+        mine = True
         try:
             while True:
+                mine = threading.get_ident() == self._owner
                 ev = self._next_event()
                 if ev is None:
                     complete = True
@@ -1561,7 +1567,7 @@ class BrishPopen:
             if not complete and not self._released:
                 if threading.get_ident() == self._owner:
                     self.close()
-                else:
+                elif mine:
                     self.kill()
 
     def __next__(self):
@@ -1579,9 +1585,11 @@ class BrishPopen:
 
     def close(self):
         """Kill the command if it is still running, drain its output and free
-        the worker. Idempotent."""
+        the worker. Idempotent. Only in the thread that created it: from
+        another thread it raises RuntimeError and changes nothing."""
         if self._released and not self._pending:
             return
+        self._check_owner()
         self.kill()
         self.wait()
 
@@ -2194,7 +2202,8 @@ class Brish:
 
         The worker's lock is held from the call until the reply has been
         read, so the object is read, waited for and closed in the thread that
-        made it; a thread that holds the lock (acquire_lock) can pass its
+        made it (from another thread, these raise RuntimeError and change
+        nothing); a thread that holds the lock (acquire_lock) can pass its
         `server_index`. Use it as a context manager: leaving the block early,
         by break or by an exception, kills the command, drains its output
         and frees the worker.
