@@ -32,6 +32,20 @@ def kill_later(p, delay):
     t = threading.Timer(delay, p.kill)
     t.start()
     return t
+def ps_cost():
+    """Seconds that one `ps` run takes now: each kill step runs one, which
+    takes a second or more on a loaded machine."""
+    t = time.monotonic()
+    bm._descendants(os.getpid())
+    return time.monotonic() - t
+def gone(pid, timeout=5):
+    """Whether every descendant of `pid` has exited within `timeout`."""
+    deadline = time.monotonic() + timeout
+    while bm._descendants(pid):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
 def same_server_ok(b, i, want_v="kept"):
     r = b.send_cmd("print -r -- ok-$v", server_index=i)
     assert (r.retcode, r.out, r.err) == (0, f"ok-{want_v}\n", ""), repr(r)
@@ -413,10 +427,19 @@ def test_escalation_to_the_worker():
         dt = time.monotonic() - t0
         assert p.retcode == 9001, (p.retcode, evs)
         assert joined(evs) == b"stuck\n", evs
-        assert joined(evs, "err").endswith(bm.WORKER_DIED_NOTE.encode() + b"\n"), evs
-        assert 0.8 < dt < 4, dt
+        note = bm.WORKER_DIED_NOTE.encode() + b"\n"
+        assert [(s, c) for _, s, c in evs[-1:]] == [("err", note)], evs
+        assert 0.8 < dt < 4 + 6 * ps_cost(), dt
         r = b.send_cmd("print -r -- next-$v", server_index=0)
         assert (r.retcode, r.out) == (0, "next-\n"), repr(r)  # restarted
+        #: stderr without a final newline: a newline chunk, then the note.
+        with b.popen("trap '' INT TERM; print -rnu2 partial; while :; do :; done", server_index=0) as p:
+            p.kill_grace = 0.5
+            kill_later(p, 0.3)
+            evs = collect(p)
+        assert p.retcode == 9001, (p.retcode, evs)
+        assert joined(evs, "err") == b"partial\n" + note, evs
+        assert [(s, c) for _, s, c in evs[-2:]] == [("err", b"\n"), ("err", note)], evs
         b.cleanup()
         ''',
         allow_orphans=False,
@@ -817,22 +840,28 @@ def test_kill_goes_by_the_command_not_the_reader():
             #: and in legacy mode a SIGKILLed worker.
             assert (p.retcode, p._stage) == (130, 1), (cmd, p.retcode, p._stage, n, dt)
             same_server_ok(b, 0)
-        #: Ignores INT and TERM and floods: still stopped, with a slow reader.
-        t0 = time.monotonic()
-        with b.popen("trap '' INT TERM; while :; do print -r -- 0123456789abcdef; done") as p:
-            p.kill_grace = 0.5
-            kill_later(p, 0.3)
-            evs = []
-            for s, c in p:
-                evs.append((s, c))
-                if time.monotonic() - t0 > 0.3:
-                    time.sleep(0.1)
-                assert time.monotonic() - t0 < 40, "never stopped"
-        assert (p.retcode, p._stage) == (9001, 4), (p.retcode, p._stage)
-        assert joined([(0,) + e for e in evs], "err").endswith(
-            bm.WORKER_DIED_NOTE.encode() + b"\n"), evs[-3:]
-        r = b.send_cmd("print -r -- ok-${v-unset}")
-        assert r.out == "ok-unset\n", repr(r)  # restarted
+        #: Ignores INT and TERM and floods, on stdout alone and on both
+        #: streams in turn: still stopped, with a slow reader. (Before, the
+        #: legacy reader queue counted as full at four tiny chunks, so with
+        #: both streams kill() never got past step 1.)
+        note = bm.WORKER_DIED_NOTE.encode() + b"\n"
+        for cmd in ("trap '' INT TERM; while :; do print -r -- 0123456789abcdef; done",
+                    "trap '' INT TERM; while :; do print -r o; print -ru2 e; done"):
+            t0 = time.monotonic()
+            with b.popen(cmd) as p:
+                p.kill_grace = 0.5
+                kill_later(p, 0.3)
+                evs = []
+                for s, c in p:
+                    evs.append((s, c))
+                    if time.monotonic() - t0 > 0.3:
+                        time.sleep(0.1)
+                    assert time.monotonic() - t0 < 40, ("never stopped", cmd, p._stage)
+            assert (p.retcode, p._stage) == (9001, 4), (cmd, p.retcode, p._stage)
+            #: The note is a chunk of its own, also after a flood of stderr.
+            assert evs[-1] == ("err", note), (cmd, evs[-3:])
+            r = b.send_cmd("print -r -- ok-${v-unset}")
+            assert r.out == "ok-unset\n", repr(r)  # restarted
         #: Once step 4 is taken, the result says the worker died, also when
         #: the reply came anyway (white box: the step is only recorded).
         b.send_cmd("v=kept")
@@ -913,6 +942,83 @@ def test_a_popen_collected_in_another_thread():
         if BINARY:
             assert not bm._descendants(pid), bm._descendants(pid)  # the sleep was killed
         pool.shutdown()
+        b.cleanup()
+        '''
+    )
+
+
+def test_kill_waits_for_a_long_report_under_a_slow_reader():
+    #: A program that handles SIGINT by writing a 200 KB report and exiting,
+    #: read at one chunk a second (a chat bot's pace), with the default
+    #: grace: Brish reads up to
+    #: 256 KiB ahead once the signal is out, sees the end, and takes no
+    #: further step. (Before, legacy mode read only about 76 KiB ahead, took
+    #: step 2, and its SIGTERM cut the report and killed an unrelated
+    #: background job of the worker.)
+    run(
+        r"""
+        prog = os.path.join(SCRATCH, "report.py")
+        with open(prog, "w") as f:
+            f.write("import sys, time\n"
+                    "try:\n"
+                    "    print('started', flush=True)\n"
+                    "    time.sleep(100)\n"
+                    "except KeyboardInterrupt:\n"
+                    "    sys.stdout.write('r' * 200000 + '\\nreport done\\n')\n"
+                    "    sys.stdout.flush()\n"
+                    "    sys.exit(3)\n")
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept; sleep 1000 &!")
+        bg = int(b.send_cmd("print -r -- $!").out)
+        try:
+            out = b""
+            py = sys.executable
+            with b.popen(b.zstring("{{ {py} {prog} }} 2>&1")) as p:
+                for s, c in p:
+                    out += c
+                    if not p._stage:
+                        if b"started" in out:
+                            p.kill()
+                    else:
+                        time.sleep(1)
+            assert (p.retcode, p._stage) == (130, 1), (p.retcode, p._stage, len(out))
+            assert out.endswith(b"r\nreport done\n") and len(out) == 200021, len(out)
+            assert bm._alive(bg), "step 2 stopped the background job"
+            same_server_ok(b, 0)
+        finally:
+            if bm._alive(bg):
+                os.kill(bg, signal.SIGKILL)
+        b.cleanup()
+        """,
+        timeout=180,
+    )
+
+
+def test_held_chunks_join_the_last_one_of_their_stream():
+    #: White box. Once 4 chunks are held for the caller, a new chunk joins
+    #: the last held chunk of its own stream, up to 64 KiB. Before, it
+    #: joined only a last chunk of the same stream, so two streams in turn
+    #: piled up one small chunk per read, and after kill() a slow caller
+    #: had to take 128 KiB of them before the next step (binary mode, a
+    #: flood of `print -r o; print -ru2 e` that ignores INT and TERM stayed
+    #: at step 2 for more than 40 s at 0.1 s per chunk).
+    run(
+        r'''
+        b = Brish(server_count=1)
+        with b.popen("sleep 0.3") as p:
+            want = {"out": [], "err": []}
+            for i in range(30000):
+                s = "out" if i % 2 else "err"
+                c = b"%d," % i
+                p._push(s, c)
+                want[s].append(c)
+            held = [(s, len(c)) for s, c in p._pending]
+            evs = collect(p)
+        assert len(held) <= 8, held
+        assert all(n <= 65536 for _, n in held), held
+        assert p.retcode == 0, p.retcode
+        assert joined(evs) == b"".join(want["out"]), held
+        assert joined(evs, "err") == b"".join(want["err"]), held
         b.cleanup()
         '''
     )

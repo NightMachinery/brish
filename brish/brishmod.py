@@ -693,11 +693,12 @@ class _Abandoned(Exception):
 
 
 #: How far the legacy reader threads may run ahead of the caller: at most
-#: this many chunks and bytes are queued. A reader that finds the queue at
-#: its chunk limit appends to the last chunk instead, up to _MERGE_MAX bytes,
-#: so a caller that falls behind gets fewer, larger chunks (as a pipe would
-#: give them) and the bytes, not the chunk count, stop the readers. The
-#: chunks that BrishPopen holds for the caller are merged the same way.
+#: _LEGACY_QUEUE_BYTES are queued, for both streams together. Once
+#: _QUEUE_CHUNKS chunks are queued, a payload joins the last queued chunk of
+#: its own stream, up to _MERGE_MAX bytes, so a caller that falls behind gets
+#: fewer, larger chunks (as a pipe would give them). Only the byte bound
+#: makes a reader wait. Once BrishPopen holds _QUEUE_CHUNKS chunks for the
+#: caller, a new chunk joins the last one it holds of its stream the same way.
 _QUEUE_CHUNKS = 4
 _LEGACY_QUEUE_BYTES = 65536
 _MERGE_MAX = 65536
@@ -708,13 +709,18 @@ _KILL_READ_AHEAD = 256 * 1024
 #: More than the pipes can hold: output read after a step's signal beyond
 #: this was written after the signal.
 _PIPE_SLACK = 128 * 1024
+#: Binary mode, when a kill step is due: Brish reads ahead while the command
+#: writes, until it has been quiet for _SETTLE seconds, for at most
+#: _SETTLE_MAX seconds (see BrishPopen._kill_step).
+_SETTLE = 0.1
+_SETTLE_MAX = 0.5
 
 
 class _ChunkQueue:
     """The queue between the legacy reader threads and BrishPopen: when the
     caller stops reading, the readers stop, the FIFOs fill up and the
-    command blocks. Bounded in chunks and in bytes (see _QUEUE_CHUNKS);
-    kill() raises the byte bound (see BrishPopen._kill_step)."""
+    command blocks. Bounded in bytes only (see _QUEUE_CHUNKS); kill() raises
+    the bound (see BrishPopen._kill_step)."""
 
     def __init__(self, chunks, limit):
         self.chunks = chunks
@@ -723,26 +729,17 @@ class _ChunkQueue:
         #: [stream, [parts], nbytes], or [None, None, 0] at the end.
         self.items = collections.deque()
         self.cond = threading.Condition(Lock())
-        #: Readers waiting for room.
+        #: Readers waiting for room, that is with `limit` bytes queued.
         self.waiting = 0
 
     def put(self, stream, payload, abandoned):
-        """Queue `payload`, waiting while there is no room. An empty queue
-        takes any payload. Returns False, without queueing, once
+        """Queue `payload`, waiting while the queue holds too many bytes. An
+        empty queue takes any payload. Returns False, without queueing, once
         `abandoned()` is true."""
         n = len(payload)
         items = self.items
         with self.cond:
-            while True:
-                if not items or self.size + n <= self.limit:
-                    if not items or len(items) < self.chunks:
-                        items.append([stream, [payload], n])
-                        break
-                    last = items[-1]
-                    if last[0] == stream and last[2] + n <= _MERGE_MAX:
-                        last[1].append(payload)
-                        last[2] += n
-                        break
+            while items and self.size + n > self.limit:
                 if abandoned():
                     return False
                 self.waiting += 1
@@ -750,6 +747,19 @@ class _ChunkQueue:
                     self.cond.wait(_POLL)
                 finally:
                     self.waiting -= 1
+            last = None
+            if len(items) >= self.chunks:
+                #: The last chunk of this stream, so the stream keeps its
+                #: order; the two streams have no order between them.
+                for item in reversed(items):
+                    if item[0] == stream:
+                        last = item
+                        break
+            if last is not None and last[2] + n <= _MERGE_MAX:
+                last[1].append(payload)
+                last[2] += n
+            else:
+                items.append([stream, [payload], n])
             self.size += n
             self.cond.notify_all()
         return True
@@ -1283,13 +1293,24 @@ class BrishPopen:
         pending = self._pending
         self._pending_bytes += len(chunk)
         if len(pending) >= _QUEUE_CHUNKS:
-            last_name, last = pending[-1]
-            if last_name == name and len(last) + len(chunk) <= _MERGE_MAX:
-                if not isinstance(last, bytearray):
-                    last = bytearray(last)
-                    pending[-1] = (name, last)
-                last += chunk
-                return
+            #: Into the last held chunk of this stream, as in _ChunkQueue.put:
+            #: the stream keeps its order, and the two streams have none
+            #: between them. Joining only a last chunk of the same stream
+            #: would let two streams in turn pile up one small chunk per
+            #: read, and after kill() a slow caller would have to take
+            #: _PIPE_SLACK bytes of them before the next step (see
+            #: _kill_step).
+            for i in range(len(pending) - 1, -1, -1):
+                if pending[i][0] != name:
+                    continue
+                last = pending[i][1]
+                if len(last) + len(chunk) <= _MERGE_MAX:
+                    if not isinstance(last, bytearray):
+                        last = bytearray(last)
+                        pending[i] = (name, last)
+                    last += chunk
+                    return
+                break
         pending.append((name, chunk))
 
     def _finish(self, retcode, restart=False, note=False):
@@ -1300,14 +1321,21 @@ class BrishPopen:
             killed = self._stage >= 4
             if killed:
                 retcode, restart, note = RETCODE_WORKER_DIED, True, True
+            if note:
+                #: The note is a chunk of its own, never merged into output
+                #: (with a newline chunk before it if the err stream so far
+                #: does not end in one).
+                pending = self._pending
+                if not self._err_nl_after_pending():
+                    pending.append(("err", b"\n"))
+                    self._pending_bytes += 1
+                msg = (WORKER_DIED_NOTE + "\n").encode()
+                pending.append(("err", msg))
+                self._pending_bytes += len(msg)
+            #: Set last, once every chunk is pending.
             self.retcode = retcode
         if killed and not self._p.binary:
             self._brish._legacy_abandon(self._p, self.server_index)
-        if note:
-            msg = (WORKER_DIED_NOTE + "\n").encode()
-            if not self._err_nl_after_pending():
-                msg = b"\n" + msg
-            self._push("err", msg)
         self._release(restart)
 
     def _err_nl_after_pending(self):
@@ -1419,14 +1447,14 @@ class BrishPopen:
         take the next step when it is due. Both go by what the command does,
         not by how fast the caller reads: once the first signal is out, Brish
         reads up to _KILL_READ_AHEAD bytes ahead of the caller, so it sees
-        the end of the reply early."""
-        if self._p.binary:
+        the end of the reply early. The legacy reader threads read ahead by
+        themselves; in binary mode Brish reads ahead only inside the
+        caller's reads, so when a step is due it first reads for as long as
+        the command keeps writing (see _read_ahead)."""
+        binary = self._p.binary
+        if binary:
             if self._ahead:
-                for _ in range(64):
-                    if self._finished or self._pending_bytes >= _KILL_READ_AHEAD:
-                        break
-                    if not self._pump_binary(0):
-                        break
+                self._read_ahead(0)
         elif self._rout.done and self._rerr.done:
             self._legacy_drain_queue()
             self._legacy_complete()
@@ -1436,10 +1464,18 @@ class BrishPopen:
             if not self._ahead:
                 return  # the first signal is not out yet
             due = self._stage_t + self.kill_grace
-            since = self._nread_total() - self._step_nread
         now = time.monotonic()
         if now < due:
             return
+        if binary:
+            #: A command that was blocked on a full pipe while the caller
+            #: did not read goes on writing only now.
+            self._read_ahead(_SETTLE)
+            if self._finished:
+                return
+            now = time.monotonic()
+        with self._mu:
+            since = self._nread_total() - self._step_nread
         if self._blocked():
             #: Brish is as far ahead of the caller as it reads, so the end of
             #: the reply may be waiting behind the caller. Go on only once
@@ -1454,16 +1490,28 @@ class BrishPopen:
         if not flows or now >= due + self.kill_grace:
             self._escalate()
 
+    def _read_ahead(self, quiet):
+        """Binary mode, once the first signal is out: read while the pipes
+        give output within `quiet` seconds (at most _SETTLE_MAX seconds in
+        all), until Brish holds _KILL_READ_AHEAD bytes or the reply ends."""
+        deadline = time.monotonic() + _SETTLE_MAX
+        for _ in range(256):
+            if self._finished or self._pending_bytes >= _KILL_READ_AHEAD:
+                return
+            if not self._pump_binary(quiet) or time.monotonic() > deadline:
+                return
+
     def _nread_total(self):
         if self._p.binary:
             return self._nread
         return self._rout.nread + self._rerr.nread
 
     def _blocked(self):
-        """Whether reading ahead has stopped because the caller is behind."""
+        """Whether reading ahead has stopped because the caller is behind:
+        Brish holds as many bytes as it reads ahead."""
         if self._p.binary:
             return self._pending_bytes >= _KILL_READ_AHEAD
-        return self._q.waiting > 0
+        return self._q.waiting > 0  # the queue's byte bound is reached
 
     def _output_flows(self, now):
         """Whether the command wrote within the last _POLL seconds."""
@@ -1472,7 +1520,11 @@ class BrishPopen:
         return any(now - r.last_read < _POLL for r in (self._rout, self._rerr) if not r.done)
 
     def _signalled(self):
-        """A step's signal is out (under _mu)."""
+        """A step's signal is out (under _mu). The next step is due a grace
+        from now: listing the processes to signal (one `ps`) can take
+        seconds on a loaded machine, and the command needs the whole grace
+        to react."""
+        self._stage_t = time.monotonic()
         self._step_nread = self._nread_total()
         if not self._ahead:
             self._ahead = True
@@ -2251,14 +2303,16 @@ class Brish:
         traps INT). Step 2: SIGTERM to the descendants and SIGINT to the
         worker. Step 3: SIGKILL to the descendants, or step 4 at once if
         there are none. Step 4: SIGKILL to the worker, which gives the
-        retcode 9001 with WORKER_DIED_NOTE and restarts the instance before
-        its next use. The steps stop once the command has ended; each comes
-        `kill_grace` seconds (default 2) after the previous one when the
-        command has gone quiet, or two graces after it while its output keeps
-        coming. After the first signal Brish reads up to 256 KiB ahead of the
-        caller, so the timing follows the command, not the caller's pace.
-        Background jobs of earlier commands are descendants of the worker
-        too, and are stopped by steps 2 to 4.
+        retcode 9001 with WORKER_DIED_NOTE as the last chunk, and restarts
+        the instance before its next use. The steps stop once the command
+        has ended; each comes `kill_grace` seconds (default 2) after the
+        previous step's signals went out when the command has gone quiet, or
+        two graces after them while its output keeps coming. After the
+        first signal Brish reads up to 256 KiB ahead of the caller, so a
+        command that ends at the signal and writes less than that meanwhile
+        is not escalated, however slowly the caller reads. Background jobs
+        of earlier commands are descendants of the worker too, and are
+        stopped by steps 2 to 4.
         """
         return BrishPopen(
             self, cmd, cmd_stdin=cmd_stdin, fork=fork, server_index=server_index,
