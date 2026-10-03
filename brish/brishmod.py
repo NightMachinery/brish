@@ -307,18 +307,27 @@ def _with_note(err, note):
 
 def _descendants(root):
     """PIDs of every descendant of `root`, from one `ps` snapshot."""
+    return _trees([root])[1:]
+
+
+def _trees(roots):
+    """`roots` and every descendant of each, from one `ps` snapshot (only
+    `roots` when `ps` fails)."""
+    roots = [r for r in roots if r]
+    if not roots:
+        return []
     try:
         out = subprocess.run(
             ["ps", "-Ao", "pid=,ppid="], capture_output=True, text=True, timeout=10
         ).stdout
     except Exception:
-        return []
+        return list(roots)
     children = {}
     for line in out.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
             children.setdefault(int(parts[1]), []).append(int(parts[0]))
-    found, stack, seen = [], [root], {root}
+    found, stack, seen = list(roots), list(roots), set(roots)
     while stack:
         for kid in children.get(stack.pop(), ()):
             if kid not in seen:
@@ -2061,6 +2070,8 @@ class Brish:
         #: commands, which have no controlling terminal either. Interrupts
         #: come from BrishPopen.kill() alone. The workers stop with us
         #: through their pipes (see docs/protocol.org, Processes).
+        #: The bootstrap's stdin stays open until cleanup() (or our end):
+        #: its EOF tells the bootstrap to stop what is left (brish2.zsh).
         p = Popen(
             shell,
             stdin=PIPE,
@@ -2930,8 +2941,16 @@ class Brish:
 
     @staticmethod
     def _cleanup_binary(p):
-        #: Stop the workers first, so this never waits for a user command.
-        pids = [w.pid for w in p.workers if w.pid]
+        #: Stop the workers first, so this never waits for a user command. A
+        #: worker that may still run one (its reply was abandoned, or a
+        #: BrishPopen of this thread still holds it) is stopped with every
+        #: process below it, so that no command outlives the instance; an
+        #: idle worker just exits.
+        busy = [
+            w.pid for w in p.workers
+            if w.pid and (w.stale or w.broken or p.popen_owner[w.index] is not None)
+        ]
+        pids = [w.pid for w in p.workers if w.pid and w.pid not in busy] + _trees(busy)
         _signal_pids(pids, signal.SIGTERM)
         for w in p.workers:
             w.close()
@@ -2958,9 +2977,23 @@ class Brish:
             except Exception:
                 pass
 
-        if getattr(p, "interrupted", False):
-            #: A worker may hold a truncated request. Closing its FIFO would
-            #: let it run the command with truncated stdin, so stop it first.
+        #: A worker that may still run a command (its reply was abandoned,
+        #: a helper thread still reads it, or a BrishPopen of this thread
+        #: still holds it) is stopped first, with every process below it, so
+        #: that no command outlives the instance. One that may hold a
+        #: truncated request must not run it once its FIFO closes either.
+        #: Without the workers' PIDs, every worker is stopped so.
+        busy = [
+            i for i in range(p.server_count)
+            if _legacy_busy(p, i) or p.popen_owner[i] is not None
+        ]
+        if busy:
+            _legacy_read_pids(p, 1.0)
+            roots = [p.legacy_pids[i] for i in busy]
+            if None in roots:
+                roots = _child_pids(p.pid)
+            _stop_pids(_trees(roots))
+        elif getattr(p, "interrupted", False):
             _stop_pids(_child_pids(p.pid))
 
         for f in (p.stdout, p.stderr, p.stdin):
@@ -2983,12 +3016,13 @@ class Brish:
             else:
                 close(f)
         shutil.rmtree(p.tmpdir, ignore_errors=True)
-        #: Workers exit once their request FIFO closes, unless a command is
-        #: still running (after an interrupt). Do not wait for it for long.
+        #: Workers exit once their request FIFO closes, and the bootstrap
+        #: once its stdin has, stopping any worker that is still busy a
+        #: second later (see brish2.zsh). Do not wait for it for long.
         try:
-            p.wait(timeout=2)
+            p.wait(timeout=4)
         except subprocess.TimeoutExpired:
-            _stop_pids(_child_pids(p.pid))
+            _stop_pids(_trees(_child_pids(p.pid)))
             try:
                 p.wait(timeout=5)
             except subprocess.TimeoutExpired:

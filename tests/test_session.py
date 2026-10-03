@@ -10,6 +10,8 @@ The commands wait with zselect (a builtin), not with sleep: they must not
 depend on an external program that something else might signal.
 """
 
+import pytest
+
 from tests.conftest import check
 
 WAIT = "zmodload zsh/zselect; zselect -t {cs}"  # centiseconds
@@ -181,4 +183,162 @@ def test_terminal_ctrl_c_reaches_python_alone():
         assert "STATE 'kept\\n'\n" in out, out
         '''.format(wait=WAIT),
         timeout=120,
+    )
+
+
+#: The end of a Python process that uses Brish, run in a child of the test
+#: (a grandchild), which records the PIDs of its busy commands' processes in
+#: SCRATCH/pids and prints READY once they all run. With HOW = "terminal" it
+#: runs on a pseudo-terminal that the test then closes.
+DEATH = r'''
+pidfile = os.path.join(SCRATCH, "pids")
+W = "zmodload zsh/zselect; zselect -t 6000"
+rec = "zmodload zsh/system; print -r -- $sysparams[pid] >> " + pidfile + "; "
+b = Brish(server_count=4)
+jobs = [
+    (0, rec + W, False),  # the worker itself waits
+    (1, rec + "zsh -fc '" + rec + W + "'", False),  # a child of the worker waits
+    (2, rec + W, True),  # a fork command's subshell waits
+]
+for i, cmd, fork in jobs:
+    threading.Thread(target=b.send_cmd, args=(cmd,), kwargs=dict(fork=fork, server_index=i), daemon=True).start()
+deadline = time.monotonic() + 30
+while not (os.path.exists(pidfile) and len(open(pidfile).read().split()) == 4):
+    assert time.monotonic() < deadline
+    time.sleep(0.05)
+print("READY", flush=True)
+if HOW == "exit":
+    sys.exit(0)
+elif HOW == "exception":
+    raise RuntimeError("the end")
+elif HOW == "sigterm":
+    os.kill(os.getpid(), signal.SIGTERM)
+elif HOW == "sigkill":
+    os.kill(os.getpid(), signal.SIGKILL)
+time.sleep(60)
+'''
+
+#: Waits for every process of a scenario to be gone: the recorded PIDs and
+#: every member of the sessions that Brish started.
+GONE = r'''
+from tests.conftest import PRELUDE, SESSIONS_FILE, session_members
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+def left_behind(pids, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        left = sorted({p for p in pids if alive(p)} | set(session_members(SCRATCH)))
+        if not left or time.monotonic() > deadline:
+            return left
+        time.sleep(0.1)
+def grandchild(how, body):
+    return PRELUDE.format(root=ROOT, scratch=SCRATCH, binary=BINARY, sessions=SESSIONS_FILE) + "HOW = %r\n" % how + body
+'''
+
+
+@pytest.mark.parametrize("how", ["exit", "exception", "sigterm", "sigkill", "terminal"])
+def test_no_command_outlives_python(how):
+    #: However Python ends, its workers and the commands they run go with
+    #: it: the bootstrap reads its stdin until EOF, and then stops every
+    #: worker still running a command, with every process below it (see
+    #: docs/protocol.org, Processes). An idle worker exits by itself.
+    check(
+        r"""
+        import pty, select, subprocess
+        code = grandchild(HOW, DEATH)
+        t0 = None
+        if HOW == "terminal":
+            pid, fd = pty.fork()
+            if pid == 0:
+                try:
+                    os.execv(sys.executable, [sys.executable, "-c", code])
+                finally:
+                    os._exit(127)
+            buf = b""
+            deadline = time.monotonic() + 60
+            while b"READY" not in buf:
+                left = deadline - time.monotonic()
+                assert left > 0 and select.select([fd], [], [], left)[0], buf
+                try:
+                    buf += os.read(fd, 4096)
+                except OSError:
+                    raise AssertionError(buf)
+            t0 = time.monotonic()
+            os.close(fd)  # the terminal goes away: SIGHUP
+            _, status = os.waitpid(pid, 0)
+            rc = os.waitstatus_to_exitcode(status)
+            out = buf.decode(errors="replace")
+        else:
+            g = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            line = g.stdout.readline()
+            assert line == b"READY\n", (line, g.stderr.read())
+            t0 = time.monotonic()
+            out, err = g.communicate(timeout=60)
+            rc = g.returncode
+            out = (line + out + err).decode(errors="replace")
+        want = {"exit": 0, "exception": 1, "sigterm": -signal.SIGTERM,
+                "sigkill": -signal.SIGKILL, "terminal": -signal.SIGHUP}[HOW]
+        assert rc == want, (rc, out)
+        pids = [int(x) for x in open(os.path.join(SCRATCH, "pids")).read().split()]
+        assert len(pids) == 4, pids
+        left = left_behind(pids, 20)
+        assert not left, (left, out)
+        print(HOW, "everything gone after", round(time.monotonic() - t0, 2), "s")
+        """,
+        setup=GONE + "DEATH = %r\nHOW = %r\n" % (DEATH, how),
+        timeout=120,
+    )
+
+
+#: A worker whose reply a KeyboardInterrupt abandoned while its command
+#: runs: cleanup() and restart() stop that command, and every process below
+#: the worker, before they return.
+STALE = r'''
+pidfile = os.path.join(SCRATCH, "pids")
+W = "zmodload zsh/zselect; zselect -t 6000"
+rec = "zmodload zsh/system; print -r -- $sysparams[pid] >> " + pidfile + "; "
+cmd, n = (rec + W, 1) if FORK else (rec + "zsh -fc '" + rec + W + "'", 2)
+def interrupt_when_running():
+    deadline = time.monotonic() + 30
+    while not (os.path.exists(pidfile) and len(open(pidfile).read().split()) == n):
+        if time.monotonic() > deadline:
+            return
+        time.sleep(0.05)
+    os.kill(os.getpid(), signal.SIGINT)
+b = Brish(server_count=2)
+threading.Thread(target=interrupt_when_running, daemon=True).start()
+try:
+    b.send_cmd(cmd, fork=FORK, server_index=0)
+    raise SystemExit("no KeyboardInterrupt")
+except KeyboardInterrupt:
+    pass
+pids = [int(x) for x in open(pidfile).read().split()]
+assert len(pids) == n and all(alive(p) for p in pids), pids
+t = time.monotonic()
+if HOW == "cleanup":
+    b.cleanup()
+else:
+    assert b.restart() is True
+    r = b.send_cmd("print -r ok", server_index=0)
+    assert (r.retcode, r.out) == (0, "ok\n"), repr(r)
+    b.cleanup()
+dt = time.monotonic() - t
+left = left_behind(pids, 5)
+assert not left, (HOW, FORK, left)
+assert dt < 15, dt
+print(HOW, FORK, "took", round(dt, 2), "s")
+'''
+
+
+@pytest.mark.parametrize("how", ["cleanup", "restart"])
+@pytest.mark.parametrize("fork", [False, True], ids=["nonfork", "fork"])
+def test_cleanup_stops_an_abandoned_command(how, fork):
+    check(
+        STALE,
+        setup=GONE + "HOW = %r\nFORK = %r\n" % (how, fork),
+        timeout=90,
     )

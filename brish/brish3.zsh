@@ -291,6 +291,63 @@ brish3_close_specs 0
 #: a command sends (`kill -INT 0`), or under older Python a terminal Ctrl-C.
 builtin trap '' INT
 
+#: Python has closed the bootstrap's stdin: it is cleaning up, or it has
+#: ended, however it ended (normally, by an exception, a signal, SIGKILL, or
+#: a closed terminal). An idle worker exits by itself, since nobody writes
+#: its requests any more. A worker still alive a second later runs a
+#: command (one whose reply was abandoned, or one whose caller died): it is
+#: stopped with every process below it, background jobs of its earlier
+#: commands included, as kill()'s steps 2 to 4 would stop them: SIGTERM,
+#: and SIGKILL to whatever is left a second later. So no command outlives
+#: Python. Background jobs that idle workers' commands left are not
+#: touched, and neither is a process that left the worker's tree (a
+#: double fork). The waits go by the clock: a timed wait can take several
+#: times as long as asked on a loaded machine.
+#: @duplicateCode/f2d464e1ad6f4e3eaedeeb994de39d42 __brish2_stop_workers in brish2.zsh
+function brish3_stop_workers {  # $@: the workers' PIDs
+  builtin emulate -LR zsh
+  builtin local -a left todo f
+  builtin local -A below
+  builtin local p row zs= i round IFS=$' \t\n'
+  builtin local -F end
+  builtin zmodload zsh/zselect 2>/dev/null && zs=1
+  builtin zmodload zsh/datetime 2>/dev/null
+  left=( $@ )
+  for round in 1 2; do
+    #: Two rounds: first the workers, which idle ones leave by themselves;
+    #: then every process left below them, after SIGTERM.
+    end=$(( ${EPOCHREALTIME:-0} + 1 ))
+    for i in {1..1000}; do
+      todo=( $left ) left=()
+      for p in $todo; do
+        builtin kill -0 $p 2>/dev/null && left+=( $p )
+      done
+      (( $#left )) || builtin return 0
+      if (( ${+EPOCHREALTIME} )); then
+        (( EPOCHREALTIME < end )) || builtin break
+      elif (( i >= 50 )); then
+        builtin break
+      fi
+      if [[ -n $zs ]]; then builtin zselect -t 2; else command sleep 0.02; fi
+    done
+    (( round == 1 )) || builtin break
+    for row in "${(@f)$(command ps -Ao pid=,ppid= 2>/dev/null)}"; do
+      f=( ${=row} )
+      (( $#f == 2 )) && below[$f[2]]+=" $f[1]"
+    done
+    todo=( $left ) left=()
+    while (( $#todo )); do
+      p=$todo[1]
+      todo[1]=()
+      left+=( $p )
+      todo+=( ${=below[$p]} )
+    done
+    builtin kill -TERM $left 2>/dev/null
+  done
+  builtin kill -KILL $left 2>/dev/null
+  builtin return 0
+}
+
 function brish3_bootstrap_wait {
   builtin emulate -LR zsh
   local x
@@ -300,7 +357,7 @@ function brish3_bootstrap_wait {
   while IFS= builtin read -r x; do
     builtin true
   done
-  builtin kill -TERM $__brish3_pids 2>/dev/null
+  brish3_stop_workers $__brish3_pids
   builtin wait
 }
 brish3_bootstrap_wait
