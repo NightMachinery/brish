@@ -23,7 +23,17 @@ __brish2_dl=$'\n'"$__brish2_nul"$'\n'  # a reply delimiter, with the newline bef
 #: acts only deeper than itself, that is inside the command's function.
 builtin typeset -g __brish_trapfile=${${(%):-%x}:A:h}/trapint.zsh
 builtin typeset -g __brish_trap= __brish_trap_arg= __brish_int= __brish_pb= __brish_pb0= __brish_tb=
-builtin typeset -g __brish_trapbody= __brish_level=0 __brish_depth=1
+builtin typeset -g __brish_trapid= __brish_trapref= __brish_level=0 __brish_depth=1
+#: The worker tells its own TRAPINT from one that a command defined by the
+#: file the function came from, $functions_source[TRAPINT] (zsh 5.4 and
+#: later). Reading $functions[TRAPINT] instead turns the body back into text
+#: every time, which made each command about 4 us slower. Older zsh compare
+#: the body.
+if (( ${+functions_source} )); then
+    __brish_trapref='functions_source[TRAPINT]'
+else
+    __brish_trapref='functions[TRAPINT]'
+fi
 
 IFS= builtin read -r -d "$__brish2_nul" BRISH_STDIN
 IFS= builtin read -r -d "$__brish2_nul" BRISH_STDOUT
@@ -64,17 +74,17 @@ function __brish2_on_exit {  # $1: exit status
 #: (Re)define the worker's TRAPINT from trapint.zsh: once when the worker
 #: starts, and after a command replaced or removed it. Aliases and
 #: local_traps are off, so that the definition parses as written and outlasts
-#: this function. The body is kept, to tell this trap from a command's own.
-#: Without syswrite (zsh/system) or the trap file, the worker ignores SIGINT
-#: instead, as workers did before TRAPINT: it writes its replies with
-#: `print`, which a SIGINT trap would cut short.
+#: this function. What tells this trap from a command's own is kept (see
+#: __brish_trapref). Without syswrite (zsh/system) or the trap file, the
+#: worker ignores SIGINT instead, as workers did before TRAPINT: it writes
+#: its replies with `print`, which a SIGINT trap would cut short.
 #: @duplicateCode/9834d1f0406a4c3eb2f9b672e929d810 brish3_deftrap in brish3.zsh
 function __brish2_deftrap {
   builtin emulate -L zsh
   builtin setopt no_aliases no_local_traps
   if [[ -n $__brish2_sw ]]; then
     builtin source "$__brish_trapfile"
-    __brish_trapbody=${functions[TRAPINT]-}
+    __brish_trapid=${(P)__brish_trapref-}
   else
     builtin trap '' INT
   fi
@@ -211,7 +221,7 @@ for brish_server_index in {1..${#stdins}} ; do
                             builtin unsetopt posix_builtins
                         fi
                     fi
-                    [[ ${functions[TRAPINT]-} == "$__brish_trapbody" ]] || __brish2_deftrap
+                    [[ ${(P)__brish_trapref-} == "$__brish_trapid" ]] || __brish2_deftrap
                     #: `unfunction` frees the body with signals held back;
                     #: redefining it in the next eval would free it where a
                     #: SIGINT can run the trap, and zsh crashes when a trap

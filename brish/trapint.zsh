@@ -7,8 +7,9 @@
 # arrives then kills the worker. So the trap stays the same while the worker
 # idles, frames and runs commands, and variables that the worker sets for
 # the duration of each command decide what it does. The worker keeps the
-# trap's body (`${functions[TRAPINT]}`) from when it sourced this file, and
-# tells its own trap from one that a command defined by comparing the two.
+# file the trap came from (`$functions_source[TRAPINT]`; with zsh before 5.4,
+# the trap's body) from when it sourced this file, and tells its own trap
+# from one that a command defined by comparing the two.
 #
 # The worker sets these before the first command:
 #   __brish_level: its $ZSH_SUBSHELL;

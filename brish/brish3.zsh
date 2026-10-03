@@ -18,7 +18,17 @@ typeset -g BRISH3_CMD= BRISH3_RET=0 brish_stdin= cmd=
 typeset -g __brish_trapfile=${${(%):-%x}:A:h}/trapint.zsh
 [[ -r $__brish_trapfile ]] || { builtin print -ru2 -- "brish3: cannot read $__brish_trapfile"; builtin exit 70 }
 typeset -g __brish_trap= __brish_trap_arg= __brish_int= __brish_pb= __brish_pb0= __brish_tb=
-typeset -g __brish_trapbody= __brish_level=0 __brish_depth=3
+typeset -g __brish_trapid= __brish_trapref= __brish_level=0 __brish_depth=3
+#: The worker tells its own TRAPINT from one that a command defined by the
+#: file the function came from, $functions_source[TRAPINT] (zsh 5.4 and
+#: later). Reading $functions[TRAPINT] instead turns the body back into text
+#: every time, which made each command about 4 us slower. Older zsh compare
+#: the body.
+if (( ${+functions_source} )); then
+  __brish_trapref='functions_source[TRAPINT]'
+else
+  __brish_trapref='functions[TRAPINT]'
+fi
 typeset -g __brish3_req= __brish3_out= __brish3_err= __brish3_empty=
 typeset -g __brish3_nul= __brish3_nl= __brish3_startp= __brish3_endp=
 typeset -ga __brish3_specs __brish3_pids
@@ -122,13 +132,14 @@ function brish3_recv {
 #: (Re)define the worker's TRAPINT from trapint.zsh: once when the worker
 #: starts, and after a command replaced or removed it. Aliases and
 #: local_traps are off, so that the definition parses as written and outlasts
-#: this function. The body is kept, to tell this trap from a command's own.
+#: this function. What tells this trap from a command's own is kept (see
+#: __brish_trapref).
 #: @duplicateCode/9834d1f0406a4c3eb2f9b672e929d810 __brish2_deftrap in brish2.zsh
 function brish3_deftrap {
   builtin emulate -L zsh
   builtin setopt no_aliases no_local_traps
   builtin source "$__brish_trapfile"
-  __brish_trapbody=${functions[TRAPINT]-}
+  __brish_trapid=${(P)__brish_trapref-}
 }
 
 #: Run the request. No locals and no emulate here: user code runs inside and
@@ -196,7 +207,7 @@ function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data
         builtin unsetopt posix_builtins
       fi
     fi
-    [[ ${functions[TRAPINT]-} == "$__brish_trapbody" ]] || brish3_deftrap
+    [[ ${(P)__brish_trapref-} == "$__brish_trapid" ]] || brish3_deftrap
     #: `unfunction` frees the body with signals held back; redefining it
     #: in the next eval would free it where a SIGINT can run the trap, and
     #: zsh crashes when a trap runs inside free() (see trapint.zsh).

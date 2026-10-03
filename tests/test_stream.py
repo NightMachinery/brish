@@ -366,18 +366,27 @@ def test_kill_with_a_user_int_trap():
         r'''
         b = Brish(server_count=1)
         b.send_cmd("v=kept")
-        for fork in (False, True):
-            with b.popen("trap 'print -r caught' INT; sleep 100; print -r after", fork=fork) as p:
-                kill_later(p, 0.3)
-                evs = collect(p)
-            assert (p.retcode, joined(evs)) == (0, b"caught\nafter\n"), (fork, p.retcode, evs)
-            same_server_ok(b, 0)
-        #: The command's trap ended with the command.
-        with b.popen("sleep 100") as p:
-            kill_later(p, 0.3)
-            collect(p)
-        assert p.retcode == 130, p.retcode
-        same_server_ok(b, 0)
+        #: A trap string, a TRAPINT function, and a TRAPINT from a sourced
+        #: file, which the worker must tell from the one trapint.zsh defines.
+        traps = (
+            "trap 'print -r caught' INT",
+            "function TRAPINT { print -r caught; return 0 }",
+            "source =(print -r -- 'function TRAPINT { print -r caught; return 0 }')",
+        )
+        for trap in traps:
+            for fork in (False, True):
+                with b.popen(trap + "; sleep 100; print -r after", fork=fork) as p:
+                    kill_later(p, 0.3)
+                    evs = collect(p)
+                assert (p.retcode, joined(evs)) == (0, b"caught\nafter\n"), (trap, fork, p.retcode, evs)
+                same_server_ok(b, 0)
+                #: The command's trap ended with the command: the next one
+                #: is unwound, and nothing else runs.
+                with b.popen("sleep 100; print -r after") as p:
+                    kill_later(p, 0.3)
+                    evs = collect(p)
+                assert (p.retcode, joined(evs)) == (130, b""), (trap, fork, p.retcode, evs)
+                same_server_ok(b, 0)
         b.cleanup()
         '''
     )
