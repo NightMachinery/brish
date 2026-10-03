@@ -1878,12 +1878,27 @@ class BrishPopen:
         the reply to its end. So the command ends, the worker is idle and in
         sync once the owner frees it, and a restart does not wait for it
         (see Brish.cleanup)."""
+        if sys.is_finalizing():
+            #: Python is ending, and no thread can start any more: on
+            #: Python 3.10, Thread.start() then waits for good, so Python
+            #: never exited. Nothing is needed: Python's end closes the
+            #: bootstrap's stdin, which stops a busy worker with every
+            #: process below it.
+            return
         self._buffer = None  # nobody reads the result
         self._drained = threading.Event()
-        self._brish._orphans.append(self)
-        threading.Thread(
+        helper = threading.Thread(
             target=self._drain, daemon=True, name="brish-popen-orphan"
-        ).start()
+        )
+        self._brish._orphans.append(self)
+        try:
+            helper.start()
+        except BaseException:
+            #: No helper (newer Pythons raise at shutdown, or a thread
+            #: limit): the owner's next call abandons it instead (_reap),
+            #: and must not wait for a drain that never comes.
+            self._drained.set()
+            raise
 
     def _drain(self):
         try:

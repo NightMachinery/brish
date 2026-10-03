@@ -1221,6 +1221,62 @@ def test_a_popen_collected_in_another_thread():
     )
 
 
+#: A BrishPopen that is never closed, and is collected while Python ends, in
+#: another thread than its owner. VARIANT "exc": an executor job makes it
+#: and raises, and the main thread re-raises the job's exception, whose
+#: traceback holds the object; "global": a thread keeps it in a global.
+AT_EXIT = r'''
+late = os.path.join(SCRATCH, "late")
+cmd = "zmodload zsh/zselect; print -r a; zselect -t 6000; print -r late > " + late
+b = Brish(server_count=2)
+if VARIANT == "global":
+    box = []
+    t = threading.Thread(target=lambda: box.append(b.popen(cmd)))
+    t.start()
+    t.join()
+else:
+    import concurrent.futures as cf
+    pool = cf.ThreadPoolExecutor(1)
+    def job():
+        p = b.popen(cmd)
+        raise ValueError("boom")
+    pool.submit(job).result()
+'''
+
+
+@pytest.mark.parametrize("variant", ["exc", "global"])
+def test_an_unclosed_popen_collected_while_python_ends(variant):
+    #: No helper thread can start then. Before, its start() waited for good
+    #: on Python 3.10, and Python never exited (exc in both modes, global
+    #: in binary mode). Now Python ends at once, and the bootstrap stops
+    #: the busy worker: its command never gets to its last line.
+    run(
+        r'''
+        import subprocess
+        from tests.conftest import PRELUDE, SESSIONS_FILE, session_members
+        code = (PRELUDE.format(root=ROOT, scratch=SCRATCH, binary=BINARY, sessions=SESSIONS_FILE)
+                + "VARIANT = %r\n" % VARIANT + AT_EXIT)
+        t = time.monotonic()
+        try:
+            g = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("Python did not end")
+        dt = time.monotonic() - t
+        err = g.stderr.decode(errors="replace")
+        assert g.returncode == (1 if VARIANT == "exc" else 0), (g.returncode, err)
+        assert VARIANT != "exc" or "ValueError: boom" in err, err
+        deadline = time.monotonic() + 20
+        while session_members(SCRATCH) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not session_members(SCRATCH), session_members(SCRATCH)
+        assert not os.path.exists(os.path.join(SCRATCH, "late"))
+        print(VARIANT, "ended after", round(dt, 2), "s")
+        ''',
+        setup="AT_EXIT = %r\nVARIANT = %r\n" % (AT_EXIT, variant),
+        timeout=120,
+    )
+
+
 def test_kill_waits_for_a_long_report_under_a_slow_reader():
     #: A program that handles SIGINT by writing a 200 KB report and exiting,
     #: read at one chunk every three seconds (a slow chat bot's pace), with
