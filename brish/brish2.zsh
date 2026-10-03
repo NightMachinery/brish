@@ -181,8 +181,15 @@ for brish_server_index in {1..${#stdins}} ; do
                 IFS= builtin read -r -d "$__brish2_nul" cmd
             }
             do
-                IFS= builtin read -r -d "$__brish2_nul" brish_stdin
-                IFS= builtin read -r -d "$__brish2_nul" brish_fork
+                #: A request cut short (its writer closed the FIFO in the
+                #: middle of it, as Python's end does while it writes a
+                #: large stdin) is never run: `read` then fails, and the
+                #: worker ends with no request open, as a binary worker
+                #: does on EOF inside a payload. Every Python, old and new,
+                #: writes all three fields.
+                IFS= builtin read -r -d "$__brish2_nul" brish_stdin &&
+                    IFS= builtin read -r -d "$__brish2_nul" brish_fork ||
+                    builtin break
                 #: Set again for every request: zsh skips an EXIT trap that was
                 #: set while POSIX_TRAPS was off, if a command turned it on and a
                 #: later command exits from inside a function.

@@ -12,7 +12,7 @@ depend on an external program that something else might signal.
 
 import pytest
 
-from tests.conftest import check
+from tests.conftest import check, legacy_only
 
 WAIT = "zmodload zsh/zselect; zselect -t {cs}"  # centiseconds
 
@@ -345,4 +345,51 @@ def test_cleanup_stops_an_abandoned_command(how, fork):
         STALE,
         setup=GONE + "HOW = %r\nFORK = %r\n" % (how, fork),
         timeout=90,
+    )
+
+
+#: A Python that ends while it writes a request with a large cmd_stdin:
+#: SIGKILLed, or after it catches the KeyboardInterrupt and exits without
+#: another Brish call. HOW is "sigkill" or "caught".
+CUT = r'''
+count = os.path.join(SCRATCH, "count")
+signal.signal(signal.SIGINT, signal.default_int_handler)  # also when inherited ignored
+b = Brish(server_count=1)
+b.send_cmd("true")
+def end():
+    os.kill(os.getpid(), signal.SIGKILL if HOW == "sigkill" else signal.SIGINT)
+threading.Timer(0.4, end).start()
+try:
+    b.send_cmd("wc -c > " + count + "; print -r done", cmd_stdin=b"y" * (8 << 20))
+    print("send_cmd returned", flush=True)
+except KeyboardInterrupt:
+    print("caught KeyboardInterrupt", flush=True)
+    sys.exit(0)
+'''
+
+
+@legacy_only
+@pytest.mark.parametrize("how", ["sigkill", "caught"])
+def test_a_request_cut_short_never_runs(how):
+    #: Python's end closes the request FIFO in the middle of the request.
+    #: The legacy worker exits without running it, as a binary worker does
+    #: on EOF inside a payload (before, it ran the command on the part of
+    #: the stdin that had arrived, after Python was gone: 3 of 3 runs).
+    #: Legacy mode reads a request one byte per system call, so 8 MiB take
+    #: seconds, and the end at 0.4 s cuts it.
+    check(
+        r"""
+        import subprocess
+        g = subprocess.run([sys.executable, "-c", grandchild(HOW, CUT)], capture_output=True, timeout=60)
+        out = (g.stdout + g.stderr).decode(errors="replace")
+        want = {"sigkill": -signal.SIGKILL, "caught": 0}[HOW]
+        assert g.returncode == want, (g.returncode, out)
+        assert "send_cmd returned" not in out, out  # the request was cut short
+        left = left_behind([], 20)
+        assert not left, (left, out)
+        count = os.path.join(SCRATCH, "count")
+        assert not os.path.exists(count), (open(count).read(), out)
+        """,
+        setup=GONE + "CUT = %r\nHOW = %r\n" % (CUT, how),
+        timeout=120,
     )
