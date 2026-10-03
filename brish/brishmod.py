@@ -2639,16 +2639,17 @@ class Brish:
         Returns a BrishPopen: in binary mode once the worker has read the
         whole request and is starting the command, in legacy mode once the
         request is written (the first popen after a legacy start reads the
-        workers' PIDs from the bootstrap, or asks a custom shell's worker). Iterating it yields (stream, chunk)
-        pairs: `stream` is "out" or "err", `chunk` is non-empty bytes, as
-        read. Only the bytes that could start the end of the reply are held
-        back until the next read: in binary mode a suffix that starts at a
-        NUL, in legacy mode a trailing newline (or newline and NUL). A
-        caller that stops reading blocks the command once Brish and the
-        pipes hold what it wrote (binary: one read of up to 64 KiB per
-        stream; legacy: a queue of 64 KiB for both streams); one that falls
-        behind gets fewer, larger chunks (up to 64 KiB). `retcode` is None
-        until the command has ended.
+        workers' PIDs from the bootstrap, or asks a custom shell's worker).
+        Iterating it yields (stream, chunk) pairs: `stream` is "out" or
+        "err", `chunk` is non-empty bytes, as read. Only the bytes that
+        could start the end of the reply are held back until the next read:
+        in binary mode a suffix that starts at a NUL, in legacy mode a
+        trailing newline (or newline and NUL). A caller that stops reading
+        blocks the command once Brish and the pipes hold what it wrote
+        (binary: one read of up to 64 KiB per stream; legacy: a queue of 64
+        KiB for both streams); one that falls behind gets fewer, larger
+        chunks (up to 64 KiB). `retcode` is None until the command has
+        ended.
 
         The arguments are those of send_cmd. With buffer=True, the chunks
         that iteration or wait() consumed are also kept, and `result` gives
@@ -2698,9 +2699,12 @@ class Brish:
         up to 256 KiB ahead of the caller, so a command that ends at the
         signal and writes less than that meanwhile is not escalated, however
         slowly the caller reads. Background jobs of earlier commands are
-        descendants of the worker too, and are stopped by steps 2 to 4. """
-        return BrishPopen( self, cmd, cmd_stdin=cmd_stdin, fork=fork,
-        server_index=server_index, lock_sleep=lock_sleep, buffer=buffer, )
+        descendants of the worker too, and are stopped by steps 2 to 4.
+        """
+        return BrishPopen(
+            self, cmd, cmd_stdin=cmd_stdin, fork=fork, server_index=server_index,
+            lock_sleep=lock_sleep, buffer=buffer,
+        )
 
     def zpopen(self, template, locals_=None, getframe=2, **kwargs):
         """popen() of `zstring(template)`, as z() is send_cmd() of it."""
