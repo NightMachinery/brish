@@ -282,6 +282,41 @@ def test_kill_signals_the_worker_before_its_descendants():
     )
 
 
+def test_no_sigkill_for_a_command_that_has_ended():
+    #: Before step 4 SIGKILLs the worker, Brish reads what the pipes already
+    #: hold and looks for the end of the reply. With a slow reader, the end
+    #: of a command that ended just after a step waits behind output that
+    #: Brish has not read, and step 3 then finds no processes below the
+    #: worker (for a fork command: because its subshell has exited). Here
+    #: the command has ended unread when step 3 is taken; it used to cost
+    #: the worker (9001 and a restart).
+    run(
+        r'''
+        b = Brish(server_count=1)
+        for fork in (True, False):
+            b.send_cmd("v=kept")
+            body = "print -r x; print -ru2 e; " + ("exit 7" if fork else "return 7")
+            with b.popen(body, fork=fork) as p:
+                deadline = time.monotonic() + 10
+                while p._worker_pid is None or bm._descendants(p._worker_pid):
+                    assert time.monotonic() < deadline, fork
+                    time.sleep(0.05)
+                time.sleep(0.5)
+                assert not p._finished, fork
+                with p._mu:
+                    p._stage = 2
+                    p._signalled()
+                p._escalate()
+                assert (p._stage, p._finished) == (2, True), (fork, p._stage, p._finished)
+                evs = collect(p)
+            assert (p.retcode, joined(evs), joined(evs, "err")) == (7, b"x\n", b"e\n"), (fork, p.retcode, evs)
+            same_server_ok(b, 0)
+        b.cleanup()
+        ''',
+        timeout=60,
+    )
+
+
 def test_kill_under_errexit_and_sh_emulation():
     #: zsh exits instead of unwinding when an interrupt meets err_exit (or
     #: err_return at the legacy worker's top level), or a special builtin

@@ -1683,11 +1683,52 @@ class BrishPopen:
             if not self._p.binary:
                 self._q.raise_limit(_LEGACY_QUEUE_BYTES + _KILL_READ_AHEAD)
 
+    def _peek_end(self):
+        """Before SIGKILL to the worker: look for the end of the reply in
+        what the pipes already hold beyond the read-ahead (up to _PIPE_SLACK
+        more bytes, for up to _SETTLE_MAX seconds). A command that ended
+        just after the last step can have its end waiting there, behind
+        output the caller has not read yet. Returns whether the command has
+        ended."""
+        deadline = time.monotonic() + _SETTLE_MAX
+        if self._p.binary:
+            limit = self._nread + _PIPE_SLACK
+            while not self._finished and self._nread < limit and time.monotonic() < deadline:
+                if not self._pump_binary(_SETTLE):
+                    break
+        else:
+            rout, rerr = self._rout, self._rerr
+            self._q.raise_limit(self._q.limit + _PIPE_SLACK)
+            for r in (rout, rerr):
+                r.thread.join(max(0.0, deadline - time.monotonic()))
+            if rout.done and rerr.done and not self._finished:
+                self._legacy_drain_queue()
+                self._legacy_complete()
+        return self._finished
+
     def _escalate(self):
         pid = self._worker_pid
         stage = self._stage + 1
         if stage <= 4:
             pids = _descendants(pid) if pid else []
+            if not pids and (stage == 3 or stage == 4):
+                #: Next is SIGKILL to the worker (step 4). Without processes
+                #: below it, the command may have ended with its end held
+                #: behind the caller; then there is nothing to kill.
+                if self._peek_end():
+                    return
+                if stage == 3 and self.fork:
+                    #: A fork command's subshell has exited: the worker has
+                    #: only the end to write, and runs no loop that ignores
+                    #: the signals. Step 4 only if it has not, a grace later.
+                    with self._mu:
+                        if self._finished:
+                            return
+                        self._stage = 3
+                        self._signalled()
+                    return
+            elif stage == 4 and self._peek_end():
+                return
             with self._mu:
                 if self._finished:
                     return
@@ -2585,20 +2626,23 @@ class Brish:
         leaves a `with` block that holds the object. kill() works from any
         thread, is idempotent, and interrupts the command, not the worker.
         Step 1: SIGINT to the worker, then its descendants (the worker aborts
-        the command as Ctrl-C does in an interactive shell, and its retcode
-        is 130 unless the command traps INT). Step 2: SIGINT to the worker
-        again, then SIGTERM to the descendants. Step 3: SIGKILL to the
-        descendants, or step 4 at once if there are none. Step 4: SIGKILL to the worker, which gives the
-        retcode 9001 with WORKER_DIED_NOTE as the last chunk, and restarts
-        the instance before its next use. The steps stop once the command
-        has ended; each comes `kill_grace` seconds (default 2) after the
-        previous step's signals went out when the command has gone quiet, or
-        two graces after them while its output keeps coming. After the
-        first signal Brish reads up to 256 KiB ahead of the caller, so a
-        command that ends at the signal and writes less than that meanwhile
-        is not escalated, however slowly the caller reads. Background jobs
-        of earlier commands are descendants of the worker too, and are
-        stopped by steps 2 to 4.
+        the command as Ctrl-C does in an interactive shell, and its retcode is
+        130 unless the command traps INT). Step 2: SIGINT to the worker again,
+        then SIGTERM to the descendants. Step 3: SIGKILL to the descendants,
+        or step 4 at once if there are none (for a fork command, whose
+        subshell has then exited, a grace later and only if its end has not
+        shown up). Step 4: SIGKILL to the worker, which gives the retcode 9001
+        with WORKER_DIED_NOTE as the last chunk, and restarts the instance
+        before its next use; before it, Brish reads up to 128 KiB more of what
+        the pipes hold, looking for the end of the reply. The steps stop once
+        the command has ended; each comes `kill_grace` seconds (default 2)
+        after the previous step's signals went out when the command has gone
+        quiet, or two graces after them while its output keeps coming. After
+        the first signal Brish reads up to 256 KiB ahead of the caller, so a
+        command that ends at the signal and writes less than that meanwhile is
+        not escalated, however slowly the caller reads. Background jobs of
+        earlier commands are descendants of the worker too, and are stopped by
+        steps 2 to 4.
         """
         return BrishPopen(
             self, cmd, cmd_stdin=cmd_stdin, fork=fork, server_index=server_index,
