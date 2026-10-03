@@ -607,6 +607,69 @@ def test_escalation_to_the_worker():
     )
 
 
+def test_reads_after_kill_wait_for_its_first_signal():
+    #: kill() sends its first SIGINT from a helper thread, after one `ps`
+    #: run. A read meanwhile (here close(), right after kill()) used to drain
+    #: the pipes, so a command held up by a full pipe ran on, to its end, and
+    #: the statement after it ran too, before the signal came. A slow `ps`
+    #: (1 s, as on a loaded machine) makes that window wide here. Now a read
+    #: after kill() first waits for the signal (at most kill_grace), and
+    #: `signalled` and `wait_signalled()` tell when it is out.
+    run(
+        r"""
+        sentinel = os.path.join(SCRATCH, "sentinel")
+        real = bm._descendants
+        def slow(pid):
+            time.sleep(1.0)
+            return real(pid)
+        b = Brish(server_count=1)
+        with b.popen("print -r -- x") as p:
+            assert (p.signalled, p.wait_signalled()) == (False, False)  # no kill()
+            assert p.wait() == 0
+        p.kill()  # it has ended: nothing to signal
+        assert (p.signalled, p.wait_signalled()) == (False, False)
+        for fork in (False, True):
+            p = b.zpopen("yes | head -c 20000000; : > {sentinel}", fork=fork)
+            next(p)  # it runs; with nobody reading, it blocks on a full pipe
+            time.sleep(0.3)
+            bm._descendants = slow
+            try:
+                t0 = time.monotonic()
+                p.kill()
+                assert not p.signalled
+                p.close()
+                dt = time.monotonic() - t0
+            finally:
+                bm._descendants = real
+            assert p.signalled and p.wait_signalled(0), p
+            assert p.retcode == 130, (fork, p.retcode)
+            assert not os.path.exists(sentinel), (fork, "the statement after it ran")
+            assert dt > 0.9, dt  # close() waited for the signal
+        #: wait_signalled() from another thread, and its own bound.
+        p = b.popen("yes | head -c 20000000; : > " + sentinel)
+        next(p)
+        time.sleep(0.3)
+        bm._descendants = slow
+        try:
+            p.kill()
+            got = []
+            t = threading.Thread(target=lambda: got.append(p.wait_signalled()))
+            t.start()
+            assert p.wait_signalled(0.2) is False  # a timeout, before the signal
+            t.join(5)
+            assert got == [True], got
+        finally:
+            bm._descendants = real
+        p.close()
+        assert p.retcode == 130 and not os.path.exists(sentinel), p.retcode
+        same = b.send_cmd("print -r ok")
+        assert same.out == "ok\n", repr(same)
+        b.cleanup()
+        """,
+        timeout=120,
+    )
+
+
 def test_leaving_early_kills_and_frees_the_worker():
     run(
         r'''

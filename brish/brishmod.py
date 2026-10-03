@@ -1116,6 +1116,11 @@ class BrishPopen:
         #: Set once kill() has sent its first signal; then Brish reads
         #: ahead. _step_nread: the bytes read when the last step was taken.
         self._ahead = False
+        #: Set when kill()'s first signal is out, or its helper thread found
+        #: the command ended (see signalled). _kill_t: when kill() was
+        #: called.
+        self._signal_done = threading.Event()
+        self._kill_t = None
         self._nread = 0  # binary mode; legacy readers count their own
         self._step_nread = 0
         self._buffer = ([], []) if buffer else None
@@ -1643,6 +1648,13 @@ class BrishPopen:
         while True:
             if self._stage and not self._finished:
                 try:
+                    if not self._ahead:
+                        #: kill() was called, and its first signal is not
+                        #: out yet. Reading now would drain the pipes, so a
+                        #: command held up by backpressure would run on (and
+                        #: a command after it in the same line too) before
+                        #: the signal lands. Wait for it, at most a grace.
+                        self._wait_first_signal(None)
                     self._kill_step()
                 except BaseException:
                     self._abandon()
@@ -1770,6 +1782,7 @@ class BrishPopen:
             self._ahead = True
             if not self._p.binary:
                 self._q.raise_limit(_LEGACY_QUEUE_BYTES + _KILL_READ_AHEAD)
+            self._signal_done.set()
 
     def _peek_end(self):
         """Before SIGKILL to the worker: look for the end of the reply in
@@ -1856,7 +1869,7 @@ class BrishPopen:
         with self._mu:
             if self._finished or self._stage:
                 return
-            self._stage_t = time.monotonic()
+            self._stage_t = self._kill_t = time.monotonic()
             self._stage = 1
             delay = max(0.0, getattr(self, "_started_at", 0.0) + _KILL_SETTLE - self._stage_t)
         threading.Thread(
@@ -1865,6 +1878,35 @@ class BrishPopen:
 
     terminate = kill
 
+    @property
+    def signalled(self):
+        """Whether kill()'s first signal (SIGINT to the worker and the
+        processes below it) is out. False before kill(), and when the
+        command had ended before the signal was due. Any thread may read
+        it."""
+        return self._ahead
+
+    def wait_signalled(self, timeout=None):
+        """Wait until kill()'s first signal is out, and return `signalled`.
+
+        Returns at once when there is nothing to wait for: kill() was not
+        called, or the command had ended. Waits at most kill_grace seconds
+        after kill() (and at most `timeout` seconds), which is also how
+        long a read after kill() waits for the signal: until it is out, the
+        output is not read, so that a command held up by a full pipe does
+        not run on meanwhile. Any thread may call it."""
+        if self._stage and not self._ahead and not self._finished:
+            self._wait_first_signal(timeout)
+        return self._ahead
+
+    def _wait_first_signal(self, timeout):
+        kill_t = self._kill_t
+        left = (kill_t if kill_t is not None else time.monotonic()) + self.kill_grace - time.monotonic()
+        if timeout is not None:
+            left = min(left, timeout)
+        if left > 0:
+            self._signal_done.wait(left)
+
     def _interrupt(self, delay):
         if delay:
             time.sleep(delay)
@@ -1872,6 +1914,7 @@ class BrishPopen:
         pids = _descendants(pid) if pid else []
         with self._mu:
             if self._finished:
+                self._signal_done.set()
                 return
             #: The worker before its descendants. zsh runs the worker's trap
             #: once the foreground child it waits for has exited, so the trap
@@ -3307,6 +3350,11 @@ class Brish:
         signal and writes less than that meanwhile is not escalated, however
         slowly the caller reads. Background jobs of earlier commands are
         descendants of the worker too, and are stopped by steps 2 to 4.
+        Step 1 goes out from a helper thread after one `ps` run; until then
+        a read after kill() waits for it (at most `kill_grace` seconds) and
+        reads nothing, so a command that a full pipe holds up does not run
+        on meanwhile. `signalled` tells whether it is out, and
+        `wait_signalled()` waits for it.
         """
         return BrishPopen(
             self, cmd, cmd_stdin=cmd_stdin, fork=fork, server_index=server_index,
