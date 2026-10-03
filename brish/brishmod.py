@@ -556,7 +556,7 @@ def _parse_trailer(trailer):
 class _Worker:
     """Python's side of one BRISH3 worker."""
 
-    __slots__ = ("index", "req", "out", "err", "pid", "sel", "stale")
+    __slots__ = ("index", "req", "out", "err", "pid", "sel", "stale", "broken")
 
     def __init__(self, index, req, out, err):
         self.index = index
@@ -568,6 +568,11 @@ class _Worker:
         #: The last reply was abandoned by an interrupt. The next request
         #: resynchronises through its START marker.
         self.stale = False
+        #: A request frame was cut short, so the worker may hold part of one
+        #: and would read the next request as its rest: it takes no request
+        #: again (a lock holder gets BrishWorkerDiedException), and the
+        #: instance restarts before its next use.
+        self.broken = False
 
     def close(self):
         if self.sel is not None:
@@ -1003,8 +1008,11 @@ class BrishPopen:
 
     def _start_binary(self, p, index, cmd_b, stdin_b, fork):
         """Write the frame and wait for START. Returns _NEVER_RAN if the
-        worker died before START; then the lock is still held."""
+        worker died before START, or is broken; then the lock is still
+        held."""
         w = p.workers[index]
+        if w.broken:
+            return _NEVER_RAN
         self._w = w
         self._worker_pid = w.pid
         nonce = secrets.token_hex(16).encode()
@@ -1037,6 +1045,7 @@ class BrishPopen:
                 w.stale = True
             else:
                 #: The worker may hold part of a frame.
+                w.broken = True
                 self._brish._request_restart(p.gen)
             self._release()
             raise
@@ -1390,6 +1399,7 @@ class BrishPopen:
                     elif self._sent >= self._total:
                         self._w.stale = True
                     else:
+                        self._w.broken = True
                         restart = True
             elif not already:
                 for r in (getattr(self, "_rout", None), getattr(self, "_rerr", None)):
@@ -2090,9 +2100,10 @@ class Brish:
         if self._holds_worker_lock():
             self._request_restart(p.gen)
             raise BrishWorkerDiedException(
-                f"worker {index} cannot take a command (it died, or a reply on it was "
-                "abandoned), and this thread holds a worker lock, so the instance "
-                "cannot restart now; release the lock (it restarts before its next use)"
+                f"worker {index} cannot take a command (it died, or a request or reply "
+                "on it was abandoned), and this thread holds a worker lock, so the "
+                "instance cannot restart now; release the lock (it restarts before "
+                "its next use)"
             )
         self._restart_now(p.gen)
 
@@ -2230,13 +2241,15 @@ class Brish:
             lock.release()
 
     def _worker_order(self, p):
+        """The order in which server_index=None tries the workers: in binary
+        mode, idle ones first, then stale ones (whose next request waits for
+        an abandoned command), then broken ones (which take no request)."""
         n = len(self.locks)
         if not getattr(p, "binary", False):
             return range(n)
         workers = p.workers
-        return [i for i in range(n) if not workers[i].stale] + [
-            i for i in range(n) if workers[i].stale
-        ]
+        rank = [2 if w.broken else 1 if w.stale else 0 for w in workers]
+        return sorted(range(n), key=rank.__getitem__)
 
     def send_cmd(
         self, cmd, cmd_stdin="", fork=False, server_index=None, lock_sleep=1
@@ -2400,11 +2413,13 @@ class Brish:
     def _binary_transact(self, p, w, frame, nonce):
         """One request/response exchange with worker `w`.
 
-        Returns _NEVER_RAN if the worker died before START, or
+        Returns _NEVER_RAN if the worker died before START or is broken, or
         (retcode, outb, errb, restart). The frame is written non-blocking
         inside the loop that drains both response pipes, so neither side can
         block the other.
         """
+        if w.broken:
+            return _NEVER_RAN
         start = b"\0BRISH3-START:" + nonce + b"\n"
         end = b"\0BRISH3-END:" + nonce + b":"
         so, se = _StreamParser(start, end), _StreamParser(start, end)
@@ -2488,7 +2503,9 @@ class Brish:
             elif attempted:
                 #: The worker may hold part of a frame (an interrupt can land
                 #: after a write returned but before `sent` was updated), and
-                #: only a restart recovers from that.
+                #: only a restart recovers from that. Until then nothing may
+                #: reach it, also not from a thread that holds its lock.
+                w.broken = True
                 self._request_restart(p.gen)
             raise
         finally:

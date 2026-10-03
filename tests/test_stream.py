@@ -4,7 +4,7 @@ Every test runs in both modes. Timing assertions use wide margins: they tell
 "arrives while the command runs" from "arrives when it ends".
 """
 
-from tests.conftest import BINARY, check, legacy_only
+from tests.conftest import BINARY, binary_only, check, legacy_only
 
 HELPERS = r'''
 from brish.brishmod import BrishPopen, BrishWorkerDiedException
@@ -991,6 +991,61 @@ def test_kill_waits_for_a_long_report_under_a_slow_reader():
         b.cleanup()
         """,
         timeout=180,
+    )
+
+
+@binary_only
+def test_binary_a_cut_request_frame_takes_the_worker_out():
+    #: An interrupt while the request frame is still being written leaves the
+    #: worker holding part of a frame. It takes no request again: a thread
+    #: that holds its lock gets BrishWorkerDiedException at once (before, its
+    #: next request was read as the rest of the old frame, ran as code inside
+    #: the old command, and hung), and the instance restarts after the
+    #: release. Injected here; a Ctrl-C in the main thread in real life.
+    run(
+        r"""
+        import faulthandler; faulthandler.dump_traceback_later(50, exit=True)
+        b = Brish(server_count=2)
+        real_write = os.write
+        for op in ("popen", "send_cmd"):
+            for i in (0, 1):
+                b.send_cmd(f"v=kept{i}", server_index=i)
+            gen = b._gen
+            req = b.p.workers[0].req
+            def cut(fd, data):
+                if fd == req and len(data) > 1000:
+                    real_write(fd, bytes(data[: len(data) - 500]))  # inside the stdin
+                    raise KeyboardInterrupt("cut")
+                return real_write(fd, data)
+            lock, _ = b.acquire_lock(server_index=0)
+            try:
+                os.write = cut
+                try:
+                    getattr(b, op)("print -r first", cmd_stdin="x" * 1000, server_index=0)
+                    raise SystemExit("no KeyboardInterrupt")
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    os.write = real_write
+                t0 = time.monotonic()
+                for call in (b.send_cmd, b.popen):
+                    try:
+                        r = call("print -r -- second-$v", cmd_stdin="y" * 600, server_index=0)
+                        raise SystemExit(f"the half-fed worker took a request: {r!r}")
+                    except bm.BrishWorkerDiedException as e:
+                        assert "abandoned" in str(e), e
+                assert time.monotonic() - t0 < 5, "not at once"
+                #: The other worker works on under the same lock.
+                r = b.send_cmd("print -r -- other-$v", server_index=1)
+                assert r.out == "other-kept1\n", (op, r)
+            finally:
+                lock.release()
+            #: After the release, the instance restarts before its next use.
+            r = b.send_cmd("print -r -- next-${v-unset}", server_index=0)
+            assert r.out == "next-unset\n", (op, r)
+            assert b._gen != gen, op
+        b.cleanup()
+        """
     )
 
 
