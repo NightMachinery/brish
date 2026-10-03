@@ -130,9 +130,25 @@ function __brish2_write_stdin {
   fi
 }
 
+#: A bootstrap that Python starts to replace one worker of a larger pool (see
+#: docs/protocol.org, "Slots") gets BRISH_SERVER_INDEX_OFFSET, the 0-based
+#: index of the first slot it serves: it is added to each worker's 1-based
+#: index, so that $brish_server_index is the slot's, as in the pool's own
+#: bootstrap. Unset (as older Python leaves it), it is 0 and nothing changes.
+#: Commands do not inherit the variable.
+#: @duplicateCode/21ca36344d874147ae4ab89e816af523 the offset in brish3.zsh
+builtin typeset -g __brish2_offset=${BRISH_SERVER_INDEX_OFFSET:-0}
+builtin unset BRISH_SERVER_INDEX_OFFSET
+if [[ $__brish2_offset != <-> ]]; then
+    builtin print -ru2 -- "brish2: bad BRISH_SERVER_INDEX_OFFSET: $__brish2_offset"
+    builtin exit 64
+fi
+
 builtin typeset -ga __brish2_pids
-builtin local brish_server_index
-for brish_server_index in {1..${#stdins}} ; do
+#: __brish2_i is the worker's own index into the FIFO lists.
+builtin local brish_server_index __brish2_i
+for __brish2_i in {1..${#stdins}} ; do
+    brish_server_index=$(( __brish2_i + __brish2_offset ))
     (
         #: fd 0 is the request FIFO. Commands never inherit it: they run with
         #: stdin redirected at the call site, so zsh keeps fd 0 in a private
@@ -300,10 +316,10 @@ for brish_server_index in {1..${#stdins}} ; do
                 __brish2_eof=1
             fi
         done
-    ) < $stdins[$brish_server_index] >> $stdouts[$brish_server_index] 2>> $stderrs[$brish_server_index] &
+    ) < $stdins[$__brish2_i] >> $stdouts[$__brish2_i] 2>> $stderrs[$__brish2_i] &
     #: Quoted: zsh 5.9 stores a subscripted assignment from a bare `$!` as
     #: the two characters `$!`, which made every worker look dead.
-    __brish2_pids[brish_server_index]="$!"
+    __brish2_pids[__brish2_i]="$!"
 done
 
 #: A worker that dies without answering (errexit, `${x:?}`, a signal, `exec`)

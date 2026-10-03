@@ -290,11 +290,27 @@ function brish3_serve {
 
 brish3_parse_argv "$@" || builtin exit 64
 
+#: A bootstrap that Python starts to replace one worker of a larger pool (see
+#: docs/protocol.org, "Slots") gets BRISH_SERVER_INDEX_OFFSET, the 0-based
+#: index of the first slot it serves: it is added to each worker's 1-based
+#: index, so that $brish_server_index is the slot's, as in the pool's own
+#: bootstrap. Unset (as older Python leaves it), it is 0 and nothing changes.
+#: Commands do not inherit the variable.
+#: @duplicateCode/21ca36344d874147ae4ab89e816af523 the offset in brish2.zsh
+typeset -g __brish3_offset=${BRISH_SERVER_INDEX_OFFSET:-0}
+builtin unset BRISH_SERVER_INDEX_OFFSET
+if [[ $__brish3_offset != <-> ]]; then
+  builtin print -ru2 -- "brish3: bad BRISH_SERVER_INDEX_OFFSET: $__brish3_offset"
+  builtin exit 64
+fi
+
 #: Fork the workers at top level, so that each inherits the options and state
 #: the startup files left behind. `$brish_server_index` is 1-based, as in
-#: brish2.zsh.
+#: brish2.zsh; __brish3_i is the worker's own index into the fd triples.
 typeset -g brish_server_index
-for (( brish_server_index = 1; brish_server_index <= $#__brish3_specs; brish_server_index++ )); do
+integer __brish3_i
+for (( __brish3_i = 1; __brish3_i <= $#__brish3_specs; __brish3_i++ )); do
+  brish_server_index=$(( __brish3_i + __brish3_offset ))
   (
     builtin trap 'brish3_on_exit $?' EXIT
     __brish_level=$ZSH_SUBSHELL
@@ -306,7 +322,7 @@ for (( brish_server_index = 1; brish_server_index <= $#__brish3_specs; brish_ser
       #: put back.
       __brish_trapref=__brish_trapid
     fi
-    brish3_setup $brish_server_index
+    brish3_setup $__brish3_i
     brish3_serve
   ) &
   __brish3_pids+=( $! )
