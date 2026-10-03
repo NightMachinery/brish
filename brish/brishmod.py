@@ -363,26 +363,30 @@ def _stop_pids(pids, grace=1.0):
     _signal_pids([pid for pid in pids if _alive(pid)], signal.SIGKILL)
 
 
-def _acquire_all(locks):
-    """Acquire every lock in `locks`, without ever blocking on one while
+def _acquire_all(locks, skip=None):
+    """Acquire every lock in `locks`, except those at an index `i` where
+    `skip(i)` is true when it comes up, without ever blocking on one while
     holding another. A thread that holds one worker lock and waits for a
     second (both at the same time are fine) can then never deadlock with a
-    restart that waits for all of them."""
+    restart that waits for all of them. Returns the locks taken."""
     while True:
         taken = []
         busy = None
-        for lock in locks:
+        for i, lock in enumerate(locks):
             if lock.acquire(blocking=False):
                 taken.append(lock)
+            elif skip is not None and skip(i):
+                continue
             else:
                 busy = lock
                 break
         if busy is None:
-            return
+            return taken
         for lock in reversed(taken):
             lock.release()
-        busy.acquire()
-        busy.release()
+        #: Poll, since whether a lock may be skipped can change meanwhile.
+        if busy.acquire(timeout=_POLL):
+            busy.release()
 
 
 def _alive(pid):
@@ -927,6 +931,10 @@ class BrishPopen:
         self.server_index = None
         self._brish = brish
         self._owner = threading.get_ident()
+        self._owner_thread = threading.current_thread()
+        #: The owner already held the worker's lock (acquire_lock) when this
+        #: took it (see _orphan_holds).
+        self._reentered = False
         self._mu = Lock()  # guards _finished, _stage and signal sending
         self._finished = False
         self._released = True  # until a worker lock is taken
@@ -979,9 +987,13 @@ class BrishPopen:
                 return
             start = self._start_legacy
         for attempt in range(2):
+            #: A lock this thread holds belongs to the current generation,
+            #: which cannot change while it is held.
+            owned = [lk for lk in b.locks if lk._is_owned()]
             lock, index, p = b._acquire(server_index, lock_sleep)
             try:
                 self._lock, self.server_index, self._p = lock, index, p
+                self._reentered = any(lk is lock for lk in owned)
                 self._released = False
                 p.free_server_count -= 1
                 p.popen_owner[index] = self._owner
@@ -1353,16 +1365,21 @@ class BrishPopen:
         return nl
 
     def _release(self, restart=False):
-        """Free the worker. Only in the owner thread."""
+        """Free the worker. Its lock is an RLock of the owner thread, so only
+        the owner can release it: called in another thread (an orphan's
+        helper thread, see _orphan), this only requests the restart, and the
+        owner releases the lock at its next call (Brish._reap_orphans)."""
         if self._released:
             return
-        self._released = True
         p = self._p
+        if restart:
+            self._brish._request_restart(p.gen)
+        if threading.get_ident() != self._owner:
+            return
+        self._released = True
         p.free_server_count += 1
         p.popen_owner[self.server_index] = None
         self._lock.release()
-        if restart:
-            self._brish._request_restart(p.gen)
 
     def _legacy_reply_read(self):
         """Whether both legacy reader threads have read their whole reply
@@ -1434,6 +1451,11 @@ class BrishPopen:
     def _next_event(self):
         """The next (stream, chunk), or None once the output is complete."""
         self._check_owner()
+        return self._read_event()
+
+    def _read_event(self):
+        """_next_event without the owner check: also an orphan's helper
+        thread reads this way (see _orphan)."""
         while True:
             if self._stage and not self._finished:
                 try:
@@ -1692,14 +1714,61 @@ class BrishPopen:
             if threading.get_ident() == self._owner:
                 self._abandon()
             else:
-                #: Collected in another thread. Only the owner can release
-                #: its worker lock, so the command is killed now and the
-                #: owner gives the worker up at its next call to the
-                #: instance (Brish._reap_orphans).
-                self.kill()
-                self._brish._orphans.append(self)
+                self._orphan()
         except Exception:
             pass
+
+    def _orphan(self):
+        """Collected in another thread than its owner, which alone can
+        release the worker lock (an RLock); it does so at its next call to
+        the instance (Brish._reap_orphans). Meanwhile a helper thread does
+        what close() would: it kills the command, with every step, and reads
+        the reply to its end. So the command ends, the worker is idle and in
+        sync once the owner frees it, and a restart does not wait for it
+        (see Brish.cleanup)."""
+        self._buffer = None  # nobody reads the result
+        self._drained = threading.Event()
+        self._brish._orphans.append(self)
+        threading.Thread(
+            target=self._drain, daemon=True, name="brish-popen-orphan"
+        ).start()
+
+    def _drain(self):
+        try:
+            self.kill()
+            while self._read_event() is not None:
+                pass
+        except BaseException:
+            pass
+        finally:
+            self._drained.set()
+            #: An owner that has ended will never free the worker: restart
+            #: before the next use, which no longer waits for this lock.
+            if not self._owner_thread.is_alive():
+                self._brish._request_restart(self._p.gen)
+
+    def _reap(self):
+        """In the owner thread: free the worker of an orphan, once its
+        helper thread is done (the kill escalates, so it ends)."""
+        drained = getattr(self, "_drained", None)
+        if drained is not None:
+            drained.wait()
+        if self._finished:
+            self._release()
+        else:
+            self._abandon()
+
+    def _orphan_holds(self, p):
+        """The worker of generation `p` that this orphan holds, once its
+        reply has been read to its end, and only when the owner did not hold
+        that lock already (then it holds it for its own reasons); else
+        None."""
+        drained = getattr(self, "_drained", None)
+        if (drained is None or not drained.is_set() or not self._finished
+                or self._released or self._reentered
+                or getattr(self, "_p", None) is not p):
+            return None
+        return self.server_index
 
     @property
     def result(self):
@@ -2082,10 +2151,11 @@ class Brish:
                 self.restart()
 
     def _reap_orphans(self):
-        """Give up this thread's BrishPopen objects that were collected
-        unclosed in another thread: they still hold this thread's worker
-        locks, which no other thread can release. Called at the start of
-        every call that takes a worker."""
+        """Free the workers of this thread's BrishPopen objects that were
+        collected unclosed in another thread: they still hold this thread's
+        worker locks, which no other thread can release (see
+        BrishPopen._orphan). Called at the start of every call that takes a
+        worker; it waits for an orphan's helper thread to finish."""
         orphans = self._orphans
         if not orphans:
             return
@@ -2096,9 +2166,25 @@ class Brish:
             except IndexError:
                 return
             if popen._owner == me:
-                popen._abandon()
+                popen._reap()
             else:
                 orphans.append(popen)
+
+    def _orphan_held(self, p):
+        """The workers of generation `p` that drained orphans hold (see
+        BrishPopen._orphan_holds): a restart need not wait for them."""
+        while True:
+            try:
+                orphans = list(self._orphans)
+                break
+            except RuntimeError:  # mutated by another thread meanwhile
+                continue
+        held = set()
+        for popen in orphans:
+            i = popen._orphan_holds(p)
+            if i is not None:
+                held.add(i)
+        return held
 
     def _holds_worker_lock(self):
         """Whether this thread holds a worker lock of the current generation.
@@ -2340,8 +2426,9 @@ class Brish:
         they name it or no other worker is free at once. Use it as a context
         manager: leaving the block early, by break or by an exception, kills
         the command, drains its output and frees the worker. An unclosed
-        object that is collected in another thread is killed, and its worker
-        is freed only at the creating thread's next call to this instance.
+        object collected in another thread is killed with every step and
+        drained in a helper thread, and its worker is freed at the creating
+        thread's next call to this instance.
 
         `kill()` (alias `terminate()`) works from any thread, is idempotent,
         and interrupts the command, not the worker. Step 1: SIGINT to the
@@ -2693,9 +2780,11 @@ class Brish:
             if self.p is None:
                 return
             locks = self.locks
-            _acquire_all(locks)
+            p = self.p
+            #: A drained orphan (see BrishPopen._orphan) holds its worker
+            #: idle until its owner thread frees it: do not wait for that.
+            taken = _acquire_all(locks, lambda i: i in self._orphan_held(p))
             try:
-                p = self.p
                 self.p = None
                 self.locks = []
                 if getattr(p, "binary", False):
@@ -2703,7 +2792,7 @@ class Brish:
                 else:
                     self._cleanup_legacy(p)
             finally:
-                for lock in locks:
+                for lock in taken:
                     lock.release()
 
     @staticmethod

@@ -984,26 +984,19 @@ def test_a_popen_collected_in_another_thread():
             return ok
         assert not lock_free()
         assert pool.submit(b._holds_worker_lock).result()
-        if not BINARY:
-            #: Once the reader threads have the whole reply (the kill ended
-            #: the command), freeing the worker needs no restart.
-            orphan = b._orphans[0]
-            deadline = time.monotonic() + 30
-            while not orphan._legacy_reply_read():
-                assert time.monotonic() < deadline, "the reply never came"
-                time.sleep(0.05)
         t0 = time.monotonic()
-        r = pool.submit(lambda: b.send_cmd("print -r -- ok-${v-unset}")).result(timeout=30)
-        assert time.monotonic() - t0 < 10, time.monotonic() - t0
-        #: Binary mode skips the abandoned reply; legacy mode has read it.
+        r = pool.submit(lambda: b.send_cmd("print -r -- ok-${v-unset}")).result(timeout=90)
+        assert time.monotonic() - t0 < 60, time.monotonic() - t0  # not the sleep's 100 s
+        #: A helper thread read the reply to its end, so the worker is in
+        #: sync and keeps its state, in legacy mode too.
         assert (r.retcode, r.out) == (0, "ok-kept\n"), repr(r)
         assert lock_free()
         assert not pool.submit(b._holds_worker_lock).result()
-        if BINARY:
-            assert not bm._descendants(pid), bm._descendants(pid)  # the sleep was killed
+        assert gone(pid), bm._descendants(pid)  # the sleep was killed
         pool.shutdown()
         b.cleanup()
-        '''
+        ''',
+        timeout=120,
     )
 
 
@@ -1156,6 +1149,71 @@ def test_a_popen_dropped_in_its_thread_frees_the_worker_at_once():
         b.cleanup()
         """,
         timeout=120,
+    )
+
+
+def test_an_orphan_is_killed_with_every_step_and_holds_up_no_restart():
+    #: A BrishPopen collected in another thread than its owner (an orphan)
+    #: keeps the owner's worker lock until the owner's next call. Its command
+    #: is killed with every step all the same, here one that ignores
+    #: SIGINT (before, it got only SIGINT and ran on), the reply is read to
+    #: its end, so the worker keeps its state in both modes, and a restart
+    #: does not wait for the orphan (before, it waited for the owner's next
+    #: call, and every thread without a worker lock with it).
+    run(
+        r"""
+        import concurrent.futures as cf, gc, weakref
+        import faulthandler; faulthandler.dump_traceback_later(170, exit=True)
+        b = Brish(server_count=2)
+        for i in (0, 1):
+            b.send_cmd(f"v=kept{i}", server_index=i)
+        pool = cf.ThreadPoolExecutor(max_workers=1)
+        def orphan(cmd):
+            box = {}
+            def make():
+                p = b.popen(cmd, server_index=0)
+                p.kill_grace = 0.3
+                box["p"] = p
+            pool.submit(make).result()
+            ref = weakref.ref(box["p"])
+            pid = box["p"]._worker_pid
+            del box["p"]
+            gc.collect()
+            return ref, pid
+        def drained(ref, timeout=60):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                p = ref()
+                if p is None or p._drained.wait(0.05):
+                    return True
+            return False
+        #: 1. A command that ignores SIGINT: step 2 stops its sleep.
+        ref, pid = orphan("trap '' INT; print -r a; sleep 100; print -r -- after $?")
+        assert drained(ref), "the orphan's command was never stopped"
+        assert gone(pid), bm._descendants(pid)
+        r = pool.submit(lambda: b.send_cmd("print -r -- ok-$v", server_index=0)).result(timeout=60)
+        assert (r.retcode, r.out) == (0, "ok-kept0\n"), repr(r)
+        #: 2. A restart while an orphan holds its owner's lock.
+        ref, pid = orphan("print -r a; sleep 100")
+        assert drained(ref)
+        gen = b._gen
+        t0 = time.monotonic()
+        done = []
+        t = threading.Thread(target=lambda: done.append(b.restart()))
+        t.start()
+        t.join(60)
+        assert done == [True], ("the restart waited for the orphan", time.monotonic() - t0)
+        assert b._gen != gen
+        r = b.send_cmd("print -r -- ok-${v-unset}", server_index=0)
+        assert r.out == "ok-unset\n", repr(r)
+        #: The owner frees the old generation's lock at its next call.
+        r = pool.submit(lambda: b.send_cmd("print -r -- owner-${v-unset}", server_index=0)).result(timeout=60)
+        assert r.out == "owner-unset\n", repr(r)
+        assert not pool.submit(b._holds_worker_lock).result()
+        pool.shutdown()
+        b.cleanup()
+        """,
+        timeout=180,
     )
 
 
