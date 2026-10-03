@@ -12,7 +12,13 @@
 builtin zmodload zsh/system || builtin exit 70
 
 typeset -g BRISH3_NONCE= BRISH3_FORK=0 BRISH3_STDIN_MODE= BRISH3_INREQ= BRISH3_EOF=
-typeset -g BRISH3_CMD= BRISH3_RET=0 BRISH3_INT= BRISH3_PB= brish_stdin= cmd=
+typeset -g BRISH3_CMD= BRISH3_RET=0 brish_stdin= cmd=
+#: The SIGINT trap's state (see trapint.zsh). TRAPINT acts only deeper than
+#: itself, brish3_run and brish3_serve.
+typeset -g __brish_trapfile=${${(%):-%x}:A:h}/trapint.zsh
+[[ -r $__brish_trapfile ]] || { builtin print -ru2 -- "brish3: cannot read $__brish_trapfile"; builtin exit 70 }
+typeset -g __brish_trap= __brish_trap_arg= __brish_int= __brish_pb= __brish_pb0= __brish_tb=
+typeset -g __brish_trapbody= __brish_level=0 __brish_depth=3
 typeset -g __brish3_req= __brish3_out= __brish3_err= __brish3_empty=
 typeset -g __brish3_nul= __brish3_nl= __brish3_startp= __brish3_endp=
 typeset -ga __brish3_specs __brish3_pids
@@ -113,64 +119,63 @@ function brish3_recv {
   builtin syswrite -o $__brish3_err -- "${__brish3_startp}${f[2]}${__brish3_nl}"
 }
 
+#: (Re)define the worker's TRAPINT from trapint.zsh: once when the worker
+#: starts, and after a command replaced or removed it. Aliases and
+#: local_traps are off, so that the definition parses as written and outlasts
+#: this function. The body is kept, to tell this trap from a command's own.
+#: @duplicateCode/9834d1f0406a4c3eb2f9b672e929d810 __brish2_deftrap in brish2.zsh
+function brish3_deftrap {
+  builtin emulate -L zsh
+  builtin setopt no_aliases no_local_traps
+  builtin source "$__brish_trapfile"
+  __brish_trapbody=${functions[TRAPINT]-}
+}
+
 #: Run the request. No locals and no emulate here: user code runs inside and
 #: must see the user's options. The nonce is kept only in $1 while user code
 #: runs; `always` restores it from there.
 #:
-#: SIGINT is ignored while the worker is idle or framing, so that it never
-#: interrupts the worker's own reads and writes. While a command runs, a
-#: TRAPINT makes SIGINT act like an interactive Ctrl-C: returning 128+signal
-#: unwinds the command as interrupted. A fork command sets a trap in its
-#: subshell that exits with 128+signal; the worker keeps ignoring SIGINT. A
-#: non-fork command gets the worker's trap: `always` stops the unwinding
+#: SIGINT reaches the worker's TRAPINT at any time (see trapint.zsh). Idle or
+#: framing, it returns at once. While a command runs (from setting
+#: __brish_trap to `always`), it makes SIGINT act like an interactive Ctrl-C.
+#: A fork command's subshell exits with 128+signal; the worker itself goes on
+#: waiting for it. A non-fork command is unwound: `always` stops the unwinding
 #: (TRY_BLOCK_INTERRUPT=0), and END carries the status the trap records
-#: (returning through a function turns it into 1). The worker's trap acts
-#: only inside the command's function (deeper than TRAPINT, brish3_run and
-#: brish3_serve); between the worker's own commands it is ignored. A command
-#: may set its own INT trap, which lasts until the command ends.
+#: (returning through a function turns it into 1). A command may set its own
+#: INT trap, which lasts until the command ends.
 function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data)
-  BRISH3_NONCE= BRISH3_INT= BRISH3_PB=
+  BRISH3_NONCE= __brish_int= __brish_pb= __brish_pb0=
+  [[ -o posix_builtins ]] && __brish_pb0=1
   {
     repeat 1 do  # absorbs a bare break or continue
       if [[ $2 == 1 ]]; then
+        __brish_trap=unsetopt __brish_trap_arg=xtrace
         if [[ $3 == data ]]; then
-          ( function TRAPINT { builtin exit $(( 128 + $1 )) }; builtin set --; { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | builtin eval "$BRISH3_CMD" ) >&$__brish3_out 2>&$__brish3_err
+          ( builtin set --; { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | builtin eval "$BRISH3_CMD" ) >&$__brish3_out 2>&$__brish3_err
         elif [[ $3 == null ]]; then
-          ( function TRAPINT { builtin exit $(( 128 + $1 )) }; builtin set --; builtin eval "$BRISH3_CMD" ) </dev/null >&$__brish3_out 2>&$__brish3_err
+          ( builtin set --; builtin eval "$BRISH3_CMD" ) </dev/null >&$__brish3_out 2>&$__brish3_err
         else
-          ( function TRAPINT { builtin exit $(( 128 + $1 )) }; builtin set --; builtin eval "$BRISH3_CMD" ) <&$__brish3_empty >&$__brish3_out 2>&$__brish3_err
+          ( builtin set --; builtin eval "$BRISH3_CMD" ) <&$__brish3_empty >&$__brish3_out 2>&$__brish3_err
         fi
       else
-        #: The trap turns off the options that would make zsh exit the
-        #: worker instead of unwinding: err_exit and err_return, which
-        #: `always` turns off anyway, and posix_builtins (`emulate sh`), under
-        #: which an interrupt inside a special builtin such as `:` or `eval`
-        #: is fatal; `always` turns that back on when the change was global
-        #: (no local_options where the trap ran). Turning off local_options
-        #: keeps these changes when the trap returns into a function that set
-        #: it. `[@]`: the element count, also under ksh_arrays.
-        function TRAPINT {
-          if (( ${#funcstack[@]} > 3 )); then
-            BRISH3_INT=$(( 128 + $1 ))
-            if [[ -o posix_builtins ]]; then
-              [[ -o local_options ]] || BRISH3_PB=1
-              builtin unsetopt posix_builtins
-            fi
-            builtin unsetopt local_options err_exit err_return
-            builtin return $BRISH3_INT
-          fi
-        }
         #: A function body lets the command `return`. `functions[...]=` would
         #: corrupt NUL and the bytes 0x83 to 0x9D, so the body goes through
         #: eval. `&&`: after a syntax error the old body must not run again.
+        #: __brish_trap is set once the function is defined, as in brish2.zsh,
+        #: where a trap that acted inside that eval would break the worker's
+        #: loops. The stdin writer clears it, so that a SIGINT does not stop
+        #: it: the command decides whether it is interrupted.
         if [[ $3 == data ]]; then
           builtin eval "function tmp_block_8182782 {${__brish3_nl}${BRISH3_CMD}${__brish3_nl}}" &&
-            { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | tmp_block_8182782 >&$__brish3_out 2>&$__brish3_err
+            __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&
+            { __brish_trap=; builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | tmp_block_8182782 >&$__brish3_out 2>&$__brish3_err
         elif [[ $3 == null ]]; then
           builtin eval "function tmp_block_8182782 {${__brish3_nl}${BRISH3_CMD}${__brish3_nl}}" &&
+            __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&
             tmp_block_8182782 </dev/null >&$__brish3_out 2>&$__brish3_err
         else
           builtin eval "function tmp_block_8182782 {${__brish3_nl}${BRISH3_CMD}${__brish3_nl}}" &&
+            __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&
             tmp_block_8182782 <&$__brish3_empty >&$__brish3_out 2>&$__brish3_err
         fi
       fi
@@ -179,17 +184,32 @@ function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data
     #: Runs after normal completion, shell errors (NOMATCH and the like),
     #: err_return unwinding and interrupts. While `exit` unwinds, $? is 0
     #: here and the EXIT trap reports the status instead.
-    BRISH3_RET=${BRISH3_INT:-$?} BRISH3_NONCE=$1 TRY_BLOCK_ERROR=0 TRY_BLOCK_INTERRUPT=0
-    builtin trap '' INT
+    BRISH3_RET=${__brish_int:-$?} BRISH3_NONCE=$1 TRY_BLOCK_ERROR=0 TRY_BLOCK_INTERRUPT=0 __brish_trap= __brish_trap_arg=
     builtin unsetopt err_exit err_return
-    if [[ -n $BRISH3_PB ]]; then
-      builtin setopt posix_builtins
+    #: The trap turned posix_builtins off where it ran. Whether that was the
+    #: command's global setting or one that a scope (`emulate sh -c`) has
+    #: undone since, it is put back as it was before the command.
+    if [[ -n $__brish_pb ]]; then
+      if [[ -n $__brish_pb0 ]]; then
+        builtin setopt posix_builtins
+      else
+        builtin unsetopt posix_builtins
+      fi
+    fi
+    [[ ${functions[TRAPINT]-} == "$__brish_trapbody" ]] || brish3_deftrap
+    #: `unfunction` frees the body with signals held back; redefining it
+    #: in the next eval would free it where a SIGINT can run the trap, and
+    #: zsh crashes when a trap runs inside free() (see trapint.zsh).
+    if [[ -n $__brish_tb ]]; then
+      __brish_tb=
+      builtin unfunction tmp_block_8182782
     fi
   }
   builtin true  # a failing status must not reach the user's ZERR trap here
 }
 
 function brish3_on_exit {  # $1: exit status
+  __brish_trap= __brish_trap_arg=  # a SIGINT must not cut this short
   builtin emulate -LR zsh
   if [[ -n $BRISH3_INREQ && -n $BRISH3_NONCE ]]; then
     builtin syswrite -o $__brish3_out -- "${__brish3_endp}${BRISH3_NONCE}:${1}:exit${__brish3_nl}"
@@ -230,7 +250,8 @@ typeset -g brish_server_index
 for (( brish_server_index = 1; brish_server_index <= $#__brish3_specs; brish_server_index++ )); do
   (
     builtin trap 'brish3_on_exit $?' EXIT
-    builtin trap '' INT  # until a command runs; see brish3_run
+    __brish_level=$ZSH_SUBSHELL
+    brish3_deftrap  # the worker's TRAPINT, for good; see brish3_run
     brish3_setup $brish_server_index
     brish3_serve
   ) &

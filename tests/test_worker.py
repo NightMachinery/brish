@@ -218,6 +218,57 @@ def test_g8_sigint_during_a_command():
     )
 
 
+def test_g8_sigint_flood_between_commands():
+    #: SIGINTs every 0.5 ms at a worker that runs short commands back to back,
+    #: so that most land while it frames a reply or a request. Each one may
+    #: abort the command it hits (130), but the worker must live on with its
+    #: state: the INT trap never changes, since every change passes through
+    #: the default disposition, and a SIGINT then kills the worker.
+    #: The flooder is a separate process (in this one it would compete for
+    #: the GIL): workers that changed the trap around every command died
+    #: within a second of it, in both modes.
+    wcheck(
+        r'''
+        import subprocess
+        b = Brish(server_count=1)
+        pid = worker_pid(b)
+        b.send_cmd("v=kept")
+        gen = b._gen
+        flooder = subprocess.Popen([sys.executable, "-c", """if 1:
+            import os, signal, sys, time
+            pid, n, t0 = int(sys.argv[1]), 0, time.monotonic()
+            while time.monotonic() - t0 < 3:
+                try:
+                    os.kill(pid, signal.SIGINT)
+                except ProcessLookupError:
+                    break
+                n += 1
+                time.sleep(0.0005)
+            print(n)
+            """, str(pid)], stdout=subprocess.PIPE, text=True)
+        i = n130 = 0
+        try:
+            while flooder.poll() is None:
+                i += 1
+                r = b.send_cmd(f"print -r -- tok{i}")
+                want = f"tok{i}\n"
+                if r.retcode == 130 and want.startswith(r.out):
+                    n130 += 1
+                    continue
+                assert (r.retcode, r.out, r.err, b._gen) == (0, want, "", gen), (i, r, b._gen)
+        finally:
+            if flooder.poll() is None:
+                flooder.kill()
+            sent = flooder.communicate()[0].strip()
+        assert int(sent) > 100, sent
+        r = b.send_cmd("print -r -- $v")
+        assert (r.retcode, r.out, b._gen) == (0, "kept\n", gen), (r, i, n130, sent)
+        b.cleanup()
+        ''',
+        timeout=90,
+    )
+
+
 def test_g8_interrupt_during_a_large_stdin_write():
     #: The payload is lines of an inert command that would create a sentinel
     #: file if a worker ever parsed stdin as code.

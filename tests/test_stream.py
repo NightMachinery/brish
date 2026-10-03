@@ -237,8 +237,9 @@ def test_kill_under_errexit_and_sh_emulation():
     #: zsh exits instead of unwinding when an interrupt meets err_exit (or
     #: err_return at the legacy worker's top level), or a special builtin
     #: under posix_builtins (`emulate sh`). The worker's trap turns those off,
-    #: so the worker survives with its state; options that the command set
-    #: globally stay as it left them.
+    #: so the worker survives with its state. Options that the command set
+    #: globally stay as it left them, except posix_builtins when the trap
+    #: had to turn it off: that comes back as it was before the command.
     run(
         r'''
         b = Brish(server_count=1)
@@ -250,11 +251,11 @@ def test_kill_under_errexit_and_sh_emulation():
             ("set -e; print -r x; while :; do :; done", "off off off off"),
             ("f() { emulate -L zsh; setopt err_exit; print -r x; sleep 100 }; f", "off off off off"),
             ("f() { emulate -L sh; print -r x; while :; do :; done }; f", "off off off off"),
-            ("emulate sh; print -r x; eval 'while :; do :; done'", "off off on on"),
+            ("emulate sh; print -r x; eval 'while :; do :; done'", "off off off on"),
         ]
         #: The sh cases die only when the signal lands inside a special
         #: builtin, so they run several times.
-        cases += [("emulate sh; set -e; print -r x; while :; do :; done", "off off on on")] * 4
+        cases += [("emulate sh; set -e; print -r x; while :; do :; done", "off off off on")] * 4
         for cmd, want_opts in cases:
             b.send_cmd("emulate zsh; v=kept")
             with b.popen(cmd) as p:
@@ -277,6 +278,72 @@ def test_kill_under_errexit_and_sh_emulation():
         b.cleanup()
         ''',
         timeout=120,
+    )
+
+
+def test_kill_restores_posix_builtins_as_before_the_command():
+    #: The trap turns posix_builtins off where it runs, and cannot tell a
+    #: global setting from one that a scope (emulate -c) undoes when the
+    #: interrupt unwinds out of it. `always` restores the value from before
+    #: the command; a worker left with posix_builtins on would die of the
+    #: next failing special builtin.
+    run(
+        r'''
+        b = Brish(server_count=1)
+        pb = "${options[posixbuiltins]}"
+        fatal = ". ./does-not-exist.sh; print -r survived"
+        for cmd in ("emulate sh -c 'print -r x; while :; do :; done'",
+                    "emulate sh -c 'print -r x; eval \"while :; do :; done\"'",
+                    "f() { emulate -L sh; print -r x; while :; do :; done }; f"):
+            b.send_cmd("emulate zsh; v=kept")
+            with b.popen(cmd) as p:
+                kill_later(p, 0.3)
+                evs = collect(p)
+            assert (p.retcode, joined(evs)) == (130, b"x\n"), (cmd, p.retcode, evs)
+            assert b.send_cmd("print -r -- " + pb).out == "off\n", cmd
+            r = b.send_cmd(fatal)
+            assert (r.retcode, r.out) == (0, "survived\n"), (cmd, r)
+            same_server_ok(b, 0)
+        #: A worker in sh emulation keeps posix_builtins on.
+        b.send_cmd("emulate sh; v=kept")
+        with b.popen("print -r x; while :; do :; done") as p:
+            kill_later(p, 0.3)
+            evs = collect(p)
+        assert p.retcode == 130, (p.retcode, evs)
+        assert b.send_cmd("print -r -- " + pb).out == "on\n"
+        b.send_cmd("emulate zsh")
+        same_server_ok(b, 0)
+        b.cleanup()
+        '''
+    )
+
+
+def test_the_trap_writes_nothing_into_the_command():
+    #: The worker's trap runs inside the interrupted command. Under set -x
+    #: only its first line is traced (it turns xtrace off for the rest), and
+    #: its assignments are global, which warn_nested_var does not report.
+    run(
+        r'''
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        for cmd, fork, traced in (
+            ("f() { setopt local_options xtrace; sleep 100 }; f", False, True),
+            ("set -x; sleep 100", True, True),
+            ("setopt local_options warn_nested_var; f() { sleep 100 }; f", False, False),
+        ):
+            with b.popen(cmd, fork=fork) as p:
+                kill_later(p, 0.3)
+                evs = collect(p)
+            assert p.retcode == 130, (cmd, p.retcode, evs)
+            err = [l for l in joined(evs, "err").split(b"\n") if l]
+            if traced:
+                assert len(err) == 2 and err[0].endswith(b"> sleep 100"), (cmd, evs)
+                assert err[1] == b"+TRAPINT:1> unsetopt xtrace", (cmd, evs)
+            else:
+                assert err == [], (cmd, evs)
+            same_server_ok(b, 0)
+        b.cleanup()
+        '''
     )
 
 
