@@ -941,8 +941,12 @@ def test_close_from_another_thread_changes_nothing():
         b = Brish(server_count=1)
         p = b.popen("print -r a; sleep 0.8; print -r done; return 3", buffer=True)
         errs = []
+        it = iter(p)
+        first = next(it)
+        assert first[0] == "out" and first[1].startswith(b"a"), first
         def other():
-            for call in (p.close, p.wait, lambda: next(iter(p)), lambda: next(p)):
+            for call in (p.close, p.wait, lambda: next(iter(p)), lambda: next(p),
+                         lambda: next(it)):
                 try:
                     call()
                 except RuntimeError as e:
@@ -950,9 +954,13 @@ def test_close_from_another_thread_changes_nothing():
         t = threading.Thread(target=other)
         t.start()
         t.join()
-        assert len(errs) == 4 and all("thread" in str(e) for e in errs), errs
-        #: The command was not killed: it ends on its own, with its output.
-        assert (p.wait(), p._stage, p.result.out) == (3, 0, "a\ndone\n"), (p.retcode, p._stage, p.result)
+        assert len(errs) == 5 and all("thread" in str(e) for e in errs), errs
+        #: The command was not killed: it ends on its own, with its output,
+        #: and the owner's iterator goes on (before, the other thread's
+        #: next(it) ended it).
+        rest = list(it)
+        assert first[1] + b"".join(c for _, c in rest) == b"a\ndone\n", (first, rest)
+        assert (p.retcode, p._stage, p.result.out) == (3, 0, "a\ndone\n"), (p.retcode, p._stage, p.result)
         p.close()
         b.cleanup()
         '''
@@ -1214,6 +1222,43 @@ def test_an_orphan_is_killed_with_every_step_and_holds_up_no_restart():
         b.cleanup()
         """,
         timeout=180,
+    )
+
+
+def test_result_from_another_thread_is_whole():
+    #: Another thread that reads p.result as soon as retcode is set gets the
+    #: whole output, and so does the owner afterwards (before, a read between
+    #: the owner's moving a chunk to the buffer could miss it, and the short
+    #: result was cached). A tiny switch interval makes such a race likely.
+    run(
+        r"""
+        sys.setswitchinterval(1e-6)
+        b = Brish(server_count=1)
+        bad = []
+        for n in range(40):
+            p = b.popen("for i in {1..30}; do print -r -- line-$i; done", buffer=True)
+            seen = []
+            stop = threading.Event()
+            def watch():
+                while not stop.is_set():
+                    r = p.result
+                    if r is not None:
+                        seen.append(r.out)
+                        return
+            t = threading.Thread(target=watch)
+            t.start()
+            p.wait()
+            stop.set()
+            t.join()
+            want = "".join(f"line-{i}\n" for i in range(1, 31))
+            if p.result.out != want or any(x != want for x in seen):
+                bad.append((n, p.result.out, seen))
+            p.close()
+        sys.setswitchinterval(0.005)
+        assert not bad, bad[:2]
+        b.cleanup()
+        """,
+        timeout=120,
     )
 
 

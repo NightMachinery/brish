@@ -1351,7 +1351,8 @@ class BrishPopen:
                 msg = (WORKER_DIED_NOTE + "\n").encode()
                 pending.append(("err", msg))
                 self._pending_bytes += len(msg)
-            #: Set last, once every chunk is pending.
+            #: Set last, under _mu: `result` from another thread then sees
+            #: every chunk.
             self.retcode = retcode
         if killed and not self._p.binary:
             self._brish._legacy_abandon(self._p, self.server_index)
@@ -1464,14 +1465,15 @@ class BrishPopen:
                     self._abandon()
                     raise
             if self._pending:
-                ev = self._pending.popleft()
-                self._pending_bytes -= len(ev[1])
-                if isinstance(ev[1], bytearray):
-                    ev = (ev[0], bytes(ev[1]))
+                with self._mu:  # see `result`
+                    ev = self._pending.popleft()
+                    self._pending_bytes -= len(ev[1])
+                    if isinstance(ev[1], bytearray):
+                        ev = (ev[0], bytes(ev[1]))
+                    if self._buffer is not None:
+                        self._buffer[0 if ev[0] == "out" else 1].append(ev[1])
                 if ev[0] == "err":
                     self._err_nl = ev[1].endswith(b"\n")
-                if self._buffer is not None:
-                    self._buffer[0 if ev[0] == "out" else 1].append(ev[1])
                 return ev
             if self._finished:
                 return None
@@ -1653,18 +1655,16 @@ class BrishPopen:
             self._signalled()
 
     def __iter__(self):
-        return self._iterate()
+        return _PopenIterator(self)
 
     def _iterate(self):
+        """The generator behind _PopenIterator. Only the owner thread
+        advances it; when it is closed early (a `break`, or the garbage
+        collector), the command is killed: by close() in the owner thread,
+        by kill() elsewhere."""
         complete = False
-        #: Whether the last thread that advanced the generator owns it. A
-        #: read from another thread raises (in _next_event) and changes
-        #: nothing; a generator of the owner's that is closed elsewhere (by
-        #: the garbage collector, say) kills the command.
-        mine = True
         try:
             while True:
-                mine = threading.get_ident() == self._owner
                 ev = self._next_event()
                 if ev is None:
                     complete = True
@@ -1674,7 +1674,7 @@ class BrishPopen:
             if not complete and not self._released:
                 if threading.get_ident() == self._owner:
                     self.close()
-                elif mine:
+                else:
                     self.kill()
 
     def __next__(self):
@@ -1773,21 +1773,48 @@ class BrishPopen:
     @property
     def result(self):
         """With buffer=True: the CmdResult (from_bytes, as send_cmd returns
-        it) once the command has ended, else None."""
+        it) once the command has ended, else None. Any thread may read it:
+        it is built under _mu, which the owner holds while it moves a chunk
+        from the pending chunks to the buffer, and the last chunk is pending
+        before retcode is set."""
         if self._buffer is None:
             raise ValueError("BrishPopen.result needs popen(..., buffer=True)")
-        if self.retcode is None:
-            return None
-        if self._result is None:
-            outs, errs = list(self._buffer[0]), list(self._buffer[1])
-            for name, chunk in self._pending:
-                (outs if name == "out" else errs).append(chunk)
-            b = self._brish
-            self._result = CmdResult.from_bytes(
-                self.retcode, b"".join(outs), b"".join(errs), self.cmd, self.cmd_stdin,
-                encoding=b.encoding, errors=b.decoding_errors,
-            )
-        return self._result
+        with self._mu:
+            if self.retcode is None:
+                return None
+            if self._result is None:
+                outs, errs = list(self._buffer[0]), list(self._buffer[1])
+                for name, chunk in self._pending:
+                    (outs if name == "out" else errs).append(bytes(chunk))
+                b = self._brish
+                self._result = CmdResult.from_bytes(
+                    self.retcode, b"".join(outs), b"".join(errs), self.cmd, self.cmd_stdin,
+                    encoding=b.encoding, errors=b.decoding_errors,
+                )
+            return self._result
+
+
+class _PopenIterator:
+    """What iter(BrishPopen) returns. A `next()` from a thread other than
+    the owner raises RuntimeError before it reaches the generator, which an
+    exception would end, so the owner's iteration goes on. Closing it (or
+    dropping it, as a `break` does) closes the generator."""
+
+    __slots__ = ("_popen", "_gen")
+
+    def __init__(self, popen):
+        self._popen = popen
+        self._gen = popen._iterate()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._popen._check_owner()
+        return next(self._gen)
+
+    def close(self):
+        self._gen.close()
 
 
 _TEMPLATE_UNSAFE = re.compile("[\r\0\ud800-\udfff]")
