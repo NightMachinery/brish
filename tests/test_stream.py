@@ -1697,15 +1697,18 @@ def test_two_owners_reap_their_orphans_at_once():
     )
 
 
-def test_keyboard_interrupt_in_popen_start_never_keeps_the_lock():
+def test_keyboard_interrupt_inside_popen_start_try_never_keeps_the_lock():
     #: A KeyboardInterrupt comes at an eval-breaker check: after a call
     #: returns, or at a backward jump. Inside _start's try block, until
     #: _released is cleared, the except clause cannot tell that the worker
     #: lock was taken, so an interrupt there kept it for good (a call
     #: between taking the lock and recording it). A SIGALRM every 50 us
-    #: raises one whenever it is handled in that stretch, with the
+    #: raises one whenever it is handled in that stretch, after the line
+    #: that takes the lock and up to the one that records it, with the
     #: acquire_lock pattern holding the worker; it must find no place to
-    #: land, or the lock must not leak.
+    #: land, or the lock must not leak. The line that takes the lock is
+    #: left out: an interrupt as _acquire() returns, before the `try`,
+    #: still keeps the lock, the window that send_cmd has too (see _start).
     run(
         r'''
         import inspect, re

@@ -1088,6 +1088,11 @@ class BrishPopen:
                 return
             start = self._start_legacy
         for attempt in range(2):
+            #: One window is left, as in send_cmd: a KeyboardInterrupt as
+            #: _acquire() returns, before the `try`, keeps the lock for
+            #: good. Closing it would need _acquire to record the lock where
+            #: the except clause reads it, which still leaves a gap of a few
+            #: bytecodes inside _acquire.
             lock, index, p = b._acquire(server_index, lock_sleep)
             try:
                 #: No call before _released is cleared: an interrupt there
