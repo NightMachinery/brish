@@ -42,7 +42,7 @@ The outcome:
 - Text views are exact: no newline translation, and =decoding_errors= (default =backslashreplace=) still applies to invalid bytes. Legacy mode builds its results the same way since the backports.
 - Quoting is pure Python in both modes, and landed first, as a security fix.
 - *Worker death follows =subprocess.run= semantics.* A command that kills its own shell is a failed command, not an API error; Brish being unable to run anything is the unexpected condition, and that one raises.
-  - If the command ran (START seen), return a =CmdResult=: the END retcode if the EXIT trap reported one, otherwise the reserved retcode 9001 with =brish: worker died during this command= appended to =.err=. The instance restarts before its next use.
+  - If the command ran (START seen), return a =CmdResult=: the END retcode if the EXIT trap reported one, otherwise the reserved retcode 9001 with =brish: worker died during this command= appended to =.err=. The instance restarted before its next use; since worker slots, only that worker is replaced (see protocol.org, "Slots").
   - If the command never ran (START not seen), restart and retry once. If the retry fails too, raise =BrishWorkerDiedException=.
   - Legacy mode applies the same rule, keyed on whether the request write succeeded, since it has no START marker.
 - A new worker file with a HELLO handshake, and =brish2.zsh= left wire-compatible (at first byte-identical; since the backports, every reply is checked against the original worker's), because versions mix in both directions: long-running processes with older Python code spawn the on-disk worker by path on every restart, and a worker that does not match its Python either hangs or misparses commands.
@@ -102,6 +102,7 @@ The worker (=brish2.zsh=), with every reply still in the frozen format:
 What the frozen format still rules out (NUL in commands and stdin, a NUL-only output line, output between requests, slow large stdin, =None= stdin, resynchronisation after an interrupt) is listed, with the reasons, in protocol.org, "What the frozen format rules out". The matching findings stay strict =xfail= in legacy mode in =tests/test_defects.py=.
 
 * Restart safety (both modes)
+Worker slots replaced this design: a death now replaces one worker, and a restart waits for no worker lock (see protocol.org, "Slots"). What the binary work did at the time:
 - =%BRISH_RESTART= is handled before any worker lock is taken.
 - Pending restarts run in =acquire_lock=, under the instance lock, before a worker lock is taken, with a generation counter so that several threads noticing the same death restart only once.
 - A failed restart leaves the instance to be initialised again on its next use, instead of raising =UninitializedBrishException= forever.
@@ -111,8 +112,8 @@ For non-fork commands:
 - persistent =errexit= and =errreturn= are cleared after each request;
 - a bare =break= or =continue= ends the request with status 0;
 - NOMATCH and other shell errors return retcode 1 instead of killing the worker;
-- =exit N= returns a normal =CmdResult= with retcode N, and the instance restarts before its next use;
-- =errexit=, =${x:?}= or a kill, where no END marker arrives, return retcode 9001, and the instance restarts;
+- =exit N= returns a normal =CmdResult= with retcode N, and that worker is replaced (before worker slots, the whole instance restarted);
+- =errexit=, =${x:?}= or a kill, where no END marker arrives, return retcode 9001, and that worker is replaced;
 - a syntax error no longer re-runs the previous command.
 
 For all commands, text views are exact (=\r= is kept), and =zp= / =zpe= write the bytes to the target's binary buffer when it has one. =cmd_stdin=None= is =/dev/null= in binary mode only.
