@@ -2443,15 +2443,19 @@ class Brish:
     ):
         """Run `cmd` in a worker and stream its output while it runs.
 
-        Returns a BrishPopen once the command has started. Iterating it
-        yields (stream, chunk) pairs: `stream` is "out" or "err", `chunk` is
-        non-empty bytes, as read. Only the bytes that could start the end of
-        the reply are held back until the next read: in binary mode a suffix
-        that starts at a NUL, in legacy mode a trailing newline (or newline
-        and NUL). Brish reads at most about 64 KiB per stream ahead of the
-        caller, so a caller that stops reading blocks the command; one that
-        falls behind gets fewer, larger chunks (up to 64 KiB). `retcode` is
-        None until the command has ended.
+        Returns a BrishPopen: in binary mode once the worker has read the
+        whole request and is starting the command, in legacy mode once the
+        request is written (the first popen per legacy worker and start also
+        asks the worker for its PID). Iterating it yields (stream, chunk)
+        pairs: `stream` is "out" or "err", `chunk` is non-empty bytes, as
+        read. Only the bytes that could start the end of the reply are held
+        back until the next read: in binary mode a suffix that starts at a
+        NUL, in legacy mode a trailing newline (or newline and NUL). A
+        caller that stops reading blocks the command once Brish and the
+        pipes hold what it wrote (binary: one read of up to 64 KiB per
+        stream; legacy: a queue of 64 KiB for both streams); one that falls
+        behind gets fewer, larger chunks (up to 64 KiB). `retcode` is None
+        until the command has ended.
 
         The arguments are those of send_cmd. With buffer=True, the chunks
         that iteration or wait() consumed are also kept, and `result` gives
