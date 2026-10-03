@@ -2149,7 +2149,8 @@ class Brish:
         #: Ctrl-Z, the SIGHUP of a closing terminal) and no signal to our
         #: process group reaches the bootstrap, its workers or their
         #: commands, which have no controlling terminal either. Interrupts
-        #: come from BrishPopen.kill() alone. The workers stop with us
+        #: come from Brish alone (BrishPopen.kill(), or the one SIGINT for
+        #: an abandoned BrishPopen). The workers stop with us
         #: through their pipes (see docs/protocol.org, Processes).
         #: The bootstrap's stdin stays open until cleanup() (or our end):
         #: its EOF tells the bootstrap to stop what is left (brish2.zsh).

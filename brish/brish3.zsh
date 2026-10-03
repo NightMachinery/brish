@@ -12,10 +12,10 @@
 builtin zmodload zsh/system || builtin exit 70
 #: New Python starts this bootstrap in a session of its own, which no
 #: terminal's signals reach, and says so with BRISH_SESSION=1. Its workers
-#: then get SIGINT from BrishPopen.kill() alone, and handle it (see
-#: brish3_run). Older Python does neither: its workers share its terminal's
-#: process group, and ignore SIGINT as they always did. Commands do not
-#: inherit the variable.
+#: then get SIGINT from Brish alone (BrishPopen.kill(), or the one SIGINT
+#: for an abandoned BrishPopen), and handle it (see brish3_run). Older
+#: Python does neither: its workers share its terminal's process group, and
+#: ignore SIGINT as they always did. Commands do not inherit the variable.
 typeset -g __brish_session=${BRISH_SESSION-}
 builtin unset BRISH_SESSION
 
@@ -176,11 +176,13 @@ function brish3_write_stdin {
 #: must see the user's options. The nonce is kept only in $1 while user code
 #: runs; `always` restores it from there.
 #:
-#: SIGINT, which only BrishPopen.kill() sends (the worker is in a session of
-#: its own), reaches the worker's TRAPINT at any time (see trapint.zsh).
-#: Under older Python there is no trap, and the worker ignores SIGINT
-#: throughout. Idle or framing, the trap returns at once. While a command runs (from setting
-#: __brish_trap to `always`), it makes SIGINT act like an interactive Ctrl-C.
+#: SIGINT, which comes from Brish alone (the worker is in a session of its
+#: own): BrishPopen.kill(), or the one SIGINT for an abandoned BrishPopen.
+#: It reaches the worker's TRAPINT at any time (see trapint.zsh). Under
+#: older Python there is no trap, and the worker ignores SIGINT throughout.
+#: Idle or framing, the trap returns at once. While a command runs (from
+#: setting __brish_trap to `always`), it makes SIGINT act like an
+#: interactive Ctrl-C.
 #: A fork command's subshell exits with 128+signal; the worker itself goes on
 #: waiting for it. A non-fork command is unwound: `always` stops the unwinding
 #: (TRY_BLOCK_INTERRUPT=0), and END carries the status the trap records

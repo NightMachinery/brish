@@ -21,9 +21,10 @@ __brish2_dl=$'\n'"$__brish2_nul"$'\n'  # a reply delimiter, with the newline bef
 
 #: New Python starts this bootstrap in a session of its own, which no
 #: terminal's signals reach, and says so with BRISH_SESSION=1. Its workers
-#: then get SIGINT from BrishPopen.kill() alone, and handle it (see below).
-#: Older Python does neither: its workers share its terminal's process group,
-#: and ignore SIGINT as they always did. Commands do not inherit the variable.
+#: then get SIGINT from Brish alone (BrishPopen.kill(), or the one SIGINT
+#: for an abandoned BrishPopen), and handle it (see below). Older Python
+#: does neither: its workers share its terminal's process group, and ignore
+#: SIGINT as they always did. Commands do not inherit the variable.
 builtin typeset -g __brish_session=${BRISH_SESSION-}
 builtin unset BRISH_SESSION
 #: The SIGINT trap's state (see trapint.zsh, and the worker below). TRAPINT
@@ -201,9 +202,10 @@ for brish_server_index in {1..${#stdins}} ; do
                 __brish2_inreq=1 __brish2_ret= __brish_int= __brish_pb= __brish_pb0= __brish_tb=
                 [[ -o posix_builtins ]] && __brish_pb0=1
                 {
-                    #: SIGINT, which only BrishPopen.kill() sends (the
-                    #: worker is in a session of its own), reaches the
-                    #: worker's TRAPINT at any time (see trapint.zsh). Under
+                    #: SIGINT, which comes from Brish alone (the worker is
+                    #: in a session of its own): BrishPopen.kill(), or the
+                    #: one SIGINT for an abandoned BrishPopen. It reaches
+                    #: the worker's TRAPINT at any time (see trapint.zsh). Under
                     #: older Python there is no trap, and the worker ignores
                     #: SIGINT throughout. Idle or framing, the trap returns
                     #: at once.

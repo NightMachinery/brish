@@ -1058,7 +1058,7 @@ z("echo {untrusted_input}") # safe
 
 - A command's standard input is always a pipe (an empty one by default). This can alter the behavior of some commands such as =ripgrep=; Using =</dev/null= or =<&-= can be a suitable workaround. In binary mode, =cmd_stdin=None= gives the command =/dev/null=.
 
-- A SIGINT from =kill()= can, rarely, hang the worker, or make an interrupted =print= write its line twice (see "Streaming output"). =kill()= still ends such a command, at step 4 (9001, and a restart).
+- A SIGINT that Brish sends (from =kill()=, or the one for an abandoned =BrishPopen=) can, rarely, hang the worker, or make an interrupted =print= write its line twice (see "Streaming output"). =kill()= still ends such a command: at step 4 with 9001 and a restart, or, for a fork command, at step 2 with 143. After an abandoned =BrishPopen='s single SIGINT nothing more is sent, and in binary mode the next command on that worker waits for good.
 
 - A =KeyboardInterrupt= in =send_cmd= does not stop the shell command (no terminal signal reaches the workers), and there is no per-command timeout. =popen= and =kill()= stop a command, and a timer that calls =kill()= gives a time limit (=threading.Timer(60, p.kill).start()=).
 

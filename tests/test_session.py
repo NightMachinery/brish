@@ -2,7 +2,8 @@
 
 No terminal signal and no signal to the caller's process group reaches a
 worker or its commands, which have no controlling terminal either. Python
-still gets its KeyboardInterrupt; BrishPopen.kill() is the only interrupt.
+still gets its KeyboardInterrupt. Only Brish interrupts a command:
+BrishPopen.kill(), or the one SIGINT for an abandoned BrishPopen.
 Every test runs in both modes. run_py starts each child in a session of its
 own, so signalling the child's process group touches nothing else.
 

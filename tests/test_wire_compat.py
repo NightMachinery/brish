@@ -351,8 +351,9 @@ def test_sigint_under_old_python(sources, python):
 
 
 def test_sigint_aborts_only_the_command(sources):
-    #: This tree's Python: SIGINT to a worker (which only BrishPopen.kill
-    #: sends, since the worker is in a session of its own) aborts the
+    #: This tree's Python: SIGINT to a worker (which comes from Brish alone,
+    #: since the worker is in a session of its own: BrishPopen.kill, or the
+    #: one SIGINT for an abandoned BrishPopen) aborts the
     #: running command, which reports 130 as a plain retcode line, and the
     #: worker lives on with its state. While idle the worker ignores it.
     check(
