@@ -6,14 +6,18 @@ Per-call latency is compared with the original legacy worker (brish2.zsh at
 9599fc3, the last release before binary mode), which forked a stdin writer
 for every command. Today's legacy worker forks nothing for an empty stdin
 either, and is about as fast as binary mode (often faster: it does less per
-request), so it is only checked against the original."""
+request), so it is only checked against the original.
+
+These are absolute timings, which a loaded machine can miss, so the test runs
+only with `BRISH_TEST_PERF=1`."""
 
 import stat
 import subprocess
 
-from tests.conftest import ROOT, binary_only, check
+from tests.conftest import ROOT, binary_only, check, perf_only
 
 
+@perf_only
 @binary_only
 def test_g12_performance(tmp_path):
     original = tmp_path / "brish2_original.zsh"

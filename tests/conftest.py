@@ -15,6 +15,8 @@ variable exactly as the library reads it. Run it twice:
 
     python -m pytest -q
     BRISH_BINARY=1 python -m pytest -q
+
+The timing tests in `test_perf.py` are skipped unless `BRISH_TEST_PERF=1`.
 """
 
 import os
@@ -51,6 +53,11 @@ MODE = "binary" if BINARY else "legacy"
 
 binary_only = pytest.mark.skipif(not BINARY, reason="binary mode only")
 legacy_only = pytest.mark.skipif(BINARY, reason="legacy mode only")
+
+#: Tests that assert absolute timings run only on request, since a loaded
+#: machine misses them without any regression.
+PERF = _bool_from_str(os.environ.get("BRISH_TEST_PERF", ""))
+perf_only = pytest.mark.skipif(not PERF, reason="timing test; set BRISH_TEST_PERF=1 to run it")
 
 _SCRATCH = Path(tempfile.mkdtemp(prefix="brish-tests-"))
 EMPTY_ZDOTDIR = _SCRATCH / "zdotdir"

@@ -34,7 +34,11 @@ poetry run python -m pytest -q
 BRISH_BINARY=1 poetry run python -m pytest -q
 #+end_example
 
-=tests/test_perf.py= (binary mode only) asserts absolute timings, such as 50 MiB of stdin in under two seconds. It can fail on a heavily loaded machine; rerun it alone before treating a failure as a regression.
+=tests/test_perf.py= (binary mode only) asserts absolute timings, such as 50 MiB of stdin in under two seconds. A heavily loaded machine can miss them with no regression, so the suite skips it unless =BRISH_TEST_PERF= is set. Run it alone on a quiet machine:
+
+#+begin_example
+BRISH_TEST_PERF=1 BRISH_BINARY=1 poetry run python -m pytest -q -s tests/test_perf.py
+#+end_example
 
 * Auditing the lock
 pip-audit checks every pinned version against the PyPI and OSV advisory databases. Fed the pins straight from =poetry.lock=, it also covers packages that only install on other platforms or Python versions. The one-liner needs Python 3.11 or newer for =tomllib=:
