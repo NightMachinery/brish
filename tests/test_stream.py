@@ -357,6 +357,43 @@ def test_kill_leaves_the_stdin_whole():
     )
 
 
+def test_stdin_keeps_a_non_fork_command_in_the_worker():
+    #: A non-fork command reads its stdin from a process substitution, not
+    #: through a pipeline: under `emulate sh`, which a command can leave
+    #: behind, zsh runs the last element of a pipeline in a subshell. With
+    #: stdin, a non-fork command then lost its state changes, its `exit`
+    #: did not end the worker, and kill() gave 1 instead of 130.
+    run(
+        r'''
+        b = Brish(server_count=1)
+        w = '{ eval "$(< /dev/stdin)"; } 2>&1'
+        base = b.send_cmd("print -r -- $ZSH_SUBSHELL").out
+        for pre in ("true", "emulate sh"):
+            b.send_cmd("emulate -R zsh; v=orig; cd /")
+            b.send_cmd(pre)
+            r = b.send_cmd(w, cmd_stdin="cd /tmp; v=changed; print -r -- $ZSH_SUBSHELL")
+            assert (r.retcode, r.out) == (0, base), (pre, r)
+            r = b.send_cmd('print -r -- "$v $PWD"')
+            assert r.out == "changed /tmp\n", (pre, r)
+            b.send_cmd("v=kept")
+            r = b.send_cmd(w, cmd_stdin="exit 7")
+            assert r.retcode == 7, (pre, r)
+            #: The worker is gone: the instance restarted.
+            r = b.send_cmd('print -r -- "${v-unset}"')
+            assert r.out == "unset\n", (pre, r)
+            b.send_cmd(pre + "; v=kept")
+            with b.popen(w, cmd_stdin="print -r x; zmodload zsh/zselect; zselect -t 10000; print -r after") as p:
+                kill_later(p, 0.5)
+                evs = collect(p)
+            assert (p.retcode, p._stage, joined(evs)) == (130, 1, b"x\n"), (pre, p.retcode, p._stage, evs)
+            r = b.send_cmd('print -r -- "$v"')
+            assert r.out == "kept\n", (pre, r)
+        b.cleanup()
+        ''',
+        timeout=120,
+    )
+
+
 def test_kill_under_errexit_and_sh_emulation():
     #: zsh exits instead of unwinding when an interrupt meets err_exit (or
     #: err_return at the legacy worker's top level), or a special builtin

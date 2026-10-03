@@ -202,11 +202,16 @@ function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data
         #: eval. `&&`: after a syntax error the old body must not run again.
         #: __brish_trap is set once the function is defined, as in brish2.zsh,
         #: where a trap that acted inside that eval would break the worker's
-        #: loops. brish3_write_stdin writes the stdin.
+        #: loops. brish3_write_stdin writes the stdin from a process
+        #: substitution, not through a pipeline: under `emulate sh`, which a
+        #: command can leave behind, zsh runs the last element of a pipeline
+        #: in a subshell, which loses the command's state and its `exit`. A
+        #: process substitution's body is parsed when it runs, under the
+        #: command's options and aliases, hence one quoted word.
         if [[ $3 == data ]]; then
           builtin eval "function tmp_block_8182782 {${__brish3_nl}${BRISH3_CMD}${__brish3_nl}}" &&
             __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&
-            brish3_write_stdin | tmp_block_8182782 >&$__brish3_out 2>&$__brish3_err
+            tmp_block_8182782 < <(\brish3_write_stdin) >&$__brish3_out 2>&$__brish3_err
         elif [[ $3 == null ]]; then
           builtin eval "function tmp_block_8182782 {${__brish3_nl}${BRISH3_CMD}${__brish3_nl}}" &&
             __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&

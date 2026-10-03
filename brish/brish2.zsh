@@ -207,7 +207,15 @@ for brish_server_index in {1..${#stdins}} ; do
                     repeat 1 do  # absorbs a bare break or continue
                         #: Call-site redirections: `>&1 2>&2` also undo a
                         #: command's `exec >file`, which would hide the replies.
-                        #: __brish2_write_stdin writes the stdin.
+                        #: __brish2_write_stdin writes the stdin: in a fork
+                        #: command's subshell through a pipeline, and for a
+                        #: non-fork command from a process substitution. Not a
+                        #: pipeline there: under `emulate sh`, which a command
+                        #: can leave behind, zsh runs the last element of a
+                        #: pipeline in a subshell, which loses the command's
+                        #: state and its `exit`. A process substitution's body
+                        #: is parsed when it runs, under the command's options
+                        #: and aliases, hence one quoted word.
                         if [[ -n $brish_fork ]]; then
                             __brish_trap=unsetopt __brish_trap_arg=xtrace
                             if [[ -n $brish_stdin ]]; then
@@ -230,7 +238,7 @@ for brish_server_index in {1..${#stdins}} ; do
                             if [[ -n $brish_stdin ]]; then
                                 builtin eval "function tmp_block_8182782 {"$'\n'"$cmd"$'\n'"}" &&
                                     __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&
-                                    __brish2_write_stdin | tmp_block_8182782 >&1 2>&2
+                                    tmp_block_8182782 < <(\__brish2_write_stdin) >&1 2>&2
                             else
                                 builtin eval "function tmp_block_8182782 {"$'\n'"$cmd"$'\n'"}" &&
                                     __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&
