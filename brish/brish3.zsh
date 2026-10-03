@@ -151,6 +151,23 @@ function brish3_deftrap {
   __brish_trapid=${(P)__brish_trapref-}
 }
 
+#: Writes a command's cmd_stdin, in a child process of its own. It clears
+#: __brish_trap for itself first: kill() sends SIGINT to every process below
+#: the worker, this one included, and the trap would otherwise exit it with
+#: 130 (it runs in a subshell), cutting the stdin short. The command decides
+#: whether it is interrupted. It writes with syswrite, which goes on after a
+#: SIGINT that the trap ignores (print can give up in the middle of a
+#: write). It ignores SIGPIPE and always succeeds, so a command that does not
+#: read its stdin still reports its own status, also under pipefail. Its
+#: stdin and stderr are /dev/null.
+#: @duplicateCode/0a4f05830c0a4ae7ba6009411f60fdbe __brish2_write_stdin in brish2.zsh
+function brish3_write_stdin {
+  __brish_trap= __brish_trap_arg=
+  builtin exec </dev/null 2>/dev/null
+  builtin trap '' PIPE
+  builtin syswrite -- "$brish_stdin" || builtin true
+}
+
 #: Run the request. No locals and no emulate here: user code runs inside and
 #: must see the user's options. The nonce is kept only in $1 while user code
 #: runs; `always` restores it from there.
@@ -173,7 +190,7 @@ function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data
       if [[ $2 == 1 ]]; then
         __brish_trap=unsetopt __brish_trap_arg=xtrace
         if [[ $3 == data ]]; then
-          ( builtin set --; { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | builtin eval "$BRISH3_CMD" ) >&$__brish3_out 2>&$__brish3_err
+          ( builtin set --; brish3_write_stdin | builtin eval "$BRISH3_CMD" ) >&$__brish3_out 2>&$__brish3_err
         elif [[ $3 == null ]]; then
           ( builtin set --; builtin eval "$BRISH3_CMD" ) </dev/null >&$__brish3_out 2>&$__brish3_err
         else
@@ -185,12 +202,11 @@ function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data
         #: eval. `&&`: after a syntax error the old body must not run again.
         #: __brish_trap is set once the function is defined, as in brish2.zsh,
         #: where a trap that acted inside that eval would break the worker's
-        #: loops. The stdin writer clears it, so that a SIGINT does not stop
-        #: it: the command decides whether it is interrupted.
+        #: loops. brish3_write_stdin writes the stdin.
         if [[ $3 == data ]]; then
           builtin eval "function tmp_block_8182782 {${__brish3_nl}${BRISH3_CMD}${__brish3_nl}}" &&
             __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&
-            { __brish_trap=; builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | tmp_block_8182782 >&$__brish3_out 2>&$__brish3_err
+            brish3_write_stdin | tmp_block_8182782 >&$__brish3_out 2>&$__brish3_err
         elif [[ $3 == null ]]; then
           builtin eval "function tmp_block_8182782 {${__brish3_nl}${BRISH3_CMD}${__brish3_nl}}" &&
             __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&

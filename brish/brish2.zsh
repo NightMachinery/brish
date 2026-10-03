@@ -102,6 +102,30 @@ function __brish2_deftrap {
   fi
 }
 
+#: Writes a command's cmd_stdin, in a child process of its own. It clears
+#: __brish_trap for itself first: kill() sends SIGINT to every process below
+#: the worker, this one included, and the trap would otherwise exit it with
+#: 130 (it runs in a subshell), cutting the stdin short. The command decides
+#: whether it is interrupted. It writes with syswrite, which goes on after a
+#: SIGINT that the trap ignores (print can give up in the middle of a
+#: write). It ignores SIGPIPE and always succeeds, so a command that does not
+#: read its stdin still reports its own status, also under pipefail. It
+#: replaces its stdin and stderr with /dev/null by `exec`: a redirection of a
+#: group would keep a saved copy of the worker's fd 0, the request FIFO.
+#: Without zsh/system it uses print: the worker then has no trap, and
+#: ignores SIGINT.
+#: @duplicateCode/0a4f05830c0a4ae7ba6009411f60fdbe brish3_write_stdin in brish3.zsh
+function __brish2_write_stdin {
+  __brish_trap= __brish_trap_arg=
+  builtin exec </dev/null 2>/dev/null
+  builtin trap '' PIPE
+  if [[ -n $__brish2_sw ]]; then
+    builtin syswrite -- "$brish_stdin" || builtin true
+  else
+    builtin print -rn -- "$brish_stdin" || builtin true
+  fi
+}
+
 builtin typeset -ga __brish2_pids
 builtin local brish_server_index
 for brish_server_index in {1..${#stdins}} ; do
@@ -183,14 +207,11 @@ for brish_server_index in {1..${#stdins}} ; do
                     repeat 1 do  # absorbs a bare break or continue
                         #: Call-site redirections: `>&1 2>&2` also undo a
                         #: command's `exec >file`, which would hide the replies.
-                        #: The stdin writer ignores SIGPIPE and always succeeds,
-                        #: so a command that does not read its stdin still
-                        #: reports its own status, also under pipefail; it gets
-                        #: </dev/null so that it never holds the request FIFO.
+                        #: __brish2_write_stdin writes the stdin.
                         if [[ -n $brish_fork ]]; then
                             __brish_trap=unsetopt __brish_trap_arg=xtrace
                             if [[ -n $brish_stdin ]]; then
-                                ( { builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } 2>/dev/null | builtin eval "$cmd" ) </dev/null
+                                ( __brish2_write_stdin | builtin eval "$cmd" ) </dev/null
                             else
                                 #: `true` first: the command starts with $? = 0,
                                 #: as it did in the original pipeline.
@@ -205,14 +226,11 @@ for brish_server_index in {1..${#stdins}} ; do
                             #: `&&`: after a syntax error the previous command must
                             #: not run again. __brish_trap is set once the
                             #: function is defined: a trap that acted inside
-                            #: the eval would break the worker's loops. The
-                            #: stdin writer clears it, so that a SIGINT does
-                            #: not stop it: the command decides whether it is
-                            #: interrupted.
+                            #: the eval would break the worker's loops.
                             if [[ -n $brish_stdin ]]; then
                                 builtin eval "function tmp_block_8182782 {"$'\n'"$cmd"$'\n'"}" &&
                                     __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&
-                                    { __brish_trap=; builtin trap '' PIPE; builtin print -rn -- "$brish_stdin"; builtin true } </dev/null 2>/dev/null | tmp_block_8182782 >&1 2>&2
+                                    __brish2_write_stdin | tmp_block_8182782 >&1 2>&2
                             else
                                 builtin eval "function tmp_block_8182782 {"$'\n'"$cmd"$'\n'"}" &&
                                     __brish_tb=1 __brish_trap=unsetopt __brish_trap_arg=xtrace &&

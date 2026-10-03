@@ -317,6 +317,46 @@ def test_no_sigkill_for_a_command_that_has_ended():
     )
 
 
+def test_kill_leaves_the_stdin_whole():
+    #: kill() sends SIGINT to every process below the worker, and so to the
+    #: writer of the command's stdin. The writer ignores it, so a command
+    #: that survives the signal (here one that ignores or traps INT) reads
+    #: its whole stdin. With fork=True the worker's trap used to exit the
+    #: writer with 130, and the command read only what the pipe held: rc 0
+    #: on partial input, or 130 under pipefail. A non-fork writer blocked on
+    #: a full pipe sometimes stopped at 64 KiB: `print` gives up on a write
+    #: that the signal interrupts, `syswrite` goes on.
+    run(
+        r'''
+        data = ("x" * 99 + "\n") * 20000
+        b = Brish(server_count=1)
+        loop = "trap '' INT; n=0; while IFS= read -r l; do n=$((n+1)); done; print -r -- $n"
+        for cmd, fork in ((loop, True), ("set -o pipefail; " + loop, True), (loop, False)):
+            for i in range(2):
+                with b.popen(cmd, cmd_stdin=data, fork=fork) as p:
+                    p.kill_grace = 60  # step 1 only
+                    kill_later(p, 0.3)
+                    evs = collect(p)
+                got = (p.retcode, p._stage, joined(evs), joined(evs, "err"))
+                assert got == (0, 1, b"20000\n", b""), (cmd, fork, i, got)
+        #: The command waits in a child while the writer fills the pipe and
+        #: blocks; the child dies of the SIGINT, the trap runs, and the
+        #: command goes on.
+        late = "command zsh -fc 'zmodload zsh/zselect; zselect -t 100 || :'; wc -c | tr -d ' '"
+        for trap in ("trap 'print -ru2 caught' INT", "TRAPINT() { print -ru2 caught; return 0 }"):
+            for i in range(4):
+                with b.popen(trap + "; " + late, cmd_stdin="x" * 300000) as p:
+                    p.kill_grace = 60
+                    kill_later(p, 0.4)
+                    evs = collect(p)
+                got = (p.retcode, p._stage, joined(evs))
+                assert got == (0, 1, b"300000\n"), (trap, i, got, evs)
+        b.cleanup()
+        ''',
+        timeout=240,
+    )
+
+
 def test_kill_under_errexit_and_sh_emulation():
     #: zsh exits instead of unwinding when an interrupt meets err_exit (or
     #: err_return at the legacy worker's top level), or a special builtin
