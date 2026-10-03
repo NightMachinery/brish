@@ -600,6 +600,164 @@ def test_soak():
     print(res.out)
 
 
+CANCEL_HELPERS = r"""
+SENTINEL = os.path.join(SCRATCH, "sentinel")
+CMD = "print -r -- ran; : > " + SENTINEL
+class Flag:
+    #: A `cancelled` callable that turns true `after` seconds from now, and
+    #: counts its calls.
+    def __init__(self, after):
+        self.at = time.monotonic() + after
+        self.calls = 0
+    def __call__(self):
+        self.calls += 1
+        return time.monotonic() >= self.at
+class Holder:
+    #: A thread that holds worker i's lock until release().
+    def __init__(self, b, i):
+        self.go, self.done = threading.Event(), threading.Event()
+        def run():
+            lock, _ = b.acquire_lock(server_index=i)
+            self.go.set()
+            self.done.wait()
+            lock.release()
+        self.t = threading.Thread(target=run, daemon=True)
+        self.t.start()
+        assert self.go.wait(30)
+    def release(self):
+        self.done.set()
+        self.t.join(30)
+def cancelled_in(fn, secs=30):
+    #: (seconds until fn() raised BrishCancelledException, its message).
+    t = time.monotonic()
+    try:
+        fn()
+    except bm.BrishCancelledException as e:
+        return time.monotonic() - t, str(e)
+    raise AssertionError("not cancelled")
+"""
+
+
+def test_a_cancelled_call_that_waits_for_a_worker_runs_nothing():
+    #: popen, send_cmd, z, zpopen and acquire_lock with cancelled=f call f
+    #: while they wait for a worker that other threads hold, and raise
+    #: BrishCancelledException soon after it turns true (not a lock_sleep
+    #: later), without the lock; an exception from f propagates the same
+    #: way. Nothing runs, and the workers serve the next calls.
+    run(
+        r"""
+        import faulthandler; faulthandler.dump_traceback_later(100, exit=True)
+        b = Brish(server_count=2)
+        for i in range(2):
+            b.send_cmd(f"v=kept{i}", server_index=i)
+        h0, h1 = Holder(b, 0), Holder(b, 1)
+        for call in (
+            lambda f: b.popen(CMD, server_index=0, cancelled=f),
+            lambda f: b.popen(CMD, cancelled=f),  # server_index=None, lock_sleep=1
+            lambda f: b.popen(CMD, lock_sleep=None, cancelled=f),
+            lambda f: b.send_cmd(CMD, server_index=1, cancelled=f),
+            lambda f: b.send_cmd(CMD, cancelled=f),
+            lambda f: b.z("{CMD:e}", cancelled=f),
+            lambda f: b.zpopen("{CMD:e}", server_index=1, cancelled=f),
+            lambda f: b.acquire_lock(cancelled=f),
+            lambda f: b.acquire_lock(server_index=0, cancelled=f),
+        ):
+            f = Flag(0.3)
+            dt, msg = cancelled_in(lambda: call(f))
+            assert 0.25 < dt < 0.9, dt
+            assert f.calls >= 2, f.calls  # it polled while it waited (once is enough on a loaded machine)
+            assert "nothing ran" in msg, msg
+        def boom():
+            raise ZeroDivisionError("from cancelled")
+        try:
+            b.popen(CMD, server_index=0, cancelled=boom)
+        except ZeroDivisionError:
+            pass
+        else:
+            raise AssertionError("the callable's exception did not propagate")
+        h0.release()
+        h1.release()
+        assert not os.path.exists(SENTINEL)
+        assert all_locks_free(b)
+        for i in range(2):
+            r = b.send_cmd("print -r -- $v", server_index=i)
+            assert r.out == f"kept{i}\n", (i, r)
+        #: A free worker: cancelled is asked once, just before the request.
+        f = Flag(0)
+        dt, _ = cancelled_in(lambda: b.popen(CMD, cancelled=f))
+        assert f.calls == 1, f.calls
+        f = Flag(0)
+        dt, _ = cancelled_in(lambda: b.acquire_lock(server_index=1, cancelled=f))
+        assert f.calls == 1, f.calls
+        never = lambda: False
+        lock, i = b.acquire_lock(server_index=1, cancelled=never)
+        lock.release()
+        with b.popen("print -r -- fine", cancelled=never) as p:
+            assert p.wait() == 0
+        assert b.send_cmd("print -r -- fine", cancelled=never).out == "fine\n"
+        assert not os.path.exists(SENTINEL)
+        b.cleanup()
+        """,
+        setup=CANCEL_HELPERS,
+    )
+
+
+@pytest.mark.parametrize("eager", [True, False], ids=["eager", "lazy"])
+def test_a_cancelled_call_keeps_the_replacement_it_waited_for(eager):
+    #: Worker 0 died. The next popen on it waits for its replacement (eager:
+    #: the one starting in the background; lazy: one it starts itself, which
+    #: is not interrupted), and its client goes away meanwhile. It raises
+    #: BrishCancelledException without running anything: eagerly as soon as
+    #: it sees the flag, lazily once the boot is done. The replacement stays
+    #: in the slot, so the next call does not boot again, and nothing leaks.
+    run(
+        r"""
+        import faulthandler; faulthandler.dump_traceback_later(100, exit=True)
+        BOOT = 1.5
+        b = Brish(server_count=2, boot_cmd=f"sleep {BOOT}; booted=yes")
+        b.eager_replacement = EAGER
+        b.send_cmd("v=kept1", server_index=1)
+        assert b.send_cmd("exit 3", server_index=0).retcode == 3
+        f = Flag(0.3)
+        dt, _ = cancelled_in(lambda: b.popen(CMD, server_index=0, cancelled=f))
+        if EAGER:
+            assert dt < BOOT - 0.3, dt  # did not wait for the boot to end
+        else:
+            assert dt > BOOT - 0.1, dt  # the boot it started ran to its end
+        assert not os.path.exists(SENTINEL)
+        if EAGER:
+            assert settle(lambda: b._slots[0].warming is not None, 30) is False
+        t = time.monotonic()
+        r = b.send_cmd("print -r -- ${booted-unset} $brish_server_index ${v-unset}", server_index=0)
+        took = time.monotonic() - t
+        assert r.out == "yes 1 unset\n", repr(r)
+        assert took < BOOT - 0.3, took  # it found the replacement ready
+        r = b.send_cmd("print -r -- $v", server_index=1)
+        assert r.out == "kept1\n", repr(r)
+        #: The callable's own exception, during the wait for an eager boot.
+        if EAGER:
+            assert b.send_cmd("exit 4", server_index=0).retcode == 4
+            def boom():
+                raise ZeroDivisionError("from cancelled")
+            try:
+                b.popen(CMD, server_index=0, cancelled=boom)
+            except ZeroDivisionError:
+                pass
+            else:
+                raise AssertionError("the callable's exception did not propagate")
+            r = b.send_cmd("print -r -- ${booted-unset}", server_index=0)
+            assert r.out == "yes\n", repr(r)
+        assert not os.path.exists(SENTINEL)
+        assert all_locks_free(b)
+        assert not settle(lambda: stray(b)), stray(b)
+        assert not settle(lambda: retired_alive(b)), retired_alive(b)
+        b.cleanup()
+        assert not settle(lambda: session_members(SCRATCH)), session_members(SCRATCH)
+        """,
+        setup=CANCEL_HELPERS + f"EAGER = {eager!r}\n",
+    )
+
+
 def git_show(rev, path):
     p = subprocess.run(
         ["git", "-C", str(ROOT), "show", f"{rev}:{path}"], capture_output=True

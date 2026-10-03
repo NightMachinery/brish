@@ -290,9 +290,25 @@ class BrishWorkerBusyException(RuntimeError):
     lock would let that thread in, since it is an RLock, but the worker is
     busy: read the BrishPopen to its end or close it first, or leave
     server_index=None so that the call picks another worker. Raised at once;
-    nothing is restarted."""
+    no worker is replaced."""
 
     pass
+
+
+class BrishCancelledException(RuntimeError):
+    """The `cancelled` callable given to popen, zpopen, send_cmd or z
+    returned true, while the call waited for a worker or just before it
+    would have sent the command: nothing ran, and the worker is free again
+    (a replacement that the call started stays in its slot)."""
+
+    pass
+
+
+def _check_cancelled(cancelled):
+    """Raise BrishCancelledException if `cancelled()` is true; an exception
+    from it propagates as it is."""
+    if cancelled():
+        raise BrishCancelledException("cancelled before the command was sent; nothing ran")
 
 
 #: Return code of a command whose worker died before reporting a status.
@@ -543,6 +559,9 @@ _HELLO = b"\0BRISH3-HELLO:"
 _READ_CHUNK = 65536
 #: Seconds between liveness checks while a worker is silent.
 _POLL = 0.5
+#: Seconds between calls of a `cancelled` callable while a call waits for a
+#: worker (see Brish.popen).
+_CANCEL_POLL = 0.05
 _END_TRAILER = re.compile(rb"(\d+)(:exit)?\Z")
 
 
@@ -1095,7 +1114,7 @@ class BrishPopen:
     kill_grace = 2.0
 
     def __init__(self, brish, cmd, cmd_stdin="", fork=False, server_index=None,
-                 lock_sleep=1, buffer=False):
+                 lock_sleep=1, buffer=False, cancelled=None):
         self.cmd = cmd
         self.cmd_stdin = brish._stored_stdin(cmd_stdin)
         self.fork = bool(fork)
@@ -1129,7 +1148,9 @@ class BrishPopen:
         self._worker_pid = None
         self._last_io = time.monotonic()
         self._dead_since = None
-        self._start(cmd, cmd_stdin, fork, server_index, lock_sleep)
+        #: `cancelled` is passed down, never kept: a callable that refers to
+        #: this object would make a reference cycle.
+        self._start(cmd, cmd_stdin, fork, server_index, lock_sleep, cancelled)
         self._started_at = time.monotonic()
 
     def __repr__(self):
@@ -1138,7 +1159,7 @@ class BrishPopen:
 
     # Starting
 
-    def _start(self, cmd, cmd_stdin, fork, server_index, lock_sleep):
+    def _start(self, cmd, cmd_stdin, fork, server_index, lock_sleep, cancelled):
         b = self._brish
         restart_cmd = cmd
         if isinstance(cmd, _BYTES_LIKE):
@@ -1168,7 +1189,7 @@ class BrishPopen:
             #: good. Closing it would need _acquire to record the lock where
             #: the except clause reads it, which still leaves a gap of a few
             #: bytecodes inside _acquire.
-            lock, index, p = b._acquire(server_index, lock_sleep)
+            lock, index, p = b._acquire(server_index, lock_sleep, cancelled)
             try:
                 #: No call before _released is cleared: an interrupt there
                 #: (a KeyboardInterrupt comes at calls and loops) would reach
@@ -1177,7 +1198,7 @@ class BrishPopen:
                 self._released = False
                 p.free_server_count -= 1
                 p.popen_owner[index] = self._owner_thread
-                outcome = start(p, index, cmd_b, stdin_b, fork)
+                outcome = start(p, index, cmd_b, stdin_b, fork, cancelled)
             except BaseException:
                 #: An interrupt while starting (the start methods leave the
                 #: worker resynchronisable or due for replacement) must not
@@ -1198,7 +1219,7 @@ class BrishPopen:
         self._finished = True
         self.retcode = retcode
 
-    def _start_binary(self, p, index, cmd_b, stdin_b, fork):
+    def _start_binary(self, p, index, cmd_b, stdin_b, fork, cancelled):
         """Write the frame and wait for START. Returns _NEVER_RAN if the
         worker died before START, or is broken; then the lock is still
         held."""
@@ -1221,6 +1242,8 @@ class BrishPopen:
         self._se = _StreamParser(start, end, collect=False)
         self._streams = {w.out: ("out", self._so), w.err: ("err", self._se)}
         self._died = False
+        if cancelled is not None:
+            _check_cancelled(cancelled)  # nothing written yet
         try:
             try:
                 self._sent = os.write(w.req, frame)
@@ -1247,7 +1270,7 @@ class BrishPopen:
             return _NEVER_RAN
         return None
 
-    def _start_legacy(self, p, index, cmd_b, stdin_b, fork):
+    def _start_legacy(self, p, index, cmd_b, stdin_b, fork, cancelled):
         """Learn the worker's PID if needed, write the request and start the
         reader threads. Returns _NEVER_RAN if the worker could not take it;
         then the lock is still held."""
@@ -1261,6 +1284,8 @@ class BrishPopen:
         if _legacy_busy(p, index):
             return _NEVER_RAN
         frame = b"".join((cmd_b, b"\0", stdin_b, b"\0", b"y" if fork else b"", b"\0\n"))
+        if cancelled is not None:
+            _check_cancelled(cancelled)  # nothing written yet
         try:
             f = p.brish_stdins[index]
             f.write(frame)
@@ -2744,7 +2769,7 @@ class Brish:
                 self._warmers.discard(threading.current_thread())
             warm.done.set()
 
-    def _service(self, i, slots, s):
+    def _service(self, i, slots, s, cancelled=None):
         """At a fresh acquire of slot i, whose lock this thread now holds:
         swap in the pending replacement, or replace a dead worker, waiting
         for an eager replacement under way or booting one. Boots at most one
@@ -2774,7 +2799,13 @@ class Brish:
                 self._retire(retire)
                 continue
             if warm is not None:
-                warm.done.wait()
+                if cancelled is None:
+                    warm.done.wait()
+                else:
+                    #: The eager replacement goes on, and stays pending for
+                    #: the slot's next user.
+                    while not warm.done.wait(_CANCEL_POLL):
+                        _check_cancelled(cancelled)
                 continue
             p = self._spawn([i], len(slots), slots, False)
             try:
@@ -3069,13 +3100,29 @@ class Brish:
     def _quote_bytes(self, b):
         return zsh_quote_bytes(b, ascii_only=self._quote_ascii_only())
 
-    def acquire_lock(self, server_index=None, lock_sleep=1):
-        lock, server_index, _ = self._acquire(server_index, lock_sleep)
+    def acquire_lock(self, server_index=None, lock_sleep=1, cancelled=None):
+        """Take a worker's lock, and return (lock, server_index); release
+        it with lock.release(). `cancelled` works as for popen: called while
+        the call waits, and once more when it has the worker; when it
+        returns true, the lock is released again and
+        BrishCancelledException is raised."""
+        lock, server_index, _ = self._acquire(server_index, lock_sleep, cancelled)
+        if cancelled is not None:
+            try:
+                _check_cancelled(cancelled)
+            except BaseException:
+                lock.release()
+                raise
         return lock, server_index
 
-    def _acquire(self, server_index=None, lock_sleep=1):
+    def _acquire(self, server_index=None, lock_sleep=1, cancelled=None):
         """Lock one slot. Returns (lock, server_index, p): worker
         `server_index` of bootstrap `p` serves the slot.
+
+        `cancelled` (a callable, or None) is called every _CANCEL_POLL
+        seconds while the call waits (for a slot's lock, for a cleanup to
+        finish, for an eager replacement to start); when it returns true,
+        the call raises BrishCancelledException, without the lock.
 
         A fresh acquire (this thread did not hold the slot's lock) first
         swaps in the slot's pending replacement, or replaces its dead worker
@@ -3088,11 +3135,11 @@ class Brish:
         while True:
             slots, locks = self._slots, self.locks
             if slots is None or (self._closing and not self._holds_worker_lock()):
-                self._wait_usable()
+                self._wait_usable(cancelled)
                 continue
             me = threading.current_thread()
             if server_index is None:
-                got = self._pick(slots, locks, me, lock_sleep)
+                got = self._pick(slots, locks, me, lock_sleep, cancelled)
                 if got is None:
                     continue
                 index, lock, fresh = got
@@ -3113,7 +3160,7 @@ class Brish:
                 lock = locks[index]
                 fresh = not lock._is_owned()
                 if fresh:
-                    if not self._wait_slot_lock(index, lock, locks):
+                    if not self._wait_slot_lock(index, lock, locks, cancelled):
                         continue
                 else:
                     lock.acquire()
@@ -3141,13 +3188,13 @@ class Brish:
                 continue
             if attn:
                 try:
-                    self._service(index, slots, s)
+                    self._service(index, slots, s, cancelled)
                 except BaseException:
                     lock.release()
                     raise
             return lock, index, s.p
 
-    def _wait_usable(self):
+    def _wait_usable(self, cancelled=None):
         """The slow path of _acquire: the instance has no workers, or a
         cleanup is under way. A thread that holds no worker lock waits for
         the cleanup to finish (one that holds one goes on: the cleanup waits
@@ -3155,7 +3202,11 @@ class Brish:
         holder = self._holds_worker_lock()
         with self.lock:
             while self._closing and not holder:
-                self._settled.wait()
+                if cancelled is None:
+                    self._settled.wait()
+                else:
+                    self._settled.wait(_CANCEL_POLL)
+                    _check_cancelled(cancelled)
             if self._slots is not None:
                 return
         with self._boot_mu:
@@ -3168,7 +3219,7 @@ class Brish:
             self.delayed_init = False
             self._init_locked()
 
-    def _pick(self, slots, locks, me, lock_sleep):
+    def _pick(self, slots, locks, me, lock_sleep, cancelled=None):
         """server_index=None: take a free slot, a healthy one first, then one
         with a pending replacement (a swap), a stale one (binary mode: its
         next request waits for an abandoned command) and last a dead one (a
@@ -3227,23 +3278,35 @@ class Brish:
             if self._owner_ended(i, locks[i]) and self._recover_slot(i, locks[i]):
                 return None
         if lock_sleep is not None:
-            time.sleep(lock_sleep)
+            if cancelled is None:
+                time.sleep(lock_sleep)
+            else:
+                deadline = time.monotonic() + lock_sleep
+                while True:
+                    _check_cancelled(cancelled)
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    time.sleep(min(left, _CANCEL_POLL))
             return None
         i = random.randrange(n)
         lock = locks[i]
         if lock._is_owned():
             lock.acquire()
             return i, lock, False
-        if not self._wait_slot_lock(i, lock, locks):
+        if not self._wait_slot_lock(i, lock, locks, cancelled):
             return None
         return i, lock, True
 
-    def _wait_slot_lock(self, i, lock, locks):
+    def _wait_slot_lock(self, i, lock, locks, cancelled=None):
         """Take slot i's lock `lock`, which this thread does not hold.
         Returns False, without it, if it stops being the slot's lock: the
         instance was cleaned up, or the lock was replaced because its holder
         has ended (see _recover_slot)."""
-        while not lock.acquire(timeout=_POLL):
+        poll = _POLL if cancelled is None else _CANCEL_POLL
+        while not lock.acquire(timeout=poll):
+            if cancelled is not None:
+                _check_cancelled(cancelled)
             if self.locks is not locks or locks[i] is not lock:
                 return False
             if self._owner_ended(i, lock):
@@ -3252,7 +3315,8 @@ class Brish:
         return True
 
     def send_cmd(
-        self, cmd, cmd_stdin="", fork=False, server_index=None, lock_sleep=1
+        self, cmd, cmd_stdin="", fork=False, server_index=None, lock_sleep=1,
+        cancelled=None,
     ):
         """Run `cmd` in a worker and return its CmdResult.
 
@@ -3260,6 +3324,11 @@ class Brish:
         instance encoding and surrogateescape. `cmd_stdin=None` means
         /dev/null in binary mode, and empty stdin in legacy mode, where a
         NUL in `cmd` or `cmd_stdin` gives the retcode 9000 instead.
+
+        `cancelled`, a callable without arguments, is called while the call
+        waits for a worker (every 0.05 s) and once just before the command
+        would be sent; when it returns true, the call raises
+        BrishCancelledException and nothing runs (see popen).
         """
         restart_cmd = cmd
         if isinstance(cmd, _BYTES_LIKE):
@@ -3277,11 +3346,12 @@ class Brish:
                 )
             return CmdResult(0, msg, "", cmd, self._stored_stdin(cmd_stdin))
         if self.binary:
-            return self._send_binary(cmd, cmd_stdin, fork, server_index, lock_sleep)
-        return self._send_legacy(cmd, cmd_stdin, fork, server_index, lock_sleep)
+            return self._send_binary(cmd, cmd_stdin, fork, server_index, lock_sleep, cancelled)
+        return self._send_legacy(cmd, cmd_stdin, fork, server_index, lock_sleep, cancelled)
 
     def popen(
-        self, cmd, cmd_stdin="", fork=False, server_index=None, lock_sleep=1, buffer=False
+        self, cmd, cmd_stdin="", fork=False, server_index=None, lock_sleep=1, buffer=False,
+        cancelled=None,
     ):
         """Run `cmd` in a worker and stream its output while it runs.
 
@@ -3303,6 +3373,21 @@ class Brish:
         The arguments are those of send_cmd. With buffer=True, the chunks
         that iteration or wait() consumed are also kept, and `result` gives
         the CmdResult that send_cmd would have returned.
+
+        `cancelled` is a callable without arguments (or None), for a caller
+        whose client may go away while the call waits for a worker: for a
+        free one, for a slot's lock, or for a dead worker's replacement to
+        start. Brish calls it every 0.05 s while it waits for a lock or an
+        eager replacement (also within lock_sleep), and once more after it
+        holds the worker and any replacement of it is done, just before it
+        writes the request. When it returns true, popen frees the worker (a
+        replacement it started stays in the slot) and raises
+        BrishCancelledException; nothing ran. An exception that the callable
+        raises propagates the same way, with nothing run. A replacement that
+        the call starts itself (eager_replacement off) is not interrupted:
+        the check after it decides. In binary mode a stale worker (see
+        below) takes the request at once and runs it when its abandoned
+        command ends; `cancelled` is not called after the request is sent.
 
         The worker's lock is held from the call until the reply has been read,
         so the object is read, waited for and closed in the thread that made
@@ -3358,7 +3443,7 @@ class Brish:
         """
         return BrishPopen(
             self, cmd, cmd_stdin=cmd_stdin, fork=fork, server_index=server_index,
-            lock_sleep=lock_sleep, buffer=buffer,
+            lock_sleep=lock_sleep, buffer=buffer, cancelled=cancelled,
         )
 
     def zpopen(self, template, locals_=None, getframe=2, **kwargs):
@@ -3399,7 +3484,7 @@ class Brish:
             return bytes(cmd_stdin)
         return str(cmd_stdin)
 
-    def _send_binary(self, cmd, cmd_stdin, fork, server_index, lock_sleep):
+    def _send_binary(self, cmd, cmd_stdin, fork, server_index, lock_sleep, cancelled=None):
         #: Encode everything first: an encoding error must leave the worker
         #: untouched.
         cmd_b = self._to_bytes(cmd, "cmd")
@@ -3411,7 +3496,13 @@ class Brish:
             nonce = secrets.token_hex(16).encode()
             header = b"BRISH3 %s %d %s %d\n" % (nonce, len(cmd_b), stdin_len, 1 if fork else 0)
             frame = b"".join((header, cmd_b, stdin_b or b""))
-            lock, index, p = self._acquire(server_index, lock_sleep)
+            lock, index, p = self._acquire(server_index, lock_sleep, cancelled)
+            if cancelled is not None:
+                try:
+                    _check_cancelled(cancelled)
+                except BaseException:
+                    lock.release()
+                    raise
             try:
                 p.free_server_count -= 1
                 outcome = self._binary_transact(p, p.workers[index], frame, nonce)
@@ -3562,7 +3653,7 @@ class Brish:
         retcode, exited = _parse_trailer(so.trailer)
         return retcode, so.payload(), se.payload(), exited
 
-    def _send_legacy(self, cmd, cmd_stdin, fork, server_index, lock_sleep):
+    def _send_legacy(self, cmd, cmd_stdin, fork, server_index, lock_sleep, cancelled=None):
         #: Encode everything first, with the same rules as binary mode: an
         #: encoding error must leave the worker untouched.
         cmd_b = self._to_bytes(cmd, "cmd")
@@ -3582,7 +3673,13 @@ class Brish:
         frame = b"".join((cmd_b, b"\0", stdin_b, b"\0", b"y" if fork else b"", b"\0\n"))
 
         for attempt in range(2):
-            lock, index, p = self._acquire(server_index, lock_sleep)
+            lock, index, p = self._acquire(server_index, lock_sleep, cancelled)
+            if cancelled is not None:
+                try:
+                    _check_cancelled(cancelled)
+                except BaseException:
+                    lock.release()
+                    raise
             outcome = None
             try:
                 p.free_server_count -= 1
