@@ -331,7 +331,8 @@ done
 #: retcode line "09001": every Python parses it as 9001, and new Python tells
 #: it apart from a command's own `return 9001`. If the
 #: worker answered, or was idle, nobody reads it: the caller's next request
-#: finds the request FIFO without a reader and restarts the instance. The
+#: finds the request FIFO without a reader, and Python replaces that worker
+#: (older Python restarts the whole instance). The
 #: FIFOs are opened non-blocking, so this never waits for a reader.
 function __brish2_answer {  # $1: worker index
   builtin local fd
