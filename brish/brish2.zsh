@@ -19,6 +19,13 @@ MARKER=$'\0'
 builtin printf -v __brish2_nul '\0'
 __brish2_dl=$'\n'"$__brish2_nul"$'\n'  # a reply delimiter, with the newline before it
 
+#: New Python starts this bootstrap in a session of its own, which no
+#: terminal's signals reach, and says so with BRISH_SESSION=1. Its workers
+#: then get SIGINT from BrishPopen.kill() alone, and handle it (see below).
+#: Older Python does neither: its workers share its terminal's process group,
+#: and ignore SIGINT as they always did. Commands do not inherit the variable.
+builtin typeset -g __brish_session=${BRISH_SESSION-}
+builtin unset BRISH_SESSION
 #: The SIGINT trap's state (see trapint.zsh, and the worker below). TRAPINT
 #: acts only deeper than itself, that is inside the command's function.
 builtin typeset -g __brish_trapfile=${${(%):-%x}:A:h}/trapint.zsh
@@ -80,12 +87,13 @@ function __brish2_on_exit {  # $1: exit status
 #: its replies with `print`, which a SIGINT trap would cut short. A
 #: command's own trap string is no function either, so it cannot be told
 #: from that: the id is then NUL, which nothing matches, and `always`
-#: ignores SIGINT again after every command.
+#: ignores SIGINT again after every command. Only a worker in a session of
+#: its own (see __brish_session) defines a trap at all.
 #: @duplicateCode/9834d1f0406a4c3eb2f9b672e929d810 brish3_deftrap in brish3.zsh
 function __brish2_deftrap {
   builtin emulate -L zsh
   builtin setopt no_aliases no_local_traps
-  if [[ -n $__brish2_sw ]]; then
+  if [[ -n $__brish2_sw && -n $__brish_trapfile ]]; then
     builtin source "$__brish_trapfile"
     __brish_trapid=${(P)__brish_trapref-}
   else
@@ -107,12 +115,18 @@ for brish_server_index in {1..${#stdins}} ; do
         #: only syswrite from zsh/system.
         builtin typeset -g __brish2_pid=$(builtin zmodload zsh/system 2>/dev/null && builtin print -r -- ${sysparams[ppid]})
         builtin trap '__brish2_on_exit $?' EXIT
-        if [[ -r $__brish_trapfile ]] && builtin zmodload -F zsh/system b:syswrite 2>/dev/null; then
+        if builtin zmodload -F zsh/system b:syswrite 2>/dev/null; then
             __brish2_sw=1
-        else
-            __brish_trapfile=
         fi
-        __brish2_deftrap  # the worker's TRAPINT, for good; see below
+        [[ -r $__brish_trapfile ]] || __brish_trapfile=
+        if [[ -n $__brish_session ]]; then
+            __brish2_deftrap  # the worker's TRAPINT, for good; see below
+        else
+            #: Older Python: SIGINT stays ignored (a background job ignores
+            #: it), and the worker never sets an INT trap, as before
+            #: TRAPINT: `always` finds nothing to put back.
+            __brish_trapref=__brish_trapid
+        fi
         #: An always-EOF pipe, opened once: the stdin of every command that
         #: gets no stdin, so such a command forks nothing.
         builtin typeset -g __brish2_empty=
@@ -148,8 +162,12 @@ for brish_server_index in {1..${#stdins}} ; do
                 __brish2_inreq=1 __brish2_ret= __brish_int= __brish_pb= __brish_pb0=
                 [[ -o posix_builtins ]] && __brish_pb0=1
                 {
-                    #: SIGINT reaches the worker's TRAPINT at any time (see
-                    #: trapint.zsh). Idle or framing, it returns at once.
+                    #: SIGINT, which only BrishPopen.kill() sends (the
+                    #: worker is in a session of its own), reaches the
+                    #: worker's TRAPINT at any time (see trapint.zsh). Under
+                    #: older Python there is no trap, and the worker ignores
+                    #: SIGINT throughout. Idle or framing, the trap returns
+                    #: at once.
                     #: While a command runs (from setting __brish_trap to
                     #: `always`), it makes SIGINT act like an interactive
                     #: Ctrl-C. A fork command's subshell exits with
@@ -277,9 +295,9 @@ function __brish2_reap {
 }
 #: Set after the workers are forked, so they do not inherit these traps or
 #: the whole module (a worker loads only syswrite from it). A reader that
-#: goes away must not kill the bootstrap with SIGPIPE, and a terminal Ctrl-C,
-#: which reaches the whole process group, must not kill it either (each
-#: worker aborts only its current command).
+#: goes away must not kill the bootstrap with SIGPIPE, and a SIGINT to the
+#: whole process group must not kill it either: one that a command sends
+#: (`kill -INT 0`), or under older Python a terminal Ctrl-C.
 builtin trap '' PIPE INT
 if builtin zmodload zsh/system 2>/dev/null; then
   builtin trap __brish2_reap CHLD

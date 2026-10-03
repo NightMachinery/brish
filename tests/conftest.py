@@ -4,9 +4,11 @@ Anything that talks to a zsh worker can hang when the transport is broken, so
 such tests run their body in a child Python process through `run_py`, which
 enforces a timeout. On timeout it walks `ps -Ao pid,ppid` from the child's PID
 and kills the whole tree by explicit PID (printing the PIDs first). Each child
-runs in its own session, so anything it leaves behind (orphaned workers,
-background jobs) shares the child's process group and is found and killed the
-same way.
+runs in its own session, so anything it leaves behind (a background job, a
+worker of older Brish code) shares the child's process group and is found and
+killed the same way. Brish starts its bootstraps in sessions of their own,
+which the child records (see PRELUDE): what is left in those sessions is
+found and killed too.
 
 The suite runs in two modes, selected by the `BRISH_BINARY` environment
 variable exactly as the library reads it. Run it twice:
@@ -88,6 +90,53 @@ def group_members(pgid):
     return [pid for pid, _, g in ps_rows() if g == pgid]
 
 
+#: Where a child records the sessions that Brish starts (see PRELUDE): one
+#: line "PID START" per bootstrap, START being time.time() just after the
+#: spawn.
+SESSIONS_FILE = ".brish-sessions"
+
+
+def _started_at(pid):
+    """The start time of a live `pid` (whole seconds), or None."""
+    out = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True
+    ).stdout.strip()
+    try:
+        return time.mktime(time.strptime(out, "%a %b %d %H:%M:%S %Y"))
+    except ValueError:
+        return None
+
+
+def session_members(scratch):
+    """The live processes of the sessions that a child's Brish started.
+
+    Every process of such a session is in the bootstrap's process group (the
+    workers do no job control). A PID is not reused while a process group of
+    that ID exists, so the group's members are the session's, unless the
+    leader died and the group emptied, and a new process took the PID: a
+    live leader therefore has to have started when it was recorded.
+    """
+    try:
+        lines = (Path(scratch) / SESSIONS_FILE).read_text().split("\n")
+    except FileNotFoundError:
+        return []
+    sessions = {}
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 2:
+            sessions[int(parts[0])] = float(parts[1])
+    rows = ps_rows()
+    live = {pid for pid, _, _ in rows}
+    found = []
+    for leader, start in sessions.items():
+        if leader in live:
+            began = _started_at(leader)
+            if began is None or not (start - 3 <= began <= start + 1):
+                continue  # not ours any more
+        found += [pid for pid, _, g in rows if g == leader]
+    return found
+
+
 def kill_pids(pids, why):
     pids = [p for p in pids if p > 1 and p != os.getpid()]
     if not pids:
@@ -129,6 +178,14 @@ from brish.brishmod import Brish, CmdResult
 assert os.path.realpath(brish.__file__).startswith(os.path.realpath(ROOT) + os.sep), brish.__file__
 SCRATCH = {scratch!r}
 BINARY = {binary!r}
+class _RecordSession(bm.Popen):
+    #: Records every session that Brish starts, for run_py's orphan check.
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        if kw.get("start_new_session"):
+            with open(os.path.join(SCRATCH, {sessions!r}), "a") as f:
+                f.write("%d %f\\n" % (self.pid, time.time()))
+bm.Popen = _RecordSession
 """
 
 
@@ -153,7 +210,7 @@ def run_py(code, timeout=60, real_env=False, env=None, cwd=None, allow_orphans=F
             else:
                 child_env[k] = v
     src = (
-        PRELUDE.format(root=str(ROOT), scratch=scratch, binary=BINARY)
+        PRELUDE.format(root=str(ROOT), scratch=scratch, binary=BINARY, sessions=SESSIONS_FILE)
         + textwrap.dedent(setup)
         + textwrap.dedent(code)
     )
@@ -174,7 +231,10 @@ def run_py(code, timeout=60, real_env=False, env=None, cwd=None, allow_orphans=F
         #: The tree walk finds live descendants; the group scan also finds
         #: ones already reparented (which can hold our output pipes open).
         tree = descendants(p.pid)
-        group = [pid for pid in group_members(p.pid) if pid not in tree]
+        group = [
+            pid for pid in group_members(p.pid) + session_members(scratch)
+            if pid not in tree
+        ]
         kill_pids(
             list(reversed(tree)) + group + [p.pid],
             f"timeout after {timeout}s in child {p.pid}",
@@ -182,14 +242,18 @@ def run_py(code, timeout=60, real_env=False, env=None, cwd=None, allow_orphans=F
         try:
             out, err = p.communicate(timeout=10)
         except subprocess.TimeoutExpired:
-            kill_pids(group_members(p.pid), f"second pass for child {p.pid}")
+            kill_pids(
+                group_members(p.pid) + session_members(scratch),
+                f"second pass for child {p.pid}",
+            )
             out, err = p.communicate(timeout=10)
-    #: Whatever is left in the child's process group is an orphan: a worker or
-    #: a background job that outlived the child. Give shutdown a moment.
+    #: Whatever is left in the child's process group or in a session that its
+    #: Brish started is an orphan: a worker or a background job that outlived
+    #: the child. Give shutdown a moment.
     orphans = []
     deadline = time.time() + 3
     while True:
-        orphans = group_members(p.pid)
+        orphans = group_members(p.pid) + session_members(scratch)
         if not orphans or time.time() > deadline:
             break
         time.sleep(0.05)

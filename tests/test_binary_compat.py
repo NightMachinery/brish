@@ -105,40 +105,50 @@ def test_master_python_on_this_worker(sources, real_env):
 
 
 def test_sigint_with_master_python(sources):
-    #: The intended difference: SIGINT now aborts the running command (status
-    #: 130) and the worker lives on; while idle it is ignored. Workers used to
-    #: ignore it throughout, so a non-fork command ran on to its end.
+    #: master's Python starts the bootstrap in its own process group (a
+    #: terminal Ctrl-C reaches the workers) and does not set BRISH_SESSION,
+    #: so this worker defines no SIGINT trap and ignores SIGINT throughout,
+    #: as master's worker did: a SIGINT to the worker and every process below
+    #: it gives what it gives on master's worker. The commands wait with
+    #: zselect, a builtin, so that nothing else's signals can reach them.
     check(
-        r'''
+        r"""
         from tests.conftest import descendants
-        mod = master_on(TREE_FILE, "t")
-        b = mod.Brish(server_count=1, binary=True)
-        pid = b.p.workers[0].pid
-        assert b.send_cmd("v=kept").retcode == 0
-        for cmd, fork in [("print -r before; sleep 100", False),
-                          ("print -r before; while :; do :; done", False),
-                          ("print -r before; sleep 100", True)]:
-            got = {}
-            t = threading.Thread(target=lambda: got.update(r=b.send_cmd(cmd, fork=fork)))
-            t.start()
-            time.sleep(0.5)
-            pids = descendants(pid) + [pid]
-            print(f"[test] SIGINT {pids}", file=sys.stderr)
-            for x in pids:
-                os.kill(x, signal.SIGINT)
-            t.join(10)
-            assert not t.is_alive()
-            r = got["r"]
-            assert (r.retcode, r.out, r.err) == (130, "before\n", ""), (cmd, fork, r)
-            r = b.send_cmd("print -r -- $v")
-            assert (r.retcode, r.out) == (0, "kept\n"), repr(r)
-        os.kill(pid, signal.SIGINT)  # idle
-        time.sleep(0.2)
-        r = b.send_cmd("print -r -- $v")
-        assert (r.retcode, r.out) == (0, "kept\n"), repr(r)
-        assert b.p.workers[0].pid == pid
-        b.cleanup()
-        ''',
+        W = "zmodload zsh/zselect; zselect -t 100"
+        cases = [("print -r before; " + W + "; print -r after", False),
+                 ("f() { " + W + " }; print -r before; f; print -r after", False),
+                 ("print -r before; " + W + "; print -r after", True),
+                 ("print -r before; " + sys.executable + " -c 'import time; time.sleep(1)'; print -r after", False)]
+        def run(mod):
+            b = mod.Brish(server_count=1, binary=True)
+            pid = b.p.workers[0].pid
+            assert b.send_cmd("v=kept").retcode == 0
+            res = []
+            for cmd, fork in cases:
+                got = {}
+                t = threading.Thread(target=lambda: got.update(r=b.send_cmd(cmd, fork=fork)))
+                t.start()
+                time.sleep(0.4)
+                pids = descendants(pid) + [pid]
+                print(f"[test] SIGINT {pids}", file=sys.stderr)
+                for x in pids:
+                    os.kill(x, signal.SIGINT)
+                t.join(10)
+                assert not t.is_alive()
+                r = got["r"]
+                res.append((cmd, fork, r.retcode, r.out, r.err, b.send_cmd("print -r -- $v").out))
+            os.kill(pid, signal.SIGINT)  # idle
+            time.sleep(0.2)
+            res.append(("idle", b.send_cmd("print -r -- $v").out, b.p.workers[0].pid == pid))
+            b.cleanup()
+            return res
+        want = run(master_on(MASTER_FILE, "m"))
+        got = run(master_on(TREE_FILE, "t"))
+        print(want)
+        assert want == got, [(a, b) for a, b in zip(want, got) if a != b]
+        assert want[0][2:] == (0, "before\nafter\n", "", "kept\n"), want[0]
+        assert want[-1] == ("idle", "kept\n", True), want[-1]
+        """,
         setup=loaders(sources),
         timeout=60,
     )

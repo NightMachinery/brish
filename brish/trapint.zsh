@@ -1,6 +1,11 @@
 # The SIGINT trap of both Brish workers (brish2.zsh and brish3.zsh). See
 # docs/protocol.org, "Interrupts".
 #
+# Only a worker in a session of its own sources it, which Brish's Python
+# starts and marks with BRISH_SESSION=1. No terminal's signals reach such a
+# worker, so its SIGINT comes from BrishPopen.kill() (or from a command that
+# signals it). Under older Python, the worker ignores SIGINT as it always did.
+#
 # A worker sources this file once when it starts, and again only after a
 # command has replaced or removed the trap: every change of the INT trap
 # passes through the default disposition for a moment, and a SIGINT that

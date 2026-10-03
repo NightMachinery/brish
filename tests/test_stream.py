@@ -279,15 +279,20 @@ def test_kill_under_errexit_and_sh_emulation():
             r = b.send_cmd("print -r -- ok-$v " + opts)
             assert r.out == f"ok-kept {want_opts}\n", (cmd, r)
         b.send_cmd("emulate zsh")
-        #: A terminal-style Ctrl-C (the whole process group) during send_cmd.
-        signal.signal(signal.SIGINT, lambda *a: None)
+        #: A terminal-style Ctrl-C (the whole process group) during send_cmd
+        #: reaches Python alone: the command runs to its end.
+        seen = []
+        signal.signal(signal.SIGINT, lambda *a: seen.append(a[0]))
         got = {}
-        t = threading.Thread(target=lambda: got.update(r=b.send_cmd("set -e; print -r x; sleep 100; print -r after")))
+        t = threading.Thread(target=lambda: got.update(r=b.send_cmd(
+            "set -e; print -r x; zmodload zsh/zselect; zselect -t 150 || :; print -r after")))
         t.start()
         time.sleep(0.5)
         os.killpg(os.getpgrp(), signal.SIGINT)
         t.join(10)
-        assert (got["r"].retcode, got["r"].out) == (130, "x\n"), got
+        assert seen == [signal.SIGINT], seen
+        assert (got["r"].retcode, got["r"].out) == (0, "x\nafter\n"), got
+        b.send_cmd("set +e")
         same_server_ok(b, 0)
         b.cleanup()
         ''',

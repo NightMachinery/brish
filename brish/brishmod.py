@@ -458,6 +458,13 @@ class _ErrReader:
             pass
 
 
+def _worker_env():
+    """The environment of a bootstrap: ours, plus BRISH_SESSION=1, which
+    tells the worker scripts that they run in a session of their own (see
+    Brish._init_legacy). The scripts remove it before any command runs."""
+    return dict(os.environ, BRISH_SESSION="1")
+
+
 #: Protocol BRISH3 (binary mode). See docs/protocol.org.
 BRISH3_FDS_ARG = "BRISH3-FDS"
 _HELLO = b"\0BRISH3-HELLO:"
@@ -1983,17 +1990,22 @@ class Brish:
         for path in brish_stdin_paths + brish_stdout_paths + brish_stderr_paths:
             os.mkfifo(path)
 
+        #: A session of its own (setsid): no terminal signal (Ctrl-C, Ctrl-\,
+        #: Ctrl-Z, the SIGHUP of a closing terminal) and no signal to our
+        #: process group reaches the bootstrap, its workers or their
+        #: commands, which have no controlling terminal either. Interrupts
+        #: come from BrishPopen.kill() alone. The workers stop with us
+        #: through their pipes (see docs/protocol.org, Processes).
         p = Popen(
             shell,
             stdin=PIPE,
             stdout=PIPE,
             stderr=PIPE,
-            env=dict(
-                os.environ,
-            ),
+            env=_worker_env(),
             text=True,
             errors=decoding_errors,  # escape invalid utf-8 bytes
             encoding=encoding,
+            start_new_session=True,
         )
         p.tmpdir = tmpdir
         p.gen = self._gen
@@ -2082,13 +2094,15 @@ class Brish:
                 f"{child_fds[3 * i]},{child_fds[3 * i + 1]},{child_fds[3 * i + 2]}"
                 for i in range(server_count)
             ]
+            #: A session of its own, as in _init_legacy.
             p = Popen(
                 argv,
                 stdin=PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=None,  # startup errors stay visible
                 pass_fds=child_fds,
-                env=dict(os.environ),
+                env=_worker_env(),
+                start_new_session=True,
             )
         except BaseException:
             for w in workers:
@@ -2474,11 +2488,16 @@ class Brish:
         drained in a helper thread, and its worker is freed at the creating
         thread's next call to this instance.
 
-        `kill()` (alias `terminate()`) works from any thread, is idempotent,
-        and interrupts the command, not the worker. Step 1: SIGINT to the
-        worker and its descendants (the worker aborts the command as a
-        terminal Ctrl-C would, and its retcode is 130 unless the command
-        traps INT). Step 2: SIGTERM to the descendants and SIGINT to the
+        `kill()` (alias `terminate()`) is the only interrupt: workers and
+        their commands run in a session of their own, which no terminal
+        signal (Ctrl-C, Ctrl-Z, the SIGHUP of a closing terminal) and no
+        signal to the caller's process group reaches. A KeyboardInterrupt
+        interrupts Python alone; the command runs on, unless the exception
+        leaves a `with` block that holds the object. kill() works from any
+        thread, is idempotent, and interrupts the command, not the worker.
+        Step 1: SIGINT to the worker and its descendants (the worker aborts
+        the command as Ctrl-C does in an interactive shell, and its retcode
+        is 130 unless the command traps INT). Step 2: SIGTERM to the descendants and SIGINT to the
         worker. Step 3: SIGKILL to the descendants, or step 4 at once if
         there are none. Step 4: SIGKILL to the worker, which gives the
         retcode 9001 with WORKER_DIED_NOTE as the last chunk, and restarts

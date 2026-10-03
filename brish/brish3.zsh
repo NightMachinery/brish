@@ -10,6 +10,14 @@
 # global aliases) and every internal command is prefixed with `builtin`, so
 # user functions that shadow builtins cannot reach worker internals.
 builtin zmodload zsh/system || builtin exit 70
+#: New Python starts this bootstrap in a session of its own, which no
+#: terminal's signals reach, and says so with BRISH_SESSION=1. Its workers
+#: then get SIGINT from BrishPopen.kill() alone, and handle it (see
+#: brish3_run). Older Python does neither: its workers share its terminal's
+#: process group, and ignore SIGINT as they always did. Commands do not
+#: inherit the variable.
+typeset -g __brish_session=${BRISH_SESSION-}
+builtin unset BRISH_SESSION
 
 typeset -g BRISH3_NONCE= BRISH3_FORK=0 BRISH3_STDIN_MODE= BRISH3_INREQ= BRISH3_EOF=
 typeset -g BRISH3_CMD= BRISH3_RET=0 brish_stdin= cmd=
@@ -133,7 +141,8 @@ function brish3_recv {
 #: starts, and after a command replaced or removed it. Aliases and
 #: local_traps are off, so that the definition parses as written and outlasts
 #: this function. What tells this trap from a command's own is kept (see
-#: __brish_trapref).
+#: __brish_trapref). Only a worker in a session of its own (see
+#: __brish_session) defines a trap at all.
 #: @duplicateCode/9834d1f0406a4c3eb2f9b672e929d810 __brish2_deftrap in brish2.zsh
 function brish3_deftrap {
   builtin emulate -L zsh
@@ -146,8 +155,10 @@ function brish3_deftrap {
 #: must see the user's options. The nonce is kept only in $1 while user code
 #: runs; `always` restores it from there.
 #:
-#: SIGINT reaches the worker's TRAPINT at any time (see trapint.zsh). Idle or
-#: framing, it returns at once. While a command runs (from setting
+#: SIGINT, which only BrishPopen.kill() sends (the worker is in a session of
+#: its own), reaches the worker's TRAPINT at any time (see trapint.zsh).
+#: Under older Python there is no trap, and the worker ignores SIGINT
+#: throughout. Idle or framing, the trap returns at once. While a command runs (from setting
 #: __brish_trap to `always`), it makes SIGINT act like an interactive Ctrl-C.
 #: A fork command's subshell exits with 128+signal; the worker itself goes on
 #: waiting for it. A non-fork command is unwound: `always` stops the unwinding
@@ -262,15 +273,22 @@ for (( brish_server_index = 1; brish_server_index <= $#__brish3_specs; brish_ser
   (
     builtin trap 'brish3_on_exit $?' EXIT
     __brish_level=$ZSH_SUBSHELL
-    brish3_deftrap  # the worker's TRAPINT, for good; see brish3_run
+    if [[ -n $__brish_session ]]; then
+      brish3_deftrap  # the worker's TRAPINT, for good; see brish3_run
+    else
+      #: Older Python: SIGINT stays ignored (a background job ignores it),
+      #: and the worker never sets an INT trap: `always` finds nothing to
+      #: put back.
+      __brish_trapref=__brish_trapid
+    fi
     brish3_setup $brish_server_index
     brish3_serve
   ) &
   __brish3_pids+=( $! )
 done
 brish3_close_specs 0
-#: A terminal Ctrl-C reaches the whole process group. The bootstrap ignores
-#: it, and each worker aborts only its current command (see brish3_run).
+#: A SIGINT to the whole process group must not kill the bootstrap: one that
+#: a command sends (`kill -INT 0`), or under older Python a terminal Ctrl-C.
 builtin trap '' INT
 
 function brish3_bootstrap_wait {

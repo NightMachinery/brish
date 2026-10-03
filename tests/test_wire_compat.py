@@ -280,59 +280,92 @@ def test_a_dying_worker_leaves_the_others_alone(sources, python, real_env):
     )
 
 
-@pytest.mark.parametrize("python", ["original", "master", "tree"])
-def test_sigint_aborts_only_the_command(sources, python):
-    #: The intended difference: SIGINT to a worker (a terminal Ctrl-C, or
-    #: BrishPopen.kill) aborts the running command, which reports 130 as a
-    #: plain retcode line, and the worker lives on with its state. While idle
-    #: the worker ignores it. Workers, the original one included, used to
-    #: ignore SIGINT throughout (they start as background jobs of a
-    #: non-interactive zsh): a non-fork command ran on to its end, and only a
-    #: fork command's subshell died of it.
+#: Commands that a SIGINT meets, as (cmd, stdin, fork). They wait with
+#: zselect, a builtin, so that nothing else's signals can reach them.
+SIGINT_CASES = r"""
+W = "zmodload zsh/zselect; zselect -t 100"
+SIGINT_CASES = [
+    ("print -r before; " + W + "; print -r after", "", False),
+    ("f() { " + W + " }; print -r before; f; print -r after", "", False),
+    ("print -r before; " + W + "; print -r after", "", True),
+    ("print -r before; cat >/dev/null; " + W + "; print -r after", "in", False),
+    ("print -r before; " + sys.executable + " -c 'import time; time.sleep(1)'; print -r after", "", False),
+]
+def sigint_cases(mod, kw):
+    from tests.conftest import descendants
+    b = mod.Brish(server_count=2, **kw)
+    c = b.send_cmd
+    pid_cmd = "zmodload zsh/system; print -r -- $sysparams[pid]"
+    r = c("v=kept; " + pid_cmd, server_index=0)
+    pid = int(r.out)
+    assert pid > 1 and pid != b.p.pid, repr(r)
+    res = []
+    for cmd, stdin, fork in SIGINT_CASES:
+        got = {}
+        t = threading.Thread(target=lambda: got.update(r=c(cmd, cmd_stdin=stdin, fork=fork, server_index=0)))
+        t.start()
+        time.sleep(0.4)
+        pids = descendants(pid) + [pid]
+        print(f"[test] SIGINT {pids}", file=sys.stderr)
+        for x in pids:
+            os.kill(x, signal.SIGINT)
+        t.join(10)
+        assert not t.is_alive(), cmd
+        r = got["r"]
+        res.append((cmd, fork, r.retcode, r.out, r.err, c("print -r -- $v", server_index=0).out))
+    os.kill(pid, signal.SIGINT)  # idle
+    time.sleep(0.2)
+    res.append(("idle", [c("print -r -- ${v-unset}", server_index=i).out for i in (0, 1)],
+                int(c(pid_cmd, server_index=0).out) == pid))
+    b.cleanup()
+    return res
+"""
+
+
+@pytest.mark.parametrize("python", ["original", "master"])
+def test_sigint_under_old_python(sources, python):
+    #: Old Python starts the bootstrap in its own process group (a terminal
+    #: Ctrl-C reaches the workers) and does not set BRISH_SESSION, so this
+    #: worker defines no SIGINT trap and ignores SIGINT throughout, as the
+    #: original worker did (workers start as background jobs of a
+    #: non-interactive zsh): a SIGINT to the worker and every process below
+    #: it changes nothing that the original worker would not.
     check(
         r"""
-        from tests.conftest import descendants
-        mod = {"original": lambda: original_on(TREE_FILE, "t"),
-               "master": lambda: master_on(TREE_FILE, "t"),
-               "tree": lambda: bm}[PY]()
-        kw = {"binary": False} if PY == "master" else {}
-        b = mod.Brish(server_count=2, **kw)
-        c = b.send_cmd
-        r = c("v=kept; zmodload zsh/system; print -r -- $sysparams[pid]", server_index=0)
-        pid = int(r.out)
-        assert pid > 1 and pid != b.p.pid, repr(r)
-        for cmd, stdin, fork in [
-            ("print -r before; sleep 100", "", False),
-            ("print -r before; while :; do :; done", "", False),
-            ("f() { while :; do :; done }; print -r before; f", "", False),
-            ("print -r before; sleep 100", "", True),
-            ("print -r before; cat >/dev/null; sleep 100", "in", False),
-            ("print -r before; while :; do :; done", "in", True),
-        ]:
-            got = {}
-            t = threading.Thread(target=lambda: got.update(r=c(cmd, cmd_stdin=stdin, fork=fork, server_index=0)))
-            t.start()
-            time.sleep(0.5)
-            pids = descendants(pid) + [pid]
-            print(f"[test] SIGINT {pids}", file=sys.stderr)
-            for x in pids:
-                os.kill(x, signal.SIGINT)
-            t.join(10)
-            assert not t.is_alive(), (PY, cmd)
-            r = got["r"]
-            assert (r.retcode, r.out, r.err) == (130, "before\n", ""), (PY, cmd, fork, repr(r))
-            r = c("print -r -- $v", server_index=0)
-            assert (r.retcode, r.out, r.err) == (0, "kept\n", ""), (PY, cmd, repr(r))
-        os.kill(pid, signal.SIGINT)  # idle
-        time.sleep(0.2)
-        for i in (0, 1):
-            r = c("print -r -- ${v-unset}", server_index=i)
-            assert (r.retcode, r.out) == (0, ("kept\n", "unset\n")[i]), (PY, repr(r))
-        r = c("zmodload zsh/system; print -r -- $sysparams[pid]", server_index=0)
-        assert int(r.out) == pid, (PY, repr(r))
-        b.cleanup()
+        r = parallel(want=lambda: sigint_cases(original_on(ORIG_FILE, "o"), {}),
+                     got=lambda: sigint_cases(
+                         {"original": lambda: original_on(TREE_FILE, "t"),
+                          "master": lambda: master_on(TREE_FILE, "t")}[PY](),
+                         {"binary": False} if PY == "master" else {}))
+        want, got = r["want"], r["got"]
+        print(want)
+        assert want == got, (PY, [(a, b) for a, b in zip(want, got) if a != b])
+        #: The non-fork commands ran on to their end.
+        assert want[0][2:] == (0, "before\nafter\n", "", "kept\n"), want[0]
+        assert want[-1] == ("idle", ["kept\n", "unset\n"], True), want[-1]
         """,
-        setup=LOADERS.format(sources=str(sources)) + f"PY = {python!r}\n",
+        setup=LOADERS.format(sources=str(sources)) + SIGINT_CASES + f"PY = {python!r}\n",
+        env={"BRISH_BINARY": None},
+        timeout=90,
+    )
+
+
+def test_sigint_aborts_only_the_command(sources):
+    #: This tree's Python: SIGINT to a worker (which only BrishPopen.kill
+    #: sends, since the worker is in a session of its own) aborts the
+    #: running command, which reports 130 as a plain retcode line, and the
+    #: worker lives on with its state. While idle the worker ignores it.
+    check(
+        r"""
+        res = sigint_cases(bm, {})
+        for cmd, fork, rc, out, err, v in res[:-1]:
+            if sys.executable in cmd:  # Python reports its KeyboardInterrupt
+                assert err.endswith("KeyboardInterrupt\n"), err
+                err = ""
+            assert (rc, out, err, v) == (130, "before\n", "", "kept\n"), (cmd, fork, rc, out, err, v)
+        assert res[-1] == ("idle", ["kept\n", "unset\n"], True), res[-1]
+        """,
+        setup=LOADERS.format(sources=str(sources)) + SIGINT_CASES,
         env={"BRISH_BINARY": None},
         timeout=90,
     )
