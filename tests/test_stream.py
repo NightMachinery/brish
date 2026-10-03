@@ -1106,10 +1106,13 @@ def test_kill_goes_by_the_command_not_the_reader():
         #: Ignores INT and TERM and floods, on stdout alone and on both
         #: streams in turn: still stopped, with a slow reader. (Before, the
         #: legacy reader queue counted as full at four tiny chunks, so with
-        #: both streams kill() never got past step 1.)
+        #: both streams kill() never got past step 1.) The pause between
+        #: the two streams' lines keeps each read to a tiny chunk, which
+        #: that bug needed.
         note = bm.WORKER_DIED_NOTE.encode() + b"\n"
         for cmd in ("trap '' INT TERM; while :; do print -r -- 0123456789abcdef; done",
-                    "trap '' INT TERM; while :; do print -r o; print -ru2 e; done"):
+                    "trap '' INT TERM; zmodload zsh/zselect; "
+                    "while :; do print -r o; print -ru2 e; zselect -t 1 || :; done"):
             t0 = time.monotonic()
             with b.popen(cmd) as p:
                 p.kill_grace = 0.5
@@ -1220,12 +1223,12 @@ def test_a_popen_collected_in_another_thread():
 
 def test_kill_waits_for_a_long_report_under_a_slow_reader():
     #: A program that handles SIGINT by writing a 200 KB report and exiting,
-    #: read at one chunk a second (a chat bot's pace), with the default
-    #: grace: Brish reads up to
-    #: 256 KiB ahead once the signal is out, sees the end, and takes no
-    #: further step. (Before, legacy mode read only about 76 KiB ahead, took
-    #: step 2, and its SIGTERM cut the report and killed an unrelated
-    #: background job of the worker.)
+    #: read at one chunk every three seconds (a slow chat bot's pace), with
+    #: the default grace: Brish reads up to 256 KiB ahead once the signal is
+    #: out, sees the end, and takes no further step. (Before, legacy mode
+    #: read only about 76 KiB ahead, took step 2, and its SIGTERM cut the
+    #: report and killed an unrelated background job of the worker. At one
+    #: chunk a second the old code passed too.)
     run(
         r"""
         prog = os.path.join(SCRATCH, "report.py")
@@ -1251,7 +1254,7 @@ def test_kill_waits_for_a_long_report_under_a_slow_reader():
                         if b"started" in out:
                             p.kill()
                     else:
-                        time.sleep(1)
+                        time.sleep(3)
             assert (p.retcode, p._stage) == (130, 1), (p.retcode, p._stage, len(out))
             assert out.endswith(b"r\nreport done\n") and len(out) == 200021, len(out)
             assert bm._alive(bg), "step 2 stopped the background job"

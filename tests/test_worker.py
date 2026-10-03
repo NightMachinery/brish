@@ -245,6 +245,12 @@ def test_g8_sigint_flood_between_commands():
     #: The flooder is a separate process (in this one it would compete for
     #: the GIL): workers that changed the trap around every command died
     #: within a second of it, in both modes.
+    #: A flood also hits, in a few percent of runs, the documented stdio
+    #: hang (docs/protocol.org, Interrupts: the signal lands while `print`
+    #: holds the C library's lock of stdout, and the trap's own flush waits
+    #: for it forever). kill() would end such a command at step 4; here a
+    #: watchdog SIGKILLs the worker, and the test accepts that outcome. The
+    #: same interplay can write the interrupted line twice before the 130.
     wcheck(
         r'''
         import subprocess
@@ -252,6 +258,14 @@ def test_g8_sigint_flood_between_commands():
         pid = worker_pid(b)
         b.send_cmd("v=kept")
         gen = b._gen
+        hung, progress, done = [], [time.monotonic()], threading.Event()
+        def watchdog():
+            while not done.wait(0.5):
+                if time.monotonic() - progress[0] > 10:
+                    hung.append(True)
+                    flooder.kill()
+                    os.kill(pid, signal.SIGKILL)
+                    return
         flooder = subprocess.Popen([sys.executable, "-c", """if 1:
             import os, signal, sys, time
             pid, n, t0 = int(sys.argv[1]), 0, time.monotonic()
@@ -264,23 +278,35 @@ def test_g8_sigint_flood_between_commands():
                 time.sleep(0.0005)
             print(n)
             """, str(pid)], stdout=subprocess.PIPE, text=True)
+        threading.Thread(target=watchdog, daemon=True).start()
         i = n130 = 0
         try:
             while flooder.poll() is None:
                 i += 1
                 r = b.send_cmd(f"print -r -- tok{i}")
+                progress[0] = time.monotonic()
+                if hung:
+                    assert r.retcode == 9001, (i, r)
+                    break
                 want = f"tok{i}\n"
-                if r.retcode == 130 and want.startswith(r.out):
+                if r.retcode == 130 and (want + want).startswith(r.out):
                     n130 += 1
                     continue
                 assert (r.retcode, r.out, r.err, b._gen) == (0, want, "", gen), (i, r, b._gen)
         finally:
+            done.set()
             if flooder.poll() is None:
                 flooder.kill()
             sent = flooder.communicate()[0].strip()
-        assert int(sent) > 100, sent
-        r = b.send_cmd("print -r -- $v")
-        assert (r.retcode, r.out, b._gen) == (0, "kept\n", gen), (r, i, n130, sent)
+        if hung:
+            #: The documented hang: the worker is gone, the instance
+            #: restarts and works.
+            assert_ok(b)
+            print("the flood hung the worker after", i, "commands")
+        else:
+            assert int(sent) > 100, sent
+            r = b.send_cmd("print -r -- $v")
+            assert (r.retcode, r.out, b._gen) == (0, "kept\n", gen), (r, i, n130, sent)
         b.cleanup()
         ''',
         timeout=90,
