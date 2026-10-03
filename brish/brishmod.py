@@ -999,6 +999,19 @@ _LEGACY_PID_RE = re.compile(rb"brish-pid:(\d+):")
 _KILL_SETTLE = 0.05
 
 
+_RLOCK_STATE = re.compile(r"owner=(\d+) count=(\d+)")
+
+
+def _rlock_levels(lock, ident):
+    """How many levels of the RLock `lock` the thread `ident` holds, or None
+    if unknown. CPython's RLock shows its owner and count only in its repr;
+    without them, a caller must assume the worst."""
+    m = _RLOCK_STATE.search(repr(lock))
+    if m is None:
+        return None
+    return int(m.group(2)) if int(m.group(1)) == ident else 0
+
+
 class BrishPopen:
     """A command whose output streams while it runs. Made by `Brish.popen`,
     which documents the API.
@@ -1023,9 +1036,6 @@ class BrishPopen:
         self._brish = brish
         self._owner = threading.get_ident()
         self._owner_thread = threading.current_thread()
-        #: The owner already held the worker's lock (acquire_lock) when this
-        #: took it (see _orphan_holds).
-        self._reentered = False
         self._mu = Lock()  # guards _finished, _stage and signal sending
         self._finished = False
         self._released = True  # until a worker lock is taken
@@ -1078,13 +1088,12 @@ class BrishPopen:
                 return
             start = self._start_legacy
         for attempt in range(2):
-            #: A lock this thread holds belongs to the current generation,
-            #: which cannot change while it is held.
-            owned = [lk for lk in b.locks if lk._is_owned()]
             lock, index, p = b._acquire(server_index, lock_sleep)
             try:
+                #: No call before _released is cleared: an interrupt there
+                #: (a KeyboardInterrupt comes at calls and loops) would reach
+                #: the except clause with the lock taken but not recorded.
                 self._lock, self.server_index, self._p = lock, index, p
-                self._reentered = any(lk is lock for lk in owned)
                 self._released = False
                 p.free_server_count -= 1
                 p.popen_owner[index] = self._owner
@@ -1902,14 +1911,16 @@ class BrishPopen:
             self._abandon()
 
     def _orphan_holds(self, p):
-        """The worker of generation `p` that this orphan holds, once its
-        reply has been read to its end, and only when the owner did not hold
-        that lock already (then it holds it for its own reasons); else
-        None."""
+        """The worker of generation `p` that this orphan holds idle, once
+        its reply has been read to its end, if nothing else holds it: the
+        owner thread has ended, or the level of the worker's lock that this
+        orphan took is the only one left (else the owner holds that lock for
+        its own reasons too, with acquire_lock, say). Else None."""
         drained = getattr(self, "_drained", None)
         if (drained is None or not drained.is_set() or not self._finished
-                or self._released or self._reentered
-                or getattr(self, "_p", None) is not p):
+                or self._released or getattr(self, "_p", None) is not p):
+            return None
+        if self._owner_thread.is_alive() and _rlock_levels(self._lock, self._owner) != 1:
             return None
         return self.server_index
 
@@ -2032,6 +2043,7 @@ class Brish:
         #: BrishPopen objects collected unclosed outside their own thread,
         #: which still hold that thread's worker lock (see _reap_orphans).
         self._orphans = collections.deque()
+        self._orphans_mu = Lock()  # one _reap_orphans at a time
         #: Bumped by every init(); a restart requested for an older
         #: generation is already done.
         self._gen = 0
@@ -2334,35 +2346,51 @@ class Brish:
             if gen == self._gen or self.p is None:
                 self.restart()
 
+    def _orphan_list(self):
+        """A snapshot of self._orphans. BrishPopen._orphan appends to it
+        without a lock (it runs in __del__, possibly inside this very
+        thread's own critical section)."""
+        while True:
+            try:
+                return list(self._orphans)
+            except RuntimeError:  # appended to while it was copied
+                continue
+
     def _reap_orphans(self):
         """Free the workers of this thread's BrishPopen objects that were
         collected unclosed in another thread: they still hold this thread's
         worker locks, which no other thread can release (see
         BrishPopen._orphan). Called at the start of every call that takes a
-        worker; it waits for an orphan's helper thread to finish."""
-        orphans = self._orphans
-        if not orphans:
+        worker; it waits for an orphan's helper thread to finish.
+
+        It also looks after the drained orphans of owner threads that have
+        ended, whose locks nobody will ever release: while their generation
+        is current, it has the instance restart before its next use (a
+        restart does not wait for such a lock, see cleanup()), and once it
+        is gone, it forgets them."""
+        if not self._orphans:
             return
         me = threading.get_ident()
-        for _ in range(len(orphans)):
-            try:
-                popen = orphans.popleft()
-            except IndexError:
-                return
-            if popen._owner == me:
-                popen._reap()
-            else:
-                orphans.append(popen)
+        mine = []
+        with self._orphans_mu:
+            for popen in self._orphan_list():
+                if popen._owner == me:
+                    mine.append(popen)
+                elif (popen._drained.is_set() and not popen._owner_thread.is_alive()
+                        and not popen._released):
+                    if popen._p.gen == self._gen and self.p is popen._p:
+                        self._request_restart(popen._p.gen)
+                        continue
+                else:
+                    continue
+                self._orphans.remove(popen)
+        for popen in mine:
+            popen._reap()
 
     def _orphan_held(self, p):
         """The workers of generation `p` that drained orphans hold (see
         BrishPopen._orphan_holds): a restart need not wait for them."""
-        while True:
-            try:
-                orphans = list(self._orphans)
-                break
-            except RuntimeError:  # mutated by another thread meanwhile
-                continue
+        orphans = self._orphan_list()
         held = set()
         for popen in orphans:
             i = popen._orphan_holds(p)
@@ -2605,18 +2633,21 @@ class Brish:
         that iteration or wait() consumed are also kept, and `result` gives
         the CmdResult that send_cmd would have returned.
 
-        The worker's lock is held from the call until the reply has been
-        read, so the object is read, waited for and closed in the thread that
-        made it (from another thread, these raise RuntimeError and change
-        nothing); a thread that holds the lock (acquire_lock) can pass its
+        The worker's lock is held from the call until the reply has been read,
+        so the object is read, waited for and closed in the thread that made
+        it (from another thread, these raise RuntimeError and change nothing);
+        a thread that holds the lock (acquire_lock) can pass its
         `server_index`. Calls from the same thread meanwhile skip that busy
-        worker, and never wait: they raise BrishWorkerBusyException when
-        they name it or no other worker is free at once. Use it as a context
+        worker, and never wait: they raise BrishWorkerBusyException when they
+        name it or no other worker is free at once. Use it as a context
         manager: leaving the block early, by break or by an exception, kills
         the command, drains its output and frees the worker. An unclosed
         object collected in another thread is killed with every step and
         drained in a helper thread, and its worker is freed at the creating
-        thread's next call to this instance.
+        thread's next call to this instance; a restart does not wait for it
+        once it is drained, unless that thread holds the worker's lock for its
+        own reasons too, and if that thread has ended, the instance restarts
+        before its next use.
 
         `kill()` (alias `terminate()`) is the only interrupt: workers and
         their commands run in a session of their own, which no terminal

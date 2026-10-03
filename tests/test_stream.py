@@ -1435,6 +1435,268 @@ def test_an_orphan_is_killed_with_every_step_and_holds_up_no_restart():
     )
 
 
+ORPHAN_HELPERS = r'''
+import gc, weakref
+SNOOZE = "zmodload zsh/zselect; print -r a; zselect -t 10000"
+def drained(ref, timeout=60):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        p = ref()
+        if p is None or p._drained.wait(0.05):
+            return True
+    return False
+def within(fn, secs):
+    """fn() in a thread: ("ok", value) or ("STILL WAITING",)."""
+    out = []
+    def go():
+        try:
+            out.append(("ok", fn()))
+        except BaseException as e:
+            out.append(("exc", repr(e)))
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(secs)
+    return out[0] if out else ("STILL WAITING",)
+'''
+
+
+def test_an_orphan_made_under_acquire_lock_holds_up_no_restart():
+    #: The readme's pattern: acquire_lock, then popen on that worker. The
+    #: object is collected in another thread (an orphan). Once the owner has
+    #: released its own acquire_lock level, the orphan's level is the only
+    #: one left, so a restart from another thread does not wait for it
+    #: (before, it waited until the owner's next call).
+    run(
+        r'''
+        import concurrent.futures as cf
+        b = Brish(server_count=2)
+        pool = cf.ThreadPoolExecutor(max_workers=1)
+        box = {}
+        def make():
+            lock, si = b.acquire_lock(server_index=0)
+            try:
+                p = b.popen(SNOOZE, server_index=si)
+                p.kill_grace = 0.3
+                next(p)
+                box["p"] = p
+                #: While the owner holds its own level too, the orphan's
+                #: worker is not skippable.
+            finally:
+                lock.release()
+        pool.submit(make).result()
+        ref = weakref.ref(box.pop("p"))
+        gc.collect()
+        assert drained(ref)
+        gen = b._gen
+        got = within(b.restart, 20)
+        assert got == ("ok", True), got
+        assert b._gen != gen
+        r = b.send_cmd("print -r ok", server_index=0)
+        assert r.out == "ok\n", repr(r)
+        r = pool.submit(lambda: b.send_cmd("print -r owner", server_index=0)).result(timeout=60)
+        assert r.out == "owner\n", repr(r)
+        assert not b._orphans
+        assert not pool.submit(b._holds_worker_lock).result()
+        pool.shutdown()
+        b.cleanup()
+        ''',
+        setup=ORPHAN_HELPERS,
+        timeout=120,
+    )
+
+
+def test_an_orphan_skipped_only_when_its_level_is_the_last():
+    #: While the owner holds the orphan's worker lock for its own reasons
+    #: too, the worker is not skipped: it may be in use.
+    run(
+        r'''
+        b = Brish(server_count=1)
+        lock, si = b.acquire_lock(server_index=0)
+        p = b.popen(SNOOZE, server_index=si)
+        p.kill_grace = 0.3
+        next(p)
+        #: Orphan it by hand, as a collection in another thread would.
+        threading.Thread(target=p._orphan).start()
+        assert drained(weakref.ref(p))
+        assert b._orphan_held(b.p) == set(), b._orphan_held(b.p)
+        lock.release()
+        assert b._orphan_held(b.p) == {0}, b._orphan_held(b.p)
+        #: The owner's next call frees it.
+        r = b.send_cmd("print -r ok")
+        assert r.out == "ok\n", repr(r)
+        assert p._released and not b._orphans and not b._holds_worker_lock()
+        del p
+        b.cleanup()
+        ''',
+        setup=ORPHAN_HELPERS,
+        timeout=60,
+    )
+
+
+def test_an_orphan_whose_owner_ends_after_the_drain():
+    #: The owner thread is alive when the helper thread has drained its
+    #: orphan, and ends later without calling the instance again. The next
+    #: call of any thread restarts the instance (before, every call waited
+    #: for that worker for good), and the orphan is then forgotten.
+    run(
+        r'''
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        go, box = threading.Event(), {}
+        def owner():
+            p = b.popen(SNOOZE)
+            p.kill_grace = 0.3
+            next(p)
+            box["p"] = p
+            del p
+            go.wait()
+        t = threading.Thread(target=owner)
+        t.start()
+        while "p" not in box:
+            time.sleep(0.01)
+        ref = weakref.ref(box.pop("p"))
+        gc.collect()
+        assert drained(ref)
+        assert t.is_alive()
+        go.set()
+        t.join()
+        #: An idle thread takes the dead owner's ident if it can, so that no
+        #: caller inherits its lock by ident reuse.
+        idle = threading.Event()
+        threading.Thread(target=idle.wait, daemon=True).start()
+        got = within(lambda: b.send_cmd("print -r -- ${v-unset}").out, 30)
+        assert got == ("ok", "unset\n"), got
+        r = b.send_cmd("print -r ok")
+        assert r.out == "ok\n", repr(r)
+        assert not b._orphans, list(b._orphans)
+        idle.set()
+        b.cleanup()
+        ''',
+        setup=ORPHAN_HELPERS,
+        timeout=120,
+    )
+
+
+def test_two_owners_reap_their_orphans_at_once():
+    #: Two owner threads, each with a drained orphan, call the instance at
+    #: the same moment. Each frees its own orphan's worker (before, one
+    #: could miss its orphan while the other held it, and its call raised
+    #: BrishWorkerBusyException). A tiny switch interval makes it likely.
+    run(
+        r'''
+        import queue
+        b = Brish(server_count=2)
+        class Owner:
+            def __init__(self, i):
+                self.i, self.q, self.r = i, queue.Queue(), queue.Queue()
+                threading.Thread(target=self.run, daemon=True).start()
+            def run(self):
+                while True:
+                    fn = self.q.get()
+                    try:
+                        v = fn()
+                    except BaseException as e:
+                        v = e
+                    self.r.put(v)
+                    v = fn = None
+            def do(self, fn):
+                self.q.put(fn)
+                return self.r.get(timeout=60)
+        owners = [Owner(0), Owner(1)]
+        bad = []
+        sys.setswitchinterval(1e-6)
+        try:
+            for n in range(40):
+                ps = [o.do(lambda i=o.i: b.popen(SNOOZE, server_index=i)) for o in owners]
+                for p in ps:
+                    p.kill_grace = 0.3
+                refs = [weakref.ref(p) for p in ps]
+                del p
+                ps.clear()
+                gc.collect()
+                for r in refs:
+                    assert drained(r)
+                bar = threading.Barrier(2)
+                def call(i):
+                    bar.wait()
+                    return b.send_cmd("true", server_index=i).retcode
+                for o in owners:
+                    o.q.put(lambda i=o.i: call(i))
+                res = [o.r.get(timeout=60) for o in owners]
+                if res != [0, 0]:
+                    bad.append((n, [repr(x)[:100] for x in res]))
+                    for o in owners:
+                        o.do(lambda i=o.i: b.send_cmd("true", server_index=i))
+        finally:
+            sys.setswitchinterval(0.005)
+        assert not bad, bad[:3]
+        assert not b._orphans
+        b.cleanup()
+        ''',
+        setup=ORPHAN_HELPERS,
+        timeout=300,
+    )
+
+
+def test_keyboard_interrupt_in_popen_start_never_keeps_the_lock():
+    #: A KeyboardInterrupt comes at an eval-breaker check: after a call
+    #: returns, or at a backward jump. Inside _start's try block, until
+    #: _released is cleared, the except clause cannot tell that the worker
+    #: lock was taken, so an interrupt there kept it for good (a call
+    #: between taking the lock and recording it). A SIGALRM every 50 us
+    #: raises one whenever it is handled in that stretch, with the
+    #: acquire_lock pattern holding the worker; it must find no place to
+    #: land, or the lock must not leak.
+    run(
+        r'''
+        import inspect, re
+        src, first = inspect.getsourcelines(bm.BrishPopen._start)
+        lo = first + next(i for i, l in enumerate(src) if "b._acquire(server_index" in l)
+        hi = first + next(i for i, l in enumerate(src) if "self._released = False" in l)
+        filename = bm.BrishPopen._start.__code__.co_filename
+        hits = []
+        def handler(sig, frame):
+            ln = frame.f_lineno if frame is not None else None
+            if (ln is not None and lo < ln <= hi and frame.f_code.co_filename == filename
+                    and frame.f_code.co_name in ("_start", "<genexpr>")):
+                hits.append(ln)
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                raise KeyboardInterrupt
+        signal.signal(signal.SIGALRM, handler)
+        b = Brish(server_count=2)
+        me = threading.get_ident()
+        def levels(lock):
+            m = re.search(r"owner=(\d+) count=(\d+)", repr(lock))
+            return int(m.group(2)) if int(m.group(1)) == me else 0
+        leaks = []
+        t0 = time.monotonic()
+        signal.setitimer(signal.ITIMER_REAL, 0.00005, 0.00005)
+        try:
+            while time.monotonic() - t0 < 5 and not hits:
+                lock, si = b.acquire_lock(server_index=0)
+                try:
+                    try:
+                        with b.popen("true", server_index=si) as p:
+                            for _ in p:
+                                pass
+                    except KeyboardInterrupt:
+                        if levels(b.locks[0]) != 1:
+                            leaks.append((hits[-1], levels(b.locks[0])))
+                finally:
+                    lock.release()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        assert not leaks, (leaks, hits)
+        assert not b._holds_worker_lock()
+        got = within(lambda: b.send_cmd("print -r ok", server_index=0).out, 30)
+        assert got == ("ok", "ok\n"), got
+        b.cleanup()
+        ''',
+        setup=ORPHAN_HELPERS,
+        timeout=120,
+    )
+
+
 def test_result_from_another_thread_is_whole():
     #: Another thread that reads p.result as soon as retcode is set gets the
     #: whole output, and so does the owner afterwards (before, a read between
