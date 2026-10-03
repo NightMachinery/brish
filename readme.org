@@ -917,7 +917,7 @@ finally:
     lock.release()
 #+end_example
 
-Use =with=, or call =close()= in the creating thread: a =BrishPopen= that is dropped unclosed and collected in another thread has its command killed, but only the creating thread can free the worker. It does so at its next call to the instance (=send_cmd=, =popen=, =acquire_lock= or =restart=, and what is built on them); until then the worker stays taken, and if that thread has ended, it may stay taken for good.
+Use =with=, or call =close()= in the owner thread. A =BrishPopen= that is dropped unclosed is closed when it is collected. In the owner thread that happens at once: the command gets one SIGINT, and the worker is freed; legacy mode then restarts the instance before its next use, unless Brish had already read the whole reply. In binary mode a command that survives the SIGINT runs on, and the next command on that worker waits for it to end. One that is collected in another thread gets one SIGINT, but only the owner can free the worker. The owner does so at its next call to the instance (=send_cmd=, =popen=, =acquire_lock= or =restart=, and what is built on them); until then the worker stays taken, and if that thread has ended, it may stay taken for good.
 
 A restart waits for every =BrishPopen= in flight, since each holds its worker's lock until its output has been read to the end. So once a restart is due (=restart()= from a thread that holds no worker lock, or the one after a worker died), an endless stream such as =tail -f= holds up the restart, and every call from a thread that holds no worker lock, until the stream ends or is killed. =cleanup()= waits for it too.
 

@@ -984,12 +984,19 @@ def test_a_popen_collected_in_another_thread():
             return ok
         assert not lock_free()
         assert pool.submit(b._holds_worker_lock).result()
+        if not BINARY:
+            #: Once the reader threads have the whole reply (the kill ended
+            #: the command), freeing the worker needs no restart.
+            orphan = b._orphans[0]
+            deadline = time.monotonic() + 30
+            while not orphan._legacy_reply_read():
+                assert time.monotonic() < deadline, "the reply never came"
+                time.sleep(0.05)
         t0 = time.monotonic()
         r = pool.submit(lambda: b.send_cmd("print -r -- ok-${v-unset}")).result(timeout=30)
         assert time.monotonic() - t0 < 10, time.monotonic() - t0
-        #: Legacy mode restarts after an abandoned reply; binary mode skips it.
-        want = "ok-kept\n" if BINARY else "ok-unset\n"
-        assert (r.retcode, r.out) == (0, want), repr(r)
+        #: Binary mode skips the abandoned reply; legacy mode has read it.
+        assert (r.retcode, r.out) == (0, "ok-kept\n"), repr(r)
         assert lock_free()
         assert not pool.submit(b._holds_worker_lock).result()
         if BINARY:
@@ -1099,6 +1106,56 @@ def test_binary_a_cut_request_frame_takes_the_worker_out():
             assert b._gen != gen, op
         b.cleanup()
         """
+    )
+
+
+def test_a_popen_dropped_in_its_thread_frees_the_worker_at_once():
+    #: With the cyclic garbage collector off, dropping a half-read BrishPopen
+    #: frees its worker at once (before, a bound method kept on the object
+    #: made a reference cycle, so the lock stayed taken until some later
+    #: collection, often in another thread). Legacy mode keeps the worker's
+    #: state when the reply was already read to its end (before, it
+    #: restarted the instance).
+    run(
+        r"""
+        import gc
+        import faulthandler; faulthandler.dump_traceback_later(110, exit=True)
+        gc.disable()
+        b = Brish(server_count=1)
+        b.send_cmd("v=kept")
+        def lock_free():
+            got = []
+            def other():
+                ok = b.locks[0].acquire(timeout=0.5)
+                if ok:
+                    b.locks[0].release()
+                got.append(ok)
+            t = threading.Thread(target=other)
+            t.start()
+            t.join()
+            return got == [True]
+        #: Half-read, the command still running.
+        p = b.popen("print -r a; sleep 100")
+        assert next(p)[0] == "out"
+        pid = p._worker_pid
+        del p
+        assert lock_free() and not b._holds_worker_lock()
+        assert gone(pid), bm._descendants(pid)  # the sleep was killed
+        r = b.send_cmd("print -r -- ok-${v-unset}")
+        want = "ok-kept\n" if BINARY else "ok-unset\n"  # legacy: an abandoned reply
+        assert (r.retcode, r.out) == (0, want), repr(r)
+        b.send_cmd("v=kept")
+        #: Half-read, the command already ended and its reply read by Brish
+        #: (legacy: by the reader threads).
+        p = b.popen("print -r a; print -r b")
+        assert next(p)[0] == "out"
+        time.sleep(0.5)
+        del p
+        assert lock_free() and not b._holds_worker_lock()
+        same_server_ok(b, 0)
+        b.cleanup()
+        """,
+        timeout=120,
     )
 
 

@@ -1028,7 +1028,6 @@ class BrishPopen:
         self._so = _StreamParser(start, end, collect=False)
         self._se = _StreamParser(start, end, collect=False)
         self._streams = {w.out: ("out", self._so), w.err: ("err", self._se)}
-        self._pump = self._pump_binary
         self._died = False
         try:
             try:
@@ -1086,7 +1085,6 @@ class BrishPopen:
         except BaseException:
             b._legacy_abandon(p, index)
             raise
-        self._pump = self._pump_legacy
         return None
 
     def _learn_legacy_pid(self, p, index):
@@ -1366,15 +1364,33 @@ class BrishPopen:
         if restart:
             self._brish._request_restart(p.gen)
 
+    def _legacy_reply_read(self):
+        """Whether both legacy reader threads have read their whole reply
+        (or met the end of their FIFO)."""
+        rout, rerr = getattr(self, "_rout", None), getattr(self, "_rerr", None)
+        return rout is not None and rerr is not None and rout.done and rerr.done
+
     def _abandon(self):
         """Give the worker up without waiting for the reply: after an
         exception while reading, or when the object is collected unclosed.
         The command is interrupted; binary mode skips the rest of its reply
-        on the next request (a stale worker), legacy mode restarts. The lock
-        is released even if this is interrupted itself."""
+        on the next request (a stale worker), legacy mode restarts, unless
+        its readers already have the whole reply. The lock is released even
+        if this is interrupted itself."""
         if self._released:
             return
         p = self._p
+        if not p.binary and not self._finished and self._legacy_reply_read():
+            #: Nothing is left unread, so the worker is in sync: finish as
+            #: usual, and it keeps its state.
+            try:
+                self._legacy_drain_queue()
+                self._legacy_complete()
+            except BaseException:
+                pass
+            if self._finished:
+                self._release()  # in case the exception came before it
+                return
         already = self._finished
         try:
             pid = self._worker_pid
@@ -1450,7 +1466,14 @@ class BrishPopen:
             #: flows, check again every 50 ms.
             left = self._stage_t + self.kill_grace - time.monotonic()
             timeout = min(timeout, left if left > 0 else 0.05)
-        self._pump(timeout)
+        #: Dispatched here rather than through a bound method kept on the
+        #: object, which would make a reference cycle: a BrishPopen dropped
+        #: unclosed would then wait for the cyclic garbage collector, in
+        #: whatever thread it runs.
+        if self._p.binary:
+            self._pump_binary(timeout)
+        else:
+            self._pump_legacy(timeout)
 
     def _kill_step(self):
         """After kill(), on every read: notice that the command has ended, or
