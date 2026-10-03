@@ -53,6 +53,13 @@
 # command's function with `unfunction`, which holds signals back, instead
 # of letting the next definition free it. A command's own shell code
 # (defining a function, say) can still be hit.
+#
+# zsh also flushes stdout after every builtin, the trap's own included, and
+# the trap cannot do without builtins: only `return` (or `exit`) makes zsh
+# unwind the command. When the signal lands while a builtin of the command
+# (`print`, `echo`) is inside the C library's lock or unlock of stdout, that
+# flush waits for the lock forever, and the process hangs. This is rare
+# (see docs/protocol.org, Interrupts), and the trap's code cannot avoid it.
 function TRAPINT {
   builtin "${__brish_trap:-return}" "${__brish_trap_arg:-0}"
   if (( ZSH_SUBSHELL > __brish_level )); then
