@@ -702,17 +702,17 @@ def test_legacy_interrupt_while_learning_the_pid():
             return got == [True]
         b.send_cmd("v=kept", server_index=0)
         #: 1. After the reply was read (in the ps call that checks the PID).
-        real_child_pids = bm._child_pids
+        real_parent_pid = bm._parent_pid
         def in_ps(pid):
             raise KeyboardInterrupt("in ps")
-        bm._child_pids = in_ps
+        bm._parent_pid = in_ps
         try:
             b.popen("print -r x", server_index=0)
             raise SystemExit("no KeyboardInterrupt")
         except KeyboardInterrupt:
             pass
         finally:
-            bm._child_pids = real_child_pids
+            bm._parent_pid = real_parent_pid
         assert lock_free(0) and not b._holds_worker_lock(), b.locks
         assert b.p.free_server_count == 2, b.p.free_server_count
         #: The reply was complete: the worker is in sync and keeps its state.

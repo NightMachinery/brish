@@ -328,8 +328,21 @@ def _descendants(root):
     return found
 
 
+def _parent_pid(pid):
+    """The parent PID of `pid`, from `ps -o ppid= -p PID`, or None. One `ps`
+    run, about half the cost of listing every process."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(int(pid))],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except Exception:
+        return None
+    return int(out) if out.isdigit() else None
+
+
 def _child_pids(pid):
-    """PIDs whose parent is `pid`, from `ps` (used only on slow shutdown paths)."""
+    """PIDs whose parent is `pid`, from `ps -A` (used on shutdown paths)."""
     try:
         out = subprocess.run(
             ["ps", "-Ao", "pid=,ppid="], capture_output=True, text=True, timeout=10
@@ -1119,7 +1132,7 @@ class BrishPopen:
                 return _NEVER_RAN
             found = _LEGACY_PID_RE.findall(res.outb)
             #: Only a child of this instance's bootstrap is ever signalled.
-            if found and int(found[-1]) in _child_pids(p.pid):
+            if found and _parent_pid(int(found[-1])) == p.pid:
                 p.legacy_pids[index] = int(found[-1])
         except BaseException:
             if not complete:
