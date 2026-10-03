@@ -105,8 +105,9 @@ def test_terminal_ctrl_c_reaches_python_alone():
     #: Python runs on a pseudo-terminal, as from an interactive shell, and a
     #: Ctrl-C is typed: Python gets its KeyboardInterrupt, and the command
     #: runs to its end. Commands have no controlling terminal: `tty` says
-    #: so, opening /dev/tty fails at once (ENXIO), and a password prompt
-    #: that wants the terminal falls back to stdin instead of waiting.
+    #: so, `stty` fails (also on /dev/tty), opening /dev/tty fails at once
+    #: (ENXIO), and a password prompt that wants the terminal falls back to
+    #: stdin instead of waiting.
     check(
         r'''
         import pty, select, textwrap
@@ -120,6 +121,8 @@ def test_terminal_ctrl_c_reaches_python_alone():
             print("TTY", repr(r.out), flush=True)
             r = b.send_cmd("{{ : </dev/tty }} 2>/dev/null; print -r -- rc=$?")
             print("DEVTTY", repr(r.out), flush=True)
+            r = b.send_cmd("stty -a >/dev/null 2>&1; print -r -- rc=$?; {{ stty -a </dev/tty }} >/dev/null 2>&1; print -r -- rc=$?")
+            print("STTY", repr(r.out), flush=True)
             r = b.send_cmd(py + " -c 'open(\\"/dev/tty\\")' 2>&1 | tail -n 1")
             print("OPEN", repr(r.out), flush=True)
             t = time.monotonic()
@@ -176,6 +179,7 @@ def test_terminal_ctrl_c_reaches_python_alone():
         assert "TTY-PY True\n" in out, out
         assert "TTY 'not a tty\\nrc=1\\n'\n" in out, out
         assert "DEVTTY 'rc=1\\n'\n" in out, out
+        assert "STTY 'rc=1\\nrc=1\\n'\n" in out, out
         assert "OPEN \"OSError: [Errno 6] Device not configured: '/dev/tty'\\n\"" in out or "OPEN \"OSError: [Errno 6] No such device or address: '/dev/tty'\\n\"" in out, out
         assert "GETPASS 'secret\\n' 0 True\n" in out, out
         assert "KBI\n" in out and "NO-KBI" not in out, out  # after the echoed ^C
