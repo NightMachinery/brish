@@ -915,12 +915,74 @@ def _legacy_busy(p, index):
     return False
 
 
-#: Internal request that prints a legacy worker's PID: the parent of a
-#: command substitution. The worker itself does not load zsh/system. The PID
-#: is bracketed by a marker, because a background job of an earlier command
-#: may write into the same reply (see docs/protocol.org); the last match wins.
+#: The legacy bootstrap (brish2.zsh) reports its workers' PIDs on its
+#: stdout, after whatever the startup files printed there.
+_LEGACY_PIDS_RE = re.compile(rb"\0BRISH2-PIDS:([0-9 ]*)\n")
+#: How long the first popen of a generation waits for that report. The
+#: bootstrap writes it right after forking the workers, before init returns.
+_LEGACY_PIDS_WAIT = 5.0
+
+
+def _legacy_read_pids(p, timeout):
+    """Read the bootstrap's PID report (see _LEGACY_PIDS_RE) into
+    p.legacy_pids, waiting up to `timeout` seconds for it. Returns whether
+    it was read. A shell that is not brish2.zsh is not asked, and one that
+    has not reported after a full _LEGACY_PIDS_WAIT is not asked again. Each
+    PID must be in the bootstrap's process group, the session Brish started
+    it in."""
+    if p.pid_report is not None:
+        return p.pid_report
+    with p.pid_lock:
+        if p.pid_report is not None:
+            return p.pid_report
+        try:
+            fd = p.stdout.fileno()
+        except (ValueError, OSError):
+            return False
+        deadline = time.monotonic() + timeout
+        with selectors.DefaultSelector() as sel:
+            sel.register(fd, selectors.EVENT_READ)
+            while True:
+                m = _LEGACY_PIDS_RE.search(p.boot_out)
+                if m:
+                    p.boot_out = b""
+                    pids = [int(x) for x in m.group(1).split()]
+                    ok = len(pids) == len(p.legacy_pids)
+                    for i, pid in enumerate(pids if ok else ()):
+                        try:
+                            if os.getpgid(pid) == p.pid and p.legacy_pids[i] is None:
+                                p.legacy_pids[i] = pid
+                        except OSError:
+                            pass  # gone already: the instance restarts
+                    p.pid_report = True if ok else False
+                    return ok
+                left = deadline - time.monotonic()
+                if left <= 0 or not sel.select(left):
+                    if timeout >= _LEGACY_PIDS_WAIT:
+                        p.pid_report = False
+                    return False
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    p.pid_report = False
+                    return False
+                #: Keep only what could hold the report: startup files may
+                #: print plenty.
+                p.boot_out = (p.boot_out + chunk)[-65536:]
+
+
+#: Internal request that prints a legacy worker's PID, for a shell that does
+#: not report them (see _legacy_read_pids): the parent of a command
+#: substitution. The worker itself does not load zsh/system. The PID is
+#: bracketed by a marker, because a background job of an earlier command may
+#: write into the same reply (see docs/protocol.org); the last match wins.
+#: The marker is printed together with the PID, inside a quoted
+#: substitution, so that worker state (a DEBUG trap that prints, digits in
+#: IFS) cannot separate them.
 _LEGACY_PID_CMD = (
-    b"builtin print -r -- brish-pid:$(builtin zmodload zsh/system && builtin print -r -- ${sysparams[ppid]}):"
+    b'builtin print -r -- "$(builtin zmodload zsh/system && builtin print -r -- brish-pid:${sysparams[ppid]}:)"'
 )
 _LEGACY_PID_RE = re.compile(rb"brish-pid:(\d+):")
 #: kill() sends its first SIGINT no sooner than this many seconds after the
@@ -1120,11 +1182,14 @@ class BrishPopen:
         return None
 
     def _learn_legacy_pid(self, p, index):
-        """Ask legacy worker `index` for its PID, once per generation (see
-        _LEGACY_PID_CMD). Returns _NEVER_RAN if the worker could not answer.
-        An interrupt while the request is in flight leaves its reply unread,
-        so the worker is given up (Brish._legacy_abandon)."""
+        """Learn legacy worker `index`'s PID, once per generation: from the
+        bootstrap's report (see _legacy_read_pids), or by asking the worker
+        (see _LEGACY_PID_CMD). Returns _NEVER_RAN if the worker could not
+        answer. An interrupt while the request is in flight leaves its reply
+        unread, so the worker is given up (Brish._legacy_abandon)."""
         b = self._brish
+        if _legacy_read_pids(p, _LEGACY_PIDS_WAIT) and p.legacy_pids[index] is not None:
+            return None
         complete = False
         try:
             outcome = b._legacy_transact(
@@ -2025,6 +2090,11 @@ class Brish:
         #: _LegacyStreamReader), and each worker's PID, learned on demand.
         p.out_readers = [None] * server_count
         p.legacy_pids = [None] * server_count
+        #: brish2.zsh reports the PIDs on its stdout (see _legacy_read_pids):
+        #: None until read, then whether it was.
+        p.pid_report = None if os.path.basename(shell[0]) == "brish2.zsh" else False
+        p.pid_lock = Lock()
+        p.boot_out = b""
         #: Workers whose reply was abandoned (see _legacy_abandon).
         p.legacy_stale = [False] * server_count
         try:
@@ -2459,8 +2529,8 @@ class Brish:
 
         Returns a BrishPopen: in binary mode once the worker has read the
         whole request and is starting the command, in legacy mode once the
-        request is written (the first popen per legacy worker and start also
-        asks the worker for its PID). Iterating it yields (stream, chunk)
+        request is written (the first popen after a legacy start reads the
+        workers' PIDs from the bootstrap, or asks a custom shell's worker). Iterating it yields (stream, chunk)
         pairs: `stream` is "out" or "err", `chunk` is non-empty bytes, as
         read. Only the bytes that could start the end of the reply are held
         back until the next read: in binary mode a suffix that starts at a

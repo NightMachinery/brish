@@ -302,6 +302,11 @@ builtin trap '' PIPE INT
 if builtin zmodload zsh/system 2>/dev/null; then
   builtin trap __brish2_reap CHLD
 fi
+#: The workers' PIDs, which BrishPopen.kill() signals, for new Python: it
+#: reads them from the bootstrap's stdout, which nothing else writes after
+#: the startup files, and which older Python never reads. The NUL sets the
+#: line apart from what the startup files printed.
+builtin print -rn -- "${__brish2_nul}BRISH2-PIDS:${(j: :)__brish2_pids}"$'\n' 2>/dev/null
 
 builtin wait
 __brish2_reap

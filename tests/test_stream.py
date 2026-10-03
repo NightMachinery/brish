@@ -4,6 +4,8 @@ Every test runs in both modes. Timing assertions use wide margins: they tell
 "arrives while the command runs" from "arrives when it ends".
 """
 
+import pytest
+
 from tests.conftest import BINARY, binary_only, check, legacy_only
 
 HELPERS = r'''
@@ -52,8 +54,8 @@ def same_server_ok(b, i, want_v="kept"):
 '''
 
 
-def run(code, timeout=60, **kw):
-    return check(code, setup=HELPERS, timeout=timeout, **kw)
+def run(code, timeout=60, setup="", **kw):
+    return check(code, setup=HELPERS + setup, timeout=timeout, **kw)
 
 
 def test_lines_arrive_while_the_command_runs():
@@ -645,33 +647,79 @@ def test_a_slow_reader_keeps_memory_flat():
     )
 
 
+#: Legacy tests of the PID that kill() needs run with the bootstrap's PID
+#: report (brish2.zsh) and with the internal PID request that a shell
+#: without the report gets (forced here with pid_report=False).
+PID_SOURCES = [pytest.param(True, id="report"), pytest.param(False, id="request")]
+
+
 @legacy_only
-def test_legacy_learns_each_worker_pid_once():
+@pytest.mark.parametrize("report", PID_SOURCES)
+def test_legacy_learns_each_worker_pid_once(report):
     run(
         r'''
         b = Brish(server_count=2)
+        if not REPORT:
+            b.p.pid_report = False
         assert b.p.legacy_pids == [None, None]
         with b.popen("print -r a", server_index=1) as p:
             collect(p)
         pids = list(b.p.legacy_pids)
-        assert pids[0] is None and pids[1] > 1, pids
-        r = b.send_cmd("zmodload zsh/system; print -r -- $sysparams[pid]", server_index=1)
-        assert int(r.out) == pids[1], (r, pids)
+        if REPORT:
+            assert all(pid and pid > 1 for pid in pids), pids  # every worker at once
+        else:
+            assert pids[0] is None and pids[1] > 1, pids
+        for i in (0, 1):
+            r = b.send_cmd("zmodload zsh/system; print -r -- $sysparams[pid]", server_index=i)
+            assert pids[i] is None or int(r.out) == pids[i], (r, pids)
         with b.popen("print -r b", server_index=1) as p:
             collect(p)
         assert b.p.legacy_pids == pids
         b.cleanup()
-        '''
+        ''',
+        setup=f"REPORT = {report!r}\n",
     )
 
 
 @legacy_only
-def test_legacy_pid_survives_background_output():
+@pytest.mark.parametrize("report", PID_SOURCES)
+def test_legacy_pid_survives_worker_state(report):
+    #: State that a command left behind (a DEBUG trap that prints, digits in
+    #: IFS) once separated the internal PID request's marker from the PID:
+    #: kill() then signalled nothing, reported 9001 three graces later, and
+    #: the command ran on after the restart.
+    run(
+        r'''
+        for state in ["trap 'print -r -- dbg' DEBUG", "IFS=0123456789"]:
+            b = Brish(server_count=1)
+            if not REPORT:
+                b.p.pid_report = False
+            b.send_cmd("v=kept")
+            b.send_cmd(state)
+            with b.popen("print -r -- started; zmodload zsh/zselect; zselect -t 10000") as p:
+                kill_later(p, 0.3)
+                evs = collect(p)
+            assert b.p.legacy_pids[0], (state, b.p.legacy_pids)
+            assert (p.retcode, p._stage) == (130, 1), (state, p.retcode, p._stage, evs)
+            assert b"started" in joined(evs), (state, evs)
+            r = b.send_cmd("trap - DEBUG; IFS=$' \\t\\n'; print -r -- ok-$v")
+            assert "ok-kept" in r.out, (state, repr(r))
+            b.cleanup()
+        ''',
+        setup=f"REPORT = {report!r}\n",
+    )
+
+
+@legacy_only
+@pytest.mark.parametrize("report", PID_SOURCES)
+def test_legacy_pid_survives_background_output(report):
     #: A background job of an earlier command writes into every later reply,
     #: also into the internal PID request's; kill() must still find the PID.
     run(
         r'''
         b = Brish(server_count=1)
+        if not REPORT:
+            b.p.pid_report = False
         import re
         r = b.send_cmd("v=kept; { repeat 3000 { print -r tick; sleep 0.005 } } &!; print -r -- job:$!")
         job = int(re.search(r"job:(\d+)", r.out).group(1))
@@ -690,7 +738,8 @@ def test_legacy_pid_survives_background_output():
         finally:
             os.kill(job, signal.SIGKILL)
         b.cleanup()
-        '''
+        ''',
+        setup=f"REPORT = {report!r}\n",
     )
 
 
@@ -700,9 +749,11 @@ def test_legacy_interrupt_while_learning_the_pid():
     #: here; a Ctrl-C in the main thread in real life) must not leak the
     #: worker lock, and a reply it leaves unread must never be read as the
     #: answer to a later request, also not by a thread that holds the lock.
+    #: Only a shell without the bootstrap's PID report sends that request.
     run(
         r'''
         b = Brish(server_count=2)
+        b.p.pid_report = False
         def lock_free(i):
             got = []
             def other():
