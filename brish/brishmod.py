@@ -3205,8 +3205,9 @@ class Brish:
         parts = p.body[0].value.values
         for part in parts:
             typ = type(part)
-            if typ is ast.Constant or typ is ast.Str:
-                result.append(part.s)  # part.value can also work in Py3.8
+            if typ is ast.Constant:
+                #: Python 3.14 removed `ast.Str` and `Constant.s`.
+                result.append(part.value)
             elif typ is ast.FormattedValue:
                 # print(part.__dict__)
 

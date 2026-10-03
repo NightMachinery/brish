@@ -20,6 +20,7 @@ tests do not use the library under test, so they run in legacy mode only.
 import os
 import stat
 import subprocess
+import sys
 
 import pytest
 
@@ -116,6 +117,10 @@ def test_raw_replies_match_the_original(sources, real_env):
     )
 
 
+@pytest.mark.skipif(
+    sys.version_info >= (3, 14),
+    reason="the original's templates read ast.Constant.s, which Python 3.14 removed",
+)
 @pytest.mark.parametrize("real_env", ENVS)
 def test_old_python_on_this_worker(sources, real_env):
     #: The baseline is the original Python on the original worker. master's
