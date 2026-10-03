@@ -203,7 +203,7 @@ def test_zp_passes_bytes_through(tmp_path):
 
 def test_loop_control_and_exit():
     #: A command's break N or continue N cannot escape the worker loop, and
-    #: exit is answered with its status; the instance restarts afterwards.
+    #: exit is answered with its status; the worker is replaced afterwards.
     check(
         r'''
         b = Brish(server_count=1)

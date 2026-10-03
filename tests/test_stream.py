@@ -256,7 +256,7 @@ def test_kill_signals_the_worker_before_its_descendants():
     #: kill thread held up between the two batches (here 50 ms after each,
     #: as the GIL or the OS can do) let the worker reap the child and go on
     #: before its own SIGINT arrived: the command ran on, or under set -e
-    #: the child's 130 exited the worker (9001, and a restart).
+    #: the child's 130 exited the worker (9001, and a new worker).
     run(
         r'''
         real = bm._signal_pids
@@ -289,7 +289,7 @@ def test_no_sigkill_for_a_command_that_has_ended():
     #: Brish has not read, and step 3 then finds no processes below the
     #: worker (for a fork command: because its subshell has exited). Here
     #: the command has ended unread when step 3 is taken; it used to cost
-    #: the worker (9001 and a restart).
+    #: the worker (9001 and a new worker).
     run(
         r'''
         b = Brish(server_count=1)
@@ -378,7 +378,7 @@ def test_stdin_keeps_a_non_fork_command_in_the_worker():
             b.send_cmd("v=kept")
             r = b.send_cmd(w, cmd_stdin="exit 7")
             assert r.retcode == 7, (pre, r)
-            #: The worker is gone: the instance restarted.
+            #: The worker is gone: it was replaced.
             r = b.send_cmd('print -r -- "${v-unset}"')
             assert r.out == "unset\n", (pre, r)
             b.send_cmd(pre + "; v=kept")
@@ -575,7 +575,7 @@ def test_escalation_stops_at_the_descendants():
 
 def test_escalation_to_the_worker():
     #: The worker itself ignores INT and TERM: it is SIGKILLed, the retcode is
-    #: 9001 with the usual note, and the instance restarts before its next use.
+    #: 9001 with the usual note, and the worker is replaced before its next use.
     run(
         r'''
         b = Brish(server_count=2)
@@ -592,7 +592,7 @@ def test_escalation_to_the_worker():
         assert [(s, c) for _, s, c in evs[-1:]] == [("err", note)], evs
         assert 0.8 < dt < 4 + 6 * ps_cost(), dt
         r = b.send_cmd("print -r -- next-$v", server_index=0)
-        assert (r.retcode, r.out) == (0, "next-\n"), repr(r)  # restarted
+        assert (r.retcode, r.out) == (0, "next-\n"), repr(r)  # replaced
         #: stderr without a final newline: a newline chunk, then the note.
         with b.popen("trap '' INT TERM; print -rnu2 partial; while :; do :; done", server_index=0) as p:
             p.kill_grace = 0.5
@@ -686,7 +686,7 @@ def test_a_command_that_exits_the_worker():
             evs = collect(p)
         assert (p.retcode, joined(evs), joined(evs, "err")) == (3, b"bye\n", b""), (p.retcode, evs)
         r = b.send_cmd("print -r -- next-$v")
-        assert (r.retcode, r.out) == (0, "next-\n"), repr(r)  # restarted
+        assert (r.retcode, r.out) == (0, "next-\n"), repr(r)  # replaced
         b.cleanup()
         '''
     )
@@ -952,7 +952,7 @@ def test_legacy_interrupt_while_learning_the_pid():
             lock.release()
         assert lock_free(0) and not b._holds_worker_lock(), b.locks
         r = b.send_cmd("print -r -- ok-${v-unset}", server_index=0)
-        assert r.out == "ok-unset\n", repr(r)  # the instance restarted
+        assert r.out == "ok-unset\n", repr(r)  # the worker was replaced
         b.cleanup()
         '''
     )
@@ -1127,7 +1127,7 @@ def test_kill_goes_by_the_command_not_the_reader():
             #: The note is a chunk of its own, also after a flood of stderr.
             assert evs[-1] == ("err", note), (cmd, evs[-3:])
             r = b.send_cmd("print -r -- ok-${v-unset}")
-            assert r.out == "ok-unset\n", repr(r)  # restarted
+            assert r.out == "ok-unset\n", repr(r)  # replaced
         #: Once step 4 is taken, the result says the worker died, also when
         #: the reply came anyway (white box: the step is only recorded).
         b.send_cmd("v=kept")
@@ -1139,7 +1139,7 @@ def test_kill_goes_by_the_command_not_the_reader():
         assert joined(evs) == b"done\n", evs
         assert joined(evs, "err").endswith(bm.WORKER_DIED_NOTE.encode() + b"\n"), evs
         r = b.send_cmd("print -r -- ok-${v-unset}")
-        assert r.out == "ok-unset\n", repr(r)  # restarted
+        assert r.out == "ok-unset\n", repr(r)  # replaced
         b.cleanup()
         ''',
         timeout=120,
@@ -1330,7 +1330,7 @@ def test_binary_a_cut_request_frame_takes_the_worker_out():
     #: worker holding part of a frame. It takes no request again: a thread
     #: that holds its lock gets BrishWorkerDiedException at once (before, its
     #: next request was read as the rest of the old frame, ran as code inside
-    #: the old command, and hung), and the instance restarts after the
+    #: the old command, and hung), and worker 0 alone is replaced after the
     #: release. Injected here; a Ctrl-C in the main thread in real life.
     run(
         r"""
@@ -1340,8 +1340,8 @@ def test_binary_a_cut_request_frame_takes_the_worker_out():
         for op in ("popen", "send_cmd"):
             for i in (0, 1):
                 b.send_cmd(f"v=kept{i}", server_index=i)
-            gen = b._gen
-            req = b.p.workers[0].req
+            old = b._slots[0].p
+            req = old.workers[0].req
             def cut(fd, data):
                 if fd == req and len(data) > 1000:
                     real_write(fd, bytes(data[: len(data) - 500]))  # inside the stdin
@@ -1370,10 +1370,12 @@ def test_binary_a_cut_request_frame_takes_the_worker_out():
                 assert r.out == "other-kept1\n", (op, r)
             finally:
                 lock.release()
-            #: After the release, the instance restarts before its next use.
+            #: After the release, worker 0 alone is replaced.
             r = b.send_cmd("print -r -- next-${v-unset}", server_index=0)
             assert r.out == "next-unset\n", (op, r)
-            assert b._gen != gen, op
+            assert b._slots[0].p is not old, op
+            r = b.send_cmd("print -r -- other-$v", server_index=1)
+            assert r.out == "other-kept1\n", (op, r)
         b.cleanup()
         """
     )
@@ -1577,9 +1579,9 @@ def test_an_orphan_skipped_only_when_its_level_is_the_last():
         #: Orphan it by hand, as a collection in another thread would.
         threading.Thread(target=p._orphan).start()
         assert drained(weakref.ref(p))
-        assert b._orphan_held(b.p) == set(), b._orphan_held(b.p)
+        assert b._orphan_held() == set(), b._orphan_held()
         lock.release()
-        assert b._orphan_held(b.p) == {0}, b._orphan_held(b.p)
+        assert b._orphan_held() == {0}, b._orphan_held()
         #: The owner's next call frees it.
         r = b.send_cmd("print -r ok")
         assert r.out == "ok\n", repr(r)
@@ -1595,8 +1597,9 @@ def test_an_orphan_skipped_only_when_its_level_is_the_last():
 def test_an_orphan_whose_owner_ends_after_the_drain():
     #: The owner thread is alive when the helper thread has drained its
     #: orphan, and ends later without calling the instance again. The next
-    #: call of any thread restarts the instance (before, every call waited
-    #: for that worker for good), and the orphan is then forgotten.
+    #: call of any thread gives the slot a new lock and worker (before slots,
+    #: it restarted the instance; before that, every call waited for that
+    #: worker for good), and the orphan is then forgotten.
     run(
         r'''
         b = Brish(server_count=1)

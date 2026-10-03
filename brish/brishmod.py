@@ -275,8 +275,11 @@ class UninitializedBrishException(Exception):
 
 
 class BrishWorkerDiedException(Exception):
-    """A worker could not run the command: it died before the command started,
-    and the restarted instance could not run it either."""
+    """A worker could not run the command: it died before the command
+    started, and its replacement could not run it either; or the calling
+    thread holds that worker's lock (from acquire_lock), so the worker cannot
+    be replaced until the thread releases it; or a new worker failed to
+    start."""
 
     pass
 
@@ -390,7 +393,7 @@ def _acquire_all(locks, skip=None):
     `skip(i)` is true when it comes up, without ever blocking on one while
     holding another. A thread that holds one worker lock and waits for a
     second (both at the same time are fine) can then never deadlock with a
-    restart that waits for all of them. Returns the locks taken."""
+    cleanup that waits for all of them. Returns the locks taken."""
     while True:
         taken = []
         busy = None
@@ -467,11 +470,71 @@ class _ErrReader:
             pass
 
 
-def _worker_env():
+#: Read by the worker scripts and removed before any command runs: the
+#: 0-based slot index that a bootstrap's first worker serves, added to each
+#: worker's 1-based $brish_server_index. Set only for a bootstrap that
+#: replaces one worker of a larger pool (see Brish._spawn).
+SERVER_INDEX_OFFSET_VAR = "BRISH_SERVER_INDEX_OFFSET"
+
+
+def _worker_env(offset=0):
     """The environment of a bootstrap: ours, plus BRISH_SESSION=1, which
     tells the worker scripts that they run in a session of their own (see
-    Brish._init_legacy). The scripts remove it before any command runs."""
-    return dict(os.environ, BRISH_SESSION="1")
+    Brish._spawn_legacy), and the index offset of a replacement bootstrap.
+    The scripts remove both before any command runs."""
+    env = dict(os.environ, BRISH_SESSION="1")
+    env.pop(SERVER_INDEX_OFFSET_VAR, None)
+    if offset:
+        env[SERVER_INDEX_OFFSET_VAR] = str(int(offset))
+    return env
+
+
+def _in_group(pid, pgid):
+    """Whether `pid` is alive in process group `pgid`. A worker is in its
+    bootstrap's group (the session Brish started), so a worker PID that
+    has been reused by another process since is never signalled."""
+    try:
+        return os.getpgid(pid) == pgid
+    except OSError:
+        return False
+
+
+class _Refused(Exception):
+    """A bootstrap was started for an instance that has moved on (cleaned
+    up, or re-initialized) meanwhile."""
+
+
+class _Slot:
+    """One worker index of a Brish instance. Its lock is Brish.locks[i]; the
+    worker that serves it is worker i of the bootstrap `p`, and can be
+    swapped for another bootstrap's, at a fresh acquire of the slot (see
+    Brish._acquire and Brish._service)."""
+
+    __slots__ = ("p", "pending", "attn", "owner", "warming")
+
+    def __init__(self, p):
+        self.p = p
+        #: A ready replacement: a bootstrap whose worker i has booted, to be
+        #: swapped in at the slot's next fresh acquire.
+        self.pending = None
+        #: The next fresh acquire must look at this slot: its worker takes
+        #: no request again (p.dead[i]), or a replacement is pending.
+        self.attn = False
+        #: The thread of the last fresh acquire (see Brish._owner_ended).
+        self.owner = None
+        #: An eager replacement that a helper thread is booting (see
+        #: Brish._warm), or None.
+        self.warming = None
+
+
+class _Warm:
+    """An eager replacement in the making (see Brish._warm): `done` is set
+    once its thread has parked the new worker or given up."""
+
+    __slots__ = ("done",)
+
+    def __init__(self):
+        self.done = threading.Event()
 
 
 #: Protocol BRISH3 (binary mode). See docs/protocol.org.
@@ -603,8 +666,8 @@ class _Worker:
         self.stale = False
         #: A request frame was cut short, so the worker may hold part of one
         #: and would read the next request as its rest: it takes no request
-        #: again (a lock holder gets BrishWorkerDiedException), and the
-        #: instance restarts before its next use.
+        #: again (a lock holder gets BrishWorkerDiedException), and its slot
+        #: gets a new worker.
         self.broken = False
 
     def close(self):
@@ -615,10 +678,14 @@ class _Worker:
                 pass
             self.sel = None
         for fd in (self.req, self.out, self.err):
+            if fd < 0:
+                continue
             try:
                 os.close(fd)
             except OSError:
                 pass
+        #: Closed: a second close() must not close numbers reused since.
+        self.req = self.out = self.err = -1
 
 
 #: The retcode line the bootstrap writes for a worker that died without
@@ -956,13 +1023,16 @@ def _legacy_read_pids(p, timeout):
                 if m:
                     p.boot_out = b""
                     pids = [int(x) for x in m.group(1).split()]
-                    ok = len(pids) == len(p.legacy_pids)
-                    for i, pid in enumerate(pids if ok else ()):
+                    #: The report lists the workers of this bootstrap, in
+                    #: slot order: every slot for a full bootstrap, one for
+                    #: a replacement (see Brish._spawn).
+                    ok = len(pids) == len(p.slot_ids)
+                    for i, pid in zip(p.slot_ids, pids if ok else ()):
                         try:
                             if os.getpgid(pid) == p.pid and p.legacy_pids[i] is None:
                                 p.legacy_pids[i] = pid
                         except OSError:
-                            pass  # gone already: the instance restarts
+                            pass  # gone already: the worker is replaced
                     p.pid_report = True if ok else False
                     return ok
                 left = deadline - time.monotonic()
@@ -1101,18 +1171,18 @@ class BrishPopen:
                 self._lock, self.server_index, self._p = lock, index, p
                 self._released = False
                 p.free_server_count -= 1
-                p.popen_owner[index] = self._owner
+                p.popen_owner[index] = self._owner_thread
                 outcome = start(p, index, cmd_b, stdin_b, fork)
             except BaseException:
                 #: An interrupt while starting (the start methods leave the
-                #: worker resynchronisable or due for a restart) must not
+                #: worker resynchronisable or due for replacement) must not
                 #: leak the worker lock.
                 self._release()
                 raise
             if outcome is not _NEVER_RAN:
                 return
             self._release()
-            b._never_ran(p, index)
+            b._never_ran(p, index, lock)
         raise BrishWorkerDiedException("a worker died before running the command, twice")
 
     def _finish_without_worker(self, retcode, outb, errb):
@@ -1128,7 +1198,7 @@ class BrishPopen:
         worker died before START, or is broken; then the lock is still
         held."""
         w = p.workers[index]
-        if w.broken:
+        if w.broken or p.dead[index]:
             return _NEVER_RAN
         self._w = w
         self._worker_pid = w.pid
@@ -1162,7 +1232,7 @@ class BrishPopen:
             else:
                 #: The worker may hold part of a frame.
                 w.broken = True
-                self._brish._request_restart(p.gen)
+                self._brish._worker_died(p, index)
             self._release()
             raise
         if self._died and not (self._so.started or self._se.started):
@@ -1177,6 +1247,8 @@ class BrishPopen:
         reader threads. Returns _NEVER_RAN if the worker could not take it;
         then the lock is still held."""
         b = self._brish
+        if p.dead[index]:
+            return _NEVER_RAN
         if p.legacy_pids[index] is None:
             if self._learn_legacy_pid(p, index) is _NEVER_RAN:
                 return _NEVER_RAN
@@ -1223,7 +1295,7 @@ class BrishPopen:
                 return _NEVER_RAN
             res, restart = outcome
             if restart:
-                b._request_restart(p.gen)
+                b._worker_died(p, index)
                 return _NEVER_RAN
             found = _LEGACY_PID_RE.findall(res.outb)
             #: Only a child of this instance's bootstrap is ever signalled.
@@ -1286,7 +1358,7 @@ class BrishPopen:
         if self._wreg:
             try:
                 self._w.sel.unregister(self._w.req)
-            except (KeyError, ValueError, OSError):
+            except (KeyError, ValueError, OSError, AttributeError):
                 pass
             self._wreg = False
 
@@ -1394,8 +1466,8 @@ class BrishPopen:
         if died:
             #: Readers that are still running keep their files (cleanup hands
             #: them over). The worker is gone, or out of sync after a forged
-            #: delimiter, so it takes no more requests, and the instance
-            #: restarts before its next use.
+            #: delimiter, so it takes no more requests, and its slot gets a
+            #: new worker.
             self._brish._legacy_abandon(p, index)
             for r in (rout, rerr):
                 if not r.done:
@@ -1474,15 +1546,17 @@ class BrishPopen:
         return nl
 
     def _release(self, restart=False):
-        """Free the worker. Its lock is an RLock of the owner thread, so only
-        the owner can release it: called in another thread (an orphan's
-        helper thread, see _orphan), this only requests the restart, and the
-        owner releases the lock at its next call (Brish._reap_orphans)."""
+        """Free the worker; with `restart`, it takes no request again, and
+        its slot gets a new worker (see Brish._worker_died). Its lock is an
+        RLock of the owner thread, so only the owner can release it: called
+        in another thread (an orphan's helper thread, see _orphan), this
+        only marks the worker, and the owner releases the lock at its next
+        call (Brish._reap_orphans)."""
         if self._released:
             return
         p = self._p
         if restart:
-            self._brish._request_restart(p.gen)
+            self._brish._worker_died(p, self.server_index)
         if threading.get_ident() != self._owner:
             return
         self._released = True
@@ -1500,9 +1574,9 @@ class BrishPopen:
         """Give the worker up without waiting for the reply: after an
         exception while reading, or when the object is collected unclosed.
         The command is interrupted; binary mode skips the rest of its reply
-        on the next request (a stale worker), legacy mode restarts, unless
-        its readers already have the whole reply. The lock is released even
-        if this is interrupted itself."""
+        on the next request (a stale worker), legacy mode replaces the
+        worker, unless its readers already have the whole reply. The lock is
+        released even if this is interrupted itself."""
         if self._released:
             return
         p = self._p
@@ -1881,8 +1955,9 @@ class BrishPopen:
         the instance (Brish._reap_orphans). Meanwhile a helper thread does
         what close() would: it kills the command, with every step, and reads
         the reply to its end. So the command ends, the worker is idle and in
-        sync once the owner frees it, and a restart does not wait for it
-        (see Brish.cleanup)."""
+        sync once the owner frees it, and cleanup() does not wait for it
+        (see Brish.cleanup), while restart() gives its slot a new lock and
+        worker at once (see Brish._swap_now)."""
         if sys.is_finalizing():
             #: Python is ending, and no thread can start any more: on
             #: Python 3.10, Thread.start() then waits for good, so Python
@@ -1903,6 +1978,7 @@ class BrishPopen:
             #: limit): the owner's next call abandons it instead (_reap),
             #: and must not wait for a drain that never comes.
             self._drained.set()
+            self._brish._orphan_drained(self)
             raise
 
     def _drain(self):
@@ -1914,10 +1990,10 @@ class BrishPopen:
             pass
         finally:
             self._drained.set()
-            #: An owner that has ended will never free the worker: restart
-            #: before the next use, which no longer waits for this lock.
-            if not self._owner_thread.is_alive():
-                self._brish._request_restart(self._p.gen)
+            #: An owner that has ended will never free the worker: its slot
+            #: gets a new lock and a new worker (Brish._orphan_drained). An
+            #: owner that ends later is caught by Brish._reap_orphans.
+            self._brish._orphan_drained(self)
 
     def _reap(self):
         """In the owner thread: free the worker of an orphan, once its
@@ -1930,19 +2006,23 @@ class BrishPopen:
         else:
             self._abandon()
 
-    def _orphan_holds(self, p):
-        """The worker of generation `p` that this orphan holds idle, once
-        its reply has been read to its end, if nothing else holds it: the
-        owner thread has ended, or the level of the worker's lock that this
-        orphan took is the only one left (else the owner holds that lock for
-        its own reasons too, with acquire_lock, say). Else None."""
+    def _orphan_holds(self, locks):
+        """The slot whose lock (in `locks`, the instance's slot locks) this
+        orphan holds with its worker idle, once its reply has been read to
+        its end, if nothing else holds it: the owner thread has ended, or the
+        level of the lock that this orphan took is the only one left (else
+        the owner holds that lock for its own reasons too, with acquire_lock,
+        say). Else None."""
         drained = getattr(self, "_drained", None)
         if (drained is None or not drained.is_set() or not self._finished
-                or self._released or getattr(self, "_p", None) is not p):
+                or self._released):
+            return None
+        i = self.server_index
+        if i is None or not 0 <= i < len(locks) or locks[i] is not self._lock:
             return None
         if self._owner_thread.is_alive() and _rlock_levels(self._lock, self._owner) != 1:
             return None
-        return self.server_index
+        return i
 
     @property
     def result(self):
@@ -2022,6 +2102,15 @@ class Brish:
     #: can take seconds on a loaded machine.
     startup_timeout = 30
 
+    #: Whether a dead worker is replaced in the background as soon as its
+    #: death is seen (an eager replacement), so that the next call that
+    #: takes its slot need not wait for a new worker to start (about as long
+    #: as a new Brish takes). The replacement runs boot_cmd when it starts,
+    #: not when it is first used, and it costs a process even if the slot is
+    #: not used again. With False, or whenever no replacement is ready, the
+    #: call that takes the slot starts one itself.
+    eager_replacement = True
+
     def __init__(
         self,
         defaultShell=None,
@@ -2058,21 +2147,41 @@ class Brish:
         ]  # Reserve big argv for `insubshell`
         self.lastShell = kwargs.get("shell") or self.defaultShell
         self.last_server_count = server_count
+        #: The newest full bootstrap (see init and restart), or None.
         self.p = None
+        #: One RLock per slot (worker index). The list is replaced by init
+        #: and cleanup; one lock is replaced when its holder has ended (see
+        #: _recover_slot).
         self.locks = []
+        #: One _Slot per worker index, or None while the instance has no
+        #: workers (before init, after cleanup).
+        self._slots = None
+        #: Every bootstrap not closed yet: the slots' own ones, pending
+        #: replacements, and those still starting.
+        self._boots = []
+        #: Held by init, restart and the end of cleanup, one at a time.
+        #: Never waited for under the instance lock; its holder never waits
+        #: for a worker lock.
+        self._boot_mu = Lock()
+        #: cleanup() calls under way. Meanwhile a thread that holds no
+        #: worker lock waits (on _settled) before it takes one.
+        self._closing = 0
+        self._settled = threading.Condition(self.lock)
+        #: Finished restarts, and the outcome of the last one: a restart
+        #: that had to wait for another returns that one's outcome.
+        self._restart_commits = 0
+        self._restart_result = (True, [])
+        #: Threads that boot an eager replacement (see _warm).
+        self._warmers = set()
         #: BrishPopen objects collected unclosed outside their own thread,
         #: which still hold that thread's worker lock (see _reap_orphans).
         self._orphans = collections.deque()
         self._orphans_mu = Lock()  # one _reap_orphans at a time
-        #: Bumped by every init(); a restart requested for an older
-        #: generation is already done.
+        #: Bumped by init() and restart().
         self._gen = 0
-        #: The generation that must restart before its next use.
-        self._restart_gen = None
-        #: A failed restart leaves the instance uninitialized; the next use
+        #: A failed init leaves the instance without workers; the next use
         #: tries again instead of raising UninitializedBrishException.
         self._init_on_use = False
-        self._booting = False
         self.delayed_init = delayed_init
         if not self.delayed_init:
             self.init(**kwargs)
@@ -2086,10 +2195,10 @@ class Brish:
         encoding=None,
         startup_timeout=None,
     ):
-        with self.lock:
-            if self.p is not None:
-                self.cleanup()
-
+        """Start the workers, stopping any first as cleanup() does. Returns
+        the boot command's results, one per worker, or None without one."""
+        self._cleanup(keep_boot_mu=True)
+        try:
             if encoding is not None:
                 self.encoding = encoding
             if decoding_errors is not None:
@@ -2105,102 +2214,162 @@ class Brish:
             self.lastShell = shell
             self.last_server_count = server_count
             assert server_count >= 1
+            return self._init_locked()
+        finally:
+            self._boot_mu.release()
 
+    def _init_locked(self):
+        """Start a full set of workers for an instance that has none. The
+        caller holds _boot_mu. A failure leaves the instance without workers,
+        and its next use tries again."""
+        n = self.last_server_count
+        with self.lock:
             self._gen += 1
-            self._restart_gen = None
+        try:
+            p = self._spawn(range(n), n, None, False)
             try:
-                if self.binary:
-                    self._init_binary(shell, server_count)
-                else:
-                    self._init_legacy(shell, server_count)
+                results = self._run_boot_cmd(p, range(n))
             except BaseException:
-                self._init_on_use = True
+                self._close_boot(p)
                 raise
+        except BaseException:
+            self._init_on_use = True
+            raise
+        with self.lock:
+            slots = [_Slot(p) for _ in range(n)]
+            for i, s in enumerate(slots):
+                s.attn = p.dead[i]  # the boot command ended it
+            self.locks = [RLock() for _ in range(n)]
+            self._slots = slots
+            self.p = p
             self._init_on_use = False
+        return results
 
-            if self.boot_cmd is not None:
-                self._booting = True
-                try:
-                    return [
-                        self.send_cmd(self.boot_cmd, fork=False, server_index=i)
-                        for i in range(server_count)
-                    ]
-                finally:
-                    self._booting = False
+    # Bootstraps
 
-    def _init_legacy(self, shell, server_count):
+    def _spawn(self, ids, n, slots, eager):
+        """Start a bootstrap whose workers serve the slots `ids` of an
+        instance of `n` slots (all of them, or one for a replacement), with
+        the instance's shell, mode, encoding and environment, and wait until
+        they are up. It is registered in self._boots as soon as it runs, so
+        that cleanup() finds it; see _register for when it is refused."""
+        ids = list(ids)
+        if self.binary:
+            return self._spawn_binary(self.lastShell, ids, n, slots, eager)
+        return self._spawn_legacy(self.lastShell, ids, n, slots, eager)
+
+    def _register(self, p, slots, eager):
+        """Record the new bootstrap `p`. A replacement (`slots` is not None)
+        is refused once the instance has other slots (it was cleaned up or
+        re-initialized), and an eager one also while a cleanup is under way:
+        cleanup() waits for the thread that boots it, and must not wait for a
+        new one. Init and restart hold _boot_mu, so no cleanup runs."""
+        with self.lock:
+            if slots is not None and (self._slots is not slots or (eager and self._closing)):
+                raise _Refused("the instance moved on while a worker was starting")
+            self._boots.append(p)
+
+    def _new_boot(self, p, ids, n):
+        """The bookkeeping of a new bootstrap. Per-worker lists have one
+        entry per slot of the instance, so that a worker is found by its slot
+        index whichever bootstrap runs it; a bootstrap that serves one slot
+        has None (or False) at the others."""
+        p.slot_ids = ids
+        p.gen = self._gen
+        p.server_count = n
+        p.free_server_count = len(ids)
+        #: The thread (a Thread: idents are reused) whose running BrishPopen
+        #: holds each worker, or None.
+        p.popen_owner = [None] * n
+        #: The worker takes no request again (it died, or its stream is out
+        #: of sync): its slot gets a new one at its next fresh acquire.
+        p.dead = [False] * n
+        #: Out of use for good (see _retire); `refs` counts the others.
+        p.retired = [False] * n
+        p.refs = len(ids)
+        #: Stopped, or claimed by the thread that stops it.
+        p.stopped = [False] * n
+        #: Binary mode: a retired worker whose pipes a BrishPopen may still
+        #: read; that BrishPopen closes them (see _retire_locked).
+        p.parked = [False] * n
+        p.closed = False
+        #: Set by cleanup(): a bootstrap that is still starting gives up.
+        p.abort = False
+        p.interrupted = False
+
+    def _spawn_legacy(self, shell, ids, n, slots, eager):
         encoding = self.encoding
         decoding_errors = self.decoding_errors
         tmpdir = tempfile.mkdtemp()
+        paths = {
+            kind: [os.path.join(tmpdir, f"brish_{i}_{kind}") for i in ids]
+            for kind in ("stdin", "stdout", "stderr")
+        }
+        try:
+            for kind in paths:
+                for path in paths[kind]:
+                    os.mkfifo(path)
 
-        brish_stdin_paths = [
-            os.path.join(tmpdir, f"brish_{i}_stdin") for i in range(server_count)
-        ]
-        brish_stdout_paths = [
-            os.path.join(tmpdir, f"brish_{i}_stdout") for i in range(server_count)
-        ]
-        brish_stderr_paths = [
-            os.path.join(tmpdir, f"brish_{i}_stderr") for i in range(server_count)
-        ]
-        for path in brish_stdin_paths + brish_stdout_paths + brish_stderr_paths:
-            os.mkfifo(path)
-
-        #: A session of its own (setsid): no terminal signal (Ctrl-C, Ctrl-\,
-        #: Ctrl-Z, the SIGHUP of a closing terminal) and no signal to our
-        #: process group reaches the bootstrap, its workers or their
-        #: commands, which have no controlling terminal either. Interrupts
-        #: come from Brish alone (BrishPopen.kill(), or the one SIGINT for
-        #: an abandoned BrishPopen). The workers stop with us
-        #: through their pipes (see docs/protocol.org, Processes).
-        #: The bootstrap's stdin stays open until cleanup() (or our end):
-        #: its EOF tells the bootstrap to stop what is left (brish2.zsh).
-        p = Popen(
-            shell,
-            stdin=PIPE,
-            stdout=PIPE,
-            stderr=PIPE,
-            env=_worker_env(),
-            text=True,
-            errors=decoding_errors,  # escape invalid utf-8 bytes
-            encoding=encoding,
-            start_new_session=True,
-        )
+            #: A session of its own (setsid): no terminal signal (Ctrl-C,
+            #: Ctrl-\, Ctrl-Z, the SIGHUP of a closing terminal) and no signal
+            #: to our process group reaches the bootstrap, its workers or
+            #: their commands, which have no controlling terminal either.
+            #: Interrupts come from Brish alone (BrishPopen.kill(), or the one
+            #: SIGINT for an abandoned BrishPopen). The workers stop with us
+            #: through their pipes (see docs/protocol.org, Processes). The
+            #: bootstrap's stdin stays open until it is closed (or our end):
+            #: its EOF tells the bootstrap to stop what is left (brish2.zsh).
+            p = Popen(
+                shell,
+                stdin=PIPE,
+                stdout=PIPE,
+                stderr=PIPE,
+                env=_worker_env(ids[0]),
+                text=True,
+                errors=decoding_errors,  # escape invalid utf-8 bytes
+                encoding=encoding,
+                start_new_session=True,
+            )
+        except BaseException:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise
+        self._new_boot(p, ids, n)
         p.tmpdir = tmpdir
-        p.gen = self._gen
         p.binary = False
-        p.server_count = server_count
-        p.free_server_count = server_count
-        #: The thread whose running BrishPopen holds each worker, or None.
-        p.popen_owner = [None] * server_count
-        p.brish_stdin_paths = brish_stdin_paths
-        p.brish_stdout_paths = brish_stdout_paths
-        p.brish_stderr_paths = brish_stderr_paths
-        p.brish_stdins = []
-        p.brish_stdouts = []
-        p.brish_stderrs = []
-        p.err_readers = [None] * server_count
+
+        def spread(values):
+            out = [None] * n
+            for i, v in zip(ids, values):
+                out[i] = v
+            return out
+
+        p.brish_stdin_paths = spread(paths["stdin"])
+        p.brish_stdout_paths = spread(paths["stdout"])
+        p.brish_stderr_paths = spread(paths["stderr"])
+        p.brish_stdins = [None] * n
+        p.brish_stdouts = [None] * n
+        p.brish_stderrs = [None] * n
+        p.err_readers = [None] * n
         #: Helper threads of BrishPopen that own a stdout FIFO (see
         #: _LegacyStreamReader), and each worker's PID, learned on demand.
-        p.out_readers = [None] * server_count
-        p.legacy_pids = [None] * server_count
+        p.out_readers = [None] * n
+        p.legacy_pids = [None] * n
         #: brish2.zsh reports the PIDs on its stdout (see _legacy_read_pids):
         #: None until read, then whether it was.
         p.pid_report = None if os.path.basename(shell[0]) == "brish2.zsh" else False
         p.pid_lock = Lock()
         p.boot_out = b""
         #: Workers whose reply was abandoned (see _legacy_abandon).
-        p.legacy_stale = [False] * server_count
+        p.legacy_stale = [False] * n
         try:
-            BRISH_STDIN = "\n".join(brish_stdin_paths)
-            BRISH_STDOUT = "\n".join(brish_stdout_paths)
-            BRISH_STDERR = "\n".join(brish_stderr_paths)
+            self._register(p, slots, eager)
             try:
                 print(
-                    BRISH_STDIN
+                    "\n".join(paths["stdin"])
                     + self.MARKER
-                    + BRISH_STDOUT
+                    + "\n".join(paths["stdout"])
                     + self.MARKER
-                    + BRISH_STDERR
+                    + "\n".join(paths["stderr"])
                     + self.MARKER,
                     file=p.stdin,
                     flush=True,
@@ -2210,22 +2379,21 @@ class Brish:
                     f"the shell exited during startup (status {p.wait()}): {shell[0]!r}"
                 )
             #: Open each request FIFO without blocking, so that a shell that
-            #: dies before opening its end is noticed instead of hanging init.
+            #: dies before opening its end is noticed instead of hanging.
             #: Requests are encoded before they are written; see _send_legacy.
-            for path in brish_stdin_paths:
-                p.brish_stdins.append(
-                    open(self._legacy_open_request_fifo(path, p, shell), "wb")
+            for i in ids:
+                p.brish_stdins[i] = open(
+                    self._legacy_open_request_fifo(p.brish_stdin_paths[i], p, shell), "wb"
                 )
             #: Replies are read as bytes and decoded once, in CmdResult.from_bytes.
-            for path in brish_stdout_paths:
-                p.brish_stdouts.append(open(path, "rb"))
-            for path in brish_stderr_paths:
-                p.brish_stderrs.append(open(path, "rb"))
+            for i in ids:
+                p.brish_stdouts[i] = open(p.brish_stdout_paths[i], "rb")
+            for i in ids:
+                p.brish_stderrs[i] = open(p.brish_stderr_paths[i], "rb")
         except BaseException:
-            self._cleanup_legacy(p)
+            self._close_boot(p)
             raise
-        self.locks = [RLock() for i in range(server_count)]
-        self.p = p
+        return p
 
     @staticmethod
     def _legacy_open_request_fifo(path, p, shell):
@@ -2240,35 +2408,39 @@ class Brish:
                     raise BrishWorkerDiedException(
                         f"the shell exited during startup (status {p.returncode}): {shell[0]!r}"
                     )
+                if p.abort:
+                    raise _Refused("the instance is being cleaned up")
                 time.sleep(0.002)
         os.set_blocking(fd, True)
         return fd
 
-    def _init_binary(self, shell, server_count):
-        workers, child_fds = [], []
+    def _spawn_binary(self, shell, ids, n, slots, eager):
+        workers, made, child_fds = [None] * n, [], []
         try:
-            for i in range(server_count):
+            for i in ids:
                 req_r, req_w = os.pipe()
                 out_r, out_w = os.pipe()
                 err_r, err_w = os.pipe()
                 child_fds += [req_r, out_w, err_w]
-                workers.append(_Worker(i, req_w, out_r, err_r))
+                w = _Worker(i, req_w, out_r, err_r)
+                workers[i] = w
+                made.append(w)
             argv = list(shell) + [BRISH3_FDS_ARG] + [
-                f"{child_fds[3 * i]},{child_fds[3 * i + 1]},{child_fds[3 * i + 2]}"
-                for i in range(server_count)
+                f"{child_fds[3 * k]},{child_fds[3 * k + 1]},{child_fds[3 * k + 2]}"
+                for k in range(len(ids))
             ]
-            #: A session of its own, as in _init_legacy.
+            #: A session of its own, as in _spawn_legacy.
             p = Popen(
                 argv,
                 stdin=PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=None,  # startup errors stay visible
                 pass_fds=child_fds,
-                env=_worker_env(),
+                env=_worker_env(ids[0]),
                 start_new_session=True,
             )
         except BaseException:
-            for w in workers:
+            for w in made:
                 w.close()
             for fd in child_fds:
                 os.close(fd)
@@ -2276,39 +2448,37 @@ class Brish:
         for fd in child_fds:
             os.close(fd)
 
-        p.gen = self._gen
+        self._new_boot(p, ids, n)
         p.binary = True
         p.workers = workers
-        p.server_count = server_count
-        p.free_server_count = server_count
-        #: The thread whose running BrishPopen holds each worker, or None.
-        p.popen_owner = [None] * server_count
         try:
-            for w in workers:
+            self._register(p, slots, eager)
+            for w in made:
                 os.set_blocking(w.req, False)
                 os.set_blocking(w.out, False)
                 os.set_blocking(w.err, False)
             self._await_hellos(p, shell)
-            for w in workers:
+            for w in made:
                 w.sel = selectors.DefaultSelector()
                 w.sel.register(w.out, selectors.EVENT_READ)
                 w.sel.register(w.err, selectors.EVENT_READ)
         except BaseException:
-            self._cleanup_binary(p)
+            self._close_boot(p)
             raise
-        self.locks = [RLock() for i in range(server_count)]
-        self.p = p
+        return p
 
     def _await_hellos(self, p, shell):
         """Wait until every worker has said HELLO, and record its PID."""
         deadline = time.monotonic() + self.startup_timeout
-        pending = {w.out: w for w in p.workers}
+        pending = {w.out: w for w in p.workers if w is not None}
         bufs = {fd: b"" for fd in pending}
         sel = selectors.DefaultSelector()
         try:
             for fd in pending:
                 sel.register(fd, selectors.EVENT_READ)
             while pending:
+                if p.abort:
+                    raise _Refused("the instance is being cleaned up")
                 left = deadline - time.monotonic()
                 if left <= 0:
                     raise BrishWorkerDiedException(
@@ -2341,31 +2511,368 @@ class Brish:
         finally:
             sel.close()
 
-    def restart(self):
-        """Restart every worker. In a thread that holds a worker lock, the
-        restart is only scheduled: it runs before the next use by a thread
-        that holds none (see `acquire_lock`). Returns whether it ran."""
-        self._reap_orphans()
-        if self._holds_worker_lock():
-            self._request_restart(self._gen)
-            return False
+    def _run_boot_cmd(self, p, ids):
+        """Run boot_cmd on the workers `ids` of bootstrap `p`, which no slot
+        serves yet. Returns the results (None without a boot_cmd). A worker
+        that the command ends is marked dead."""
+        if self.boot_cmd is None:
+            return None
+        results = []
+        for i in ids:
+            res, gone = self._exchange(p, i, self.boot_cmd)
+            if gone:
+                p.dead[i] = True
+            results.append(res)
+        return results
+
+    def _exchange(self, p, i, cmd):
+        """Run `cmd` (with empty stdin, not forked) on worker i of bootstrap
+        `p`, which no slot serves yet, so no lock is needed. Returns
+        (CmdResult, gone): `gone` if the worker died or exited."""
+        cmd_b = self._to_bytes(cmd, "cmd")
+        if self.binary:
+            nonce = secrets.token_hex(16).encode()
+            frame = b"".join((b"BRISH3 %s %d 0 0\n" % (nonce, len(cmd_b)), cmd_b))
+            outcome = self._binary_transact(p, p.workers[i], frame, nonce)
+            if outcome is _NEVER_RAN:
+                raise BrishWorkerDiedException("a new worker died before it ran the boot command")
+            retcode, outb, errb, gone = outcome
+            res = CmdResult.from_bytes(
+                retcode, outb, errb, cmd, "",
+                encoding=self.encoding, errors=self.decoding_errors,
+            )
+            return res, gone
+        if b"\0" in cmd_b:
+            return CmdResult(
+                9000, "",
+                "Illegal input: Input contained the Brish marker (currently the NUL character).",
+                cmd, "",
+            ), False
+        try:
+            outcome = self._legacy_transact(p, i, cmd_b + b"\0\0\0\n", cmd, "")
+        except BaseException:
+            self._legacy_abandon(p, i)
+            raise
+        if outcome is _NEVER_RAN:
+            raise BrishWorkerDiedException("a new worker died before it ran the boot command")
+        return outcome
+
+    def _close_boot(self, p):
+        """Close bootstrap `p`: stop the workers it still has (see
+        _cleanup_binary and _cleanup_legacy), close its stdin and reap it.
+        Idempotent."""
         with self.lock:
-            self.cleanup()
-            self.delayed_init = False
-            self.init(shell=self.lastShell, server_count=self.last_server_count)
+            if p.closed:
+                return
+            p.closed = True
+            try:
+                self._boots.remove(p)
+            except ValueError:
+                pass
+            todo = []
+            for i in p.slot_ids:
+                self._retire_locked(p, i)
+                if not p.stopped[i]:
+                    p.stopped[i] = True
+                    todo.append(i)
+        if p.binary:
+            self._cleanup_binary(p, todo, whole=True)
+        else:
+            self._cleanup_legacy(p, todo, whole=True)
+
+    def _retire(self, items):
+        """Take the workers `items`, (bootstrap, slot index) pairs, out of
+        use for good: stop each (with every process below it, if it may run
+        a command), and close a bootstrap that has no worker in use left.
+        The caller makes sure that no thread uses them: it holds the slot's
+        lock, or the slot no longer has them."""
+        stop, close = {}, []
+        with self.lock:
+            done = [(p, i) for p, i in items if self._retire_locked(p, i) and not p.closed]
+            #: Decided after the whole batch: a bootstrap whose last worker
+            #: in use is among `items` is closed whole, which stops all of
+            #: its workers at once, and the others' workers are stopped
+            #: together, one call per bootstrap.
+            for p, i in done:
+                if p.refs == 0:
+                    if p not in close:
+                        close.append(p)
+                elif not p.stopped[i]:
+                    p.stopped[i] = True
+                    stop.setdefault(id(p), (p, []))[1].append(i)
+        for p, todo in stop.values():
+            if p.binary:
+                self._cleanup_binary(p, todo, whole=False)
+            else:
+                self._cleanup_legacy(p, todo, whole=False)
+        for p in close:
+            self._close_boot(p)
+
+    def _retire_locked(self, p, i):
+        """Under the instance lock: mark worker i of `p` retired. Returns
+        whether it was not already."""
+        if p.retired[i]:
+            return False
+        p.retired[i] = True
+        p.dead[i] = True
+        p.refs -= 1
+        if p.binary and p.popen_owner[i] is not None and not self._drained_on(p, i):
+            #: A BrishPopen still holds the worker (its owner thread ended
+            #: without freeing it), and its helper thread reads the pipes, or
+            #: will once the object is collected (see BrishPopen._orphan):
+            #: closing them could hand their numbers to new pipes under that
+            #: reader. It closes them itself (see _orphan_drained).
+            p.parked[i] = True
         return True
 
-    def _request_restart(self, gen):
-        """Restart generation `gen` before its next use."""
-        if gen == self._gen:
-            self._restart_gen = gen
+    def _drained_on(self, p, i):
+        """Whether an orphan holds worker i of `p` and its helper thread is
+        done reading it."""
+        for popen in self._orphan_list():
+            if getattr(popen, "_p", None) is p and popen.server_index == i:
+                drained = getattr(popen, "_drained", None)
+                return drained is not None and drained.is_set()
+        return False
 
-    def _restart_now(self, gen):
-        """Restart unless generation `gen` has already been replaced. Never
-        call this while holding a worker lock."""
+    # Slots
+
+    def _worker_died(self, p, i):
+        """Worker i of bootstrap `p` takes no request again. If it serves its
+        slot, the slot gets a new worker: at the slot's next fresh acquire,
+        or before it in the background (see eager_replacement)."""
         with self.lock:
-            if gen == self._gen or self.p is None:
-                self.restart()
+            self._dead_locked(p, i)
+
+    def _dead_locked(self, p, i):
+        p.dead[i] = True
+        slots = self._slots
+        if slots is None or not 0 <= i < len(slots):
+            return
+        s = slots[i]
+        if s.p is not p:
+            return
+        s.attn = True
+        if (self.eager_replacement and s.pending is None and s.warming is None
+                and not self._closing and not sys.is_finalizing()):
+            warm = _Warm()
+            t = threading.Thread(
+                target=self._warm, args=(i, slots, warm), daemon=True, name="brish-replace"
+            )
+            s.warming = warm
+            self._warmers.add(t)
+            try:
+                t.start()
+            except BaseException as e:
+                #: No thread (a thread limit, or an interrupt): the next
+                #: fresh acquire replaces the worker itself.
+                s.warming = None
+                self._warmers.discard(t)
+                warm.done.set()
+                if not isinstance(e, Exception):
+                    raise
+
+    def _warm(self, i, slots, warm):
+        """The thread of an eager replacement: boot a worker for slot i, and
+        park it as the slot's pending replacement if the slot still needs
+        one; else stop it. A failure is left to the next fresh acquire, which
+        tries again and reports it."""
+        p = None
+        try:
+            try:
+                p = self._spawn([i], len(slots), slots, True)
+                self._run_boot_cmd(p, [i])
+            except BaseException:
+                if p is not None:
+                    self._close_boot(p)
+                p = None
+            with self.lock:
+                s = slots[i]
+                if (p is not None and not p.dead[i] and self._slots is slots
+                        and not self._closing and s.pending is None and s.p.dead[i]):
+                    s.pending = p
+                    s.attn = True
+                    p = None
+            if p is not None:
+                self._close_boot(p)
+        finally:
+            with self.lock:
+                if slots[i].warming is warm:
+                    slots[i].warming = None
+                self._warmers.discard(threading.current_thread())
+            warm.done.set()
+
+    def _service(self, i, slots, s):
+        """At a fresh acquire of slot i, whose lock this thread now holds:
+        swap in the pending replacement, or replace a dead worker, waiting
+        for an eager replacement under way or booting one. Boots at most one
+        worker, and raises BrishWorkerDiedException if that one is dead too
+        (its boot command ended it); the slot is then tried again at its
+        next fresh acquire."""
+        booted = False
+        while True:
+            retire = None
+            warm = None
+            with self.lock:
+                if self._slots is not slots or not s.attn:
+                    return
+                if s.pending is not None:
+                    retire = self._swap_locked(i, s)
+                elif s.warming is not None:
+                    warm = s.warming
+                elif not s.p.dead[i]:
+                    s.attn = False
+                    return
+                elif booted:
+                    raise BrishWorkerDiedException(
+                        f"worker {i} was replaced, and the new worker died before it took "
+                        "a command (did the boot command end it?)"
+                    )
+            if retire is not None:
+                self._retire(retire)
+                continue
+            if warm is not None:
+                warm.done.wait()
+                continue
+            p = self._spawn([i], len(slots), slots, False)
+            try:
+                self._run_boot_cmd(p, [i])
+            except BaseException:
+                self._close_boot(p)
+                raise
+            booted = True
+            with self.lock:
+                if self._slots is slots and s.pending is None:
+                    s.pending = p
+                    p = None
+            if p is not None:
+                self._close_boot(p)
+
+    def _swap_locked(self, i, s):
+        """Under the instance lock: put slot i's pending replacement in.
+        Returns the worker to retire."""
+        old = s.p
+        s.p = s.pending
+        s.pending = None
+        s.attn = s.p.dead[i]
+        return [(old, i)]
+
+    def _swap_now(self, i, retire):
+        """Put slot i's pending replacement in now, if no thread uses the
+        slot: its lock is free, or held only by an ended thread or a drained
+        orphan (see _recover_slot). Never waits. Returns whether it did.
+        The worker it took out of a free slot is appended to `retire`, for
+        the caller to retire with the others, so that a restart stops each
+        old bootstrap in one go (see _retire)."""
+        slots, locks = self._slots, self.locks
+        if slots is None or not 0 <= i < len(locks):
+            return True
+        lock = locks[i]
+        if lock._is_owned():
+            if slots[i].owner is threading.current_thread():
+                return False  # this thread's: its worker stays until the release
+            return self._recover_slot(i, lock)  # an ended thread's, by its ident
+        if lock.acquire(blocking=False):
+            try:
+                with self.lock:
+                    s = slots[i]
+                    if (self._slots is slots and self.locks is locks and locks[i] is lock
+                            and s.pending is not None):
+                        retire.extend(self._swap_locked(i, s))
+            finally:
+                lock.release()
+            return True
+        return self._recover_slot(i, lock)
+
+    def _owner_ended(self, i, lock):
+        """Whether slot i's lock `lock` is held by the thread of its last
+        fresh acquire, which has ended: nobody will ever release it."""
+        slots = self._slots
+        if slots is None or not 0 <= i < len(slots):
+            return False
+        t = slots[i].owner
+        return t is not None and not t.is_alive() and bool(_rlock_levels(lock, t.ident))
+
+    def _recover_slot(self, i, lock):
+        """Slot i's lock `lock` is held by a thread that has ended, or only
+        by a drained orphan (see BrishPopen._orphan_holds): nobody will
+        release it soon. Give the slot a new lock, and a new worker: the
+        pending replacement, or one made at the next fresh acquire (or
+        eagerly). Rechecked under the instance lock, which a thread that has
+        just taken `lock` needs to keep it. Returns whether it did."""
+        with self.lock:
+            slots = self._slots
+            if (slots is None or self._closing or i is None or not 0 <= i < len(slots)
+                    or self.locks[i] is not lock):
+                return False
+            s = slots[i]
+            t = s.owner
+            ended = t is not None and not t.is_alive() and bool(_rlock_levels(lock, t.ident))
+            if not ended and i not in self._orphan_held():
+                return False
+            self.locks[i] = RLock()
+            s.owner = None
+            if s.pending is not None:
+                retire = self._swap_locked(i, s)
+            else:
+                retire = [(s.p, i)]
+                self._dead_locked(s.p, i)
+        self._retire(retire)
+        return True
+
+    def restart(self):
+        """Replace every worker, without waiting for one in use.
+
+        A new set of workers is started (each runs boot_cmd), outside the
+        instance lock; then each slot whose lock is free gets its new worker
+        at once, and its old one is stopped. A slot that a thread holds (with
+        acquire_lock, or a running BrishPopen; the caller may be that
+        thread) keeps its old worker for that thread, and gets the new one at
+        its next fresh acquire after the release. Returns once the new
+        workers are up and the free slots have them: True if every slot has
+        its new worker, False if some keep the old one until their lock is
+        released. Concurrent calls share one restart."""
+        return self._restart()[0]
+
+    def _restart(self):
+        """restart(): (done, the slots that wait for a release)."""
+        self._reap_orphans()
+        seen = self._restart_commits
+        with self._boot_mu:
+            if self._slots is None:
+                self.delayed_init = False
+                self._init_locked()
+                return True, []
+            if self._restart_commits != seen:
+                #: Another restart finished while this one waited for it: it
+                #: started its workers after this call began waiting.
+                return self._restart_result
+            n = len(self._slots)
+            p = self._spawn(range(n), n, None, False)
+            try:
+                self._run_boot_cmd(p, range(n))
+            except BaseException:
+                self._close_boot(p)
+                raise
+            retire = []
+            with self.lock:
+                slots = self._slots
+                self._gen += 1
+                p.gen = self._gen
+                self.p = p
+                for i, s in enumerate(slots):
+                    if s.pending is not None:
+                        retire.append((s.pending, i))  # an unused older one
+                    s.pending = p
+                    s.attn = True
+            try:
+                busy = [i for i in range(n) if not self._swap_now(i, retire)]
+            finally:
+                self._retire(retire)
+            result = (not busy, busy)
+            with self.lock:
+                self._restart_commits += 1
+                self._restart_result = result
+            return result
 
     def _orphan_list(self):
         """A snapshot of self._orphans. BrishPopen._orphan appends to it
@@ -2385,69 +2892,91 @@ class Brish:
         worker; it waits for an orphan's helper thread to finish.
 
         It also looks after the drained orphans of owner threads that have
-        ended, whose locks nobody will ever release: while their generation
-        is current, it has the instance restart before its next use (a
-        restart does not wait for such a lock, see cleanup()), and once it
-        is gone, it forgets them."""
+        ended, whose locks nobody will ever release (see _orphan_drained),
+        and then forgets them."""
         if not self._orphans:
             return
-        me = threading.get_ident()
-        mine = []
+        me = threading.current_thread()
+        mine, ended = [], []
         with self._orphans_mu:
             for popen in self._orphan_list():
-                if popen._owner == me:
+                if popen._owner_thread is me:
                     mine.append(popen)
                 elif (popen._drained.is_set() and not popen._owner_thread.is_alive()
                         and not popen._released):
-                    if popen._p.gen == self._gen and self.p is popen._p:
-                        self._request_restart(popen._p.gen)
-                        continue
-                else:
-                    continue
+                    ended.append(popen)
+            for popen in mine:
                 self._orphans.remove(popen)
+        for popen in ended:
+            #: Still listed meanwhile, so that its worker counts as drained.
+            self._orphan_drained(popen)
+        if ended:
+            with self._orphans_mu:
+                for popen in ended:
+                    try:
+                        self._orphans.remove(popen)
+                    except ValueError:
+                        pass
         for popen in mine:
             popen._reap()
 
-    def _orphan_held(self, p):
-        """The workers of generation `p` that drained orphans hold (see
-        BrishPopen._orphan_holds): a restart need not wait for them."""
-        orphans = self._orphan_list()
+    def _orphan_drained(self, popen):
+        """An orphan's helper thread is done reading (see BrishPopen._drain).
+        If the owner thread has ended, nobody will release the worker lock:
+        close the pipes that were left to the orphan (see _retire_locked), or
+        give the slot a new lock and worker (see _recover_slot)."""
+        if popen._owner_thread.is_alive():
+            return
+        p, i = getattr(popen, "_p", None), popen.server_index
+        if p is None or i is None:
+            return
+        with self.lock:
+            parked = p.parked[i]
+            p.parked[i] = False
+        if parked:
+            p.workers[i].close()
+            return
+        self._recover_slot(i, popen._lock)
+
+    def _orphan_held(self):
+        """The slots whose locks drained orphans hold (see
+        BrishPopen._orphan_holds): cleanup() does not wait for them, and
+        restart() gives them a new lock and worker at once."""
+        locks = self.locks
         held = set()
-        for popen in orphans:
-            i = popen._orphan_holds(p)
+        for popen in self._orphan_list():
+            i = popen._orphan_holds(locks)
             if i is not None:
                 held.add(i)
         return held
 
     def _holds_worker_lock(self):
-        """Whether this thread holds a worker lock of the current generation.
-
-        Such a thread must never restart, or wait for a restart: restart()
-        takes the instance lock and then waits for every worker lock, so a
-        lock holder that blocks on the instance lock deadlocks with it.
-        """
-        for lock in self.locks:
+        """Whether this thread holds a worker lock of the instance (not
+        merely the ident of a thread that ended holding one)."""
+        slots = self._slots
+        me = None
+        for i, lock in enumerate(self.locks):
             if lock._is_owned():
-                return True
+                if me is None:
+                    me = threading.current_thread()
+                if slots is None or slots[i].owner is me:
+                    return True
         return False
 
-    def _never_ran(self, p, index):
-        """The worker could not run a command. Restart, unless this thread
-        must not; then raise BrishWorkerDiedException, so that the call fails
-        fast instead of waiting for a restart that needs this thread's lock."""
-        if self._booting:
-            raise BrishWorkerDiedException(
-                "a worker died before running the boot command"
-            )
-        if self._holds_worker_lock():
-            self._request_restart(p.gen)
+    def _never_ran(self, p, index, lock):
+        """Worker `index` of bootstrap `p` could not run a command, and the
+        caller has released the level of `lock` it took. Its slot gets a new
+        worker at the next fresh acquire, so the caller tries again; unless
+        this thread still holds the lock (acquire_lock): then the worker
+        cannot be replaced until the release, and the call fails fast."""
+        self._worker_died(p, index)
+        if lock._is_owned():
             raise BrishWorkerDiedException(
                 f"worker {index} cannot take a command (it died, or a request or reply "
-                "on it was abandoned), and this thread holds a worker lock, so the "
-                "instance cannot restart now; release the lock (it restarts before "
-                "its next use)"
+                "on it was abandoned), and this thread holds a worker lock on it "
+                "(acquire_lock), so it cannot be replaced now; release the lock, and "
+                "the next call that takes the worker replaces it"
             )
-        self._restart_now(p.gen)
 
     def zsh_quote(self, obj, use_shared_instance=True, retry_count=0, retry_limit=10):
         """Quote `obj` as zsh words, in pure Python (no zsh process is used).
@@ -2502,107 +3031,182 @@ class Brish:
         return lock, server_index
 
     def _acquire(self, server_index=None, lock_sleep=1):
-        """Lock one worker. Returns (lock, server_index, p).
+        """Lock one slot. Returns (lock, server_index, p): worker
+        `server_index` of bootstrap `p` serves the slot.
 
-        A pending restart runs here, before the worker lock is taken, so a
-        thread never restarts while holding a worker lock. A thread that
-        already holds one (it called acquire_lock and goes on calling
-        send_cmd, say) skips both the restart and the instance lock: while it
-        holds a lock of this generation, `self.p` cannot be replaced.
+        A fresh acquire (this thread did not hold the slot's lock) first
+        swaps in the slot's pending replacement, or replaces its dead worker
+        (see _service), so a thread never sees its slot's worker change
+        while it holds the lock. The instance lock is taken briefly, after
+        the slot's lock, to check that the lock is still the slot's and to
+        record the thread (see _owner_ended); nothing waits under it.
         """
         self._reap_orphans()
         while True:
-            if self._holds_worker_lock():
-                current_p = self.p
-                locks = self.locks
-            else:
-                with self.lock:
-                    if self.p is not None and self._restart_gen == self._gen:
-                        self.restart()
-                    if self.p is None:
-                        if self.delayed_init or self._init_on_use:
-                            self.delayed_init = False
-                            self.restart()
-                        else:
-                            raise UninitializedBrishException(
-                                "acquire_lock called with an uninitialized Brish"
-                            )
-                    current_p = self.p
-                    locks = self.locks
-
-            assert len(locks) >= 1
-            #: A worker that a running BrishPopen of this thread holds would
-            #: let this thread in (an RLock), but its command is still
-            #: streaming: skip it, or refuse an explicit server_index.
-            me = threading.get_ident()
-            busy = current_p.popen_owner
-            lock = None
+            slots, locks = self._slots, self.locks
+            if slots is None or (self._closing and not self._holds_worker_lock()):
+                self._wait_usable()
+                continue
+            me = threading.current_thread()
             if server_index is None:
-                for i in self._worker_order(current_p):
-                    if busy[i] == me:
-                        continue
-                    if locks[i].acquire(blocking=False):
-                        # https://docs.python.org/3/library/threading.html#threading.Lock.acquire
-                        lock, index = locks[i], i
-                        break
-                if lock is None:
-                    mine = [i for i in range(len(locks)) if busy[i] == me]
-                    if len(mine) == len(locks):
-                        raise BrishWorkerBusyException(
-                            "every worker is streaming a BrishPopen of this thread; "
-                            "read one to its end or close it first"
-                        )
-                    if mine:
-                        #: Waiting here would hold the streaming worker while
-                        #: waiting for another one: two threads that do this
-                        #: on each other's workers would wait forever.
-                        raise BrishWorkerBusyException(
-                            f"worker {mine[0]} is streaming a BrishPopen of this thread, "
-                            "and every other worker is taken; this thread cannot wait for "
-                            "one, since another thread that streams and waits the same way "
-                            "would deadlock with it: make the call after the BrishPopen "
-                            "has been read to its end or closed"
-                        )
-                    if lock_sleep is not None:
-                        time.sleep(lock_sleep)
-                        continue
-                    index = random.randrange(len(locks))
+                got = self._pick(slots, locks, me, lock_sleep)
+                if got is None:
+                    continue
+                index, lock, fresh = got
             else:
+                n = len(locks)
                 index = server_index
-                try:
-                    mine = busy[index] == me
-                except (IndexError, TypeError):
-                    mine = False
-                if mine:
+                if -n <= index < 0:
+                    index += n
+                if not 0 <= index < n:
+                    ic(n, server_index)
+                    time.sleep(1)
+                    continue
+                if slots[index].p.popen_owner[index] is me:
                     raise BrishWorkerBusyException(
                         f"worker {index} is streaming a BrishPopen of this thread; read it "
                         "to its end or close it first, or use server_index=None"
                     )
+                lock = locks[index]
+                fresh = not lock._is_owned()
+                if fresh:
+                    if not self._wait_slot_lock(index, lock, locks):
+                        continue
+                else:
+                    lock.acquire()
 
-            if lock is None:
+            s = slots[index]
+            if not fresh:
+                if s.owner is not me:
+                    #: The RLock knows its owner by ident only, and this
+                    #: thread has the ident of a thread that ended holding
+                    #: it: the slot gets a new lock (see _recover_slot).
+                    lock.release()
+                    if self._recover_slot(index, lock):
+                        continue
+                    lock.acquire()
+                #: This thread already holds the slot: it keeps its worker.
+                return lock, index, s.p
+            with self.lock:
+                ok = self.locks is locks and locks[index] is lock
+                if ok:
+                    s.owner = me
+                    attn = s.attn
+            if not ok:
+                #: Cleaned up, or the lock was replaced (see _recover_slot).
+                lock.release()
+                continue
+            if attn:
                 try:
-                    lock = locks[index]
-                except IndexError:
-                    ic(len(locks), index)
-                    time.sleep(1)
-                    continue
-                lock.acquire()
+                    self._service(index, slots, s)
+                except BaseException:
+                    lock.release()
+                    raise
+            return lock, index, s.p
 
-            #: Holding a worker lock, `self.p` can no longer be replaced.
-            if self.p is current_p:
-                return lock, index, current_p
-            lock.release()
+    def _wait_usable(self):
+        """The slow path of _acquire: the instance has no workers, or a
+        cleanup is under way. A thread that holds no worker lock waits for
+        the cleanup to finish (one that holds one goes on: the cleanup waits
+        for it). Starts the workers of a delayed or failed init."""
+        holder = self._holds_worker_lock()
+        with self.lock:
+            while self._closing and not holder:
+                self._settled.wait()
+            if self._slots is not None:
+                return
+        with self._boot_mu:
+            if self._slots is not None:
+                return
+            if not (self.delayed_init or self._init_on_use):
+                raise UninitializedBrishException(
+                    "acquire_lock called with an uninitialized Brish"
+                )
+            self.delayed_init = False
+            self._init_locked()
 
-    def _worker_order(self, p):
-        """The order in which server_index=None tries the workers: in binary
-        mode, idle ones first, then stale ones (whose next request waits for
-        an abandoned command), then broken ones (which take no request)."""
-        n = len(self.locks)
-        if not getattr(p, "binary", False):
-            return range(n)
-        workers = p.workers
-        rank = [2 if w.broken else 1 if w.stale else 0 for w in workers]
-        return sorted(range(n), key=rank.__getitem__)
+    def _pick(self, slots, locks, me, lock_sleep):
+        """server_index=None: take a free slot, a healthy one first, then one
+        with a pending replacement (a swap), a stale one (binary mode: its
+        next request waits for an abandoned command) and last a dead one (a
+        boot). Returns (index, lock, fresh), or None to start over (after
+        sleeping lock_sleep seconds while every slot is taken)."""
+        n = len(locks)
+        binary = self.binary
+        later = None
+        for i in range(n):
+            s = slots[i]
+            p = s.p
+            if p.popen_owner[i] is me:
+                #: Its lock would let this thread in (an RLock), but its
+                #: command is still streaming.
+                continue
+            if s.attn:
+                rank = 1 if s.pending is not None else 3
+            elif binary and p.workers[i].stale:
+                rank = 2
+            else:
+                lock = locks[i]
+                fresh = not lock._is_owned()
+                # https://docs.python.org/3/library/threading.html#threading.Lock.acquire
+                if lock.acquire(blocking=False):
+                    return i, lock, fresh
+                continue
+            if later is None:
+                later = []
+            later.append((rank, i))
+        if later is not None:
+            later.sort()
+            for _, i in later:
+                lock = locks[i]
+                fresh = not lock._is_owned()
+                if lock.acquire(blocking=False):
+                    return i, lock, fresh
+
+        mine = [i for i in range(n) if slots[i].p.popen_owner[i] is me]
+        if len(mine) == n:
+            raise BrishWorkerBusyException(
+                "every worker is streaming a BrishPopen of this thread; "
+                "read one to its end or close it first"
+            )
+        if mine:
+            #: Waiting here would hold the streaming worker while waiting
+            #: for another one: two threads that do this on each other's
+            #: workers would wait forever.
+            raise BrishWorkerBusyException(
+                f"worker {mine[0]} is streaming a BrishPopen of this thread, "
+                "and every other worker is taken; this thread cannot wait for "
+                "one, since another thread that streams and waits the same way "
+                "would deadlock with it: make the call after the BrishPopen "
+                "has been read to its end or closed"
+            )
+        for i in range(n):
+            if self._owner_ended(i, locks[i]) and self._recover_slot(i, locks[i]):
+                return None
+        if lock_sleep is not None:
+            time.sleep(lock_sleep)
+            return None
+        i = random.randrange(n)
+        lock = locks[i]
+        if lock._is_owned():
+            lock.acquire()
+            return i, lock, False
+        if not self._wait_slot_lock(i, lock, locks):
+            return None
+        return i, lock, True
+
+    def _wait_slot_lock(self, i, lock, locks):
+        """Take slot i's lock `lock`, which this thread does not hold.
+        Returns False, without it, if it stops being the slot's lock: the
+        instance was cleaned up, or the lock was replaced because its holder
+        has ended (see _recover_slot)."""
+        while not lock.acquire(timeout=_POLL):
+            if self.locks is not locks or locks[i] is not lock:
+                return False
+            if self._owner_ended(i, lock):
+                self._recover_slot(i, lock)
+                return False
+        return True
 
     def send_cmd(
         self, cmd, cmd_stdin="", fork=False, server_index=None, lock_sleep=1
@@ -2618,15 +3222,17 @@ class Brish:
         if isinstance(cmd, _BYTES_LIKE):
             restart_cmd = bytes(cmd).decode("utf-8", "surrogateescape")
         if restart_cmd == "%BRISH_RESTART":
-            #: Handled before any worker lock is taken: restarting needs every
-            #: worker lock, so holding one here could deadlock with another
-            #: thread's restart(). A thread that holds one only schedules it.
-            if not self.restart():
-                return CmdResult(
-                    0, "Restart scheduled: this thread holds a worker lock.", "",
-                    cmd, self._stored_stdin(cmd_stdin),
+            #: Handled before any worker lock is taken: it restarts every
+            #: worker (see restart), and runs on none.
+            done, busy = self._restart()
+            if done:
+                msg = "Restarted succesfully."
+            else:
+                msg = (
+                    "Restarted; in use, and replaced when their locks are released: "
+                    + ", ".join(f"worker {i}" for i in busy) + "."
                 )
-            return CmdResult(0, "Restarted succesfully.", "", cmd, self._stored_stdin(cmd_stdin))
+            return CmdResult(0, msg, "", cmd, self._stored_stdin(cmd_stdin))
         if self.binary:
             return self._send_binary(cmd, cmd_stdin, fork, server_index, lock_sleep)
         return self._send_legacy(cmd, cmd_stdin, fork, server_index, lock_sleep)
@@ -2669,10 +3275,11 @@ class Brish:
         an exception, kills the command, drains its output and frees the
         worker. An unclosed object collected in another thread is killed with
         every step and drained in a helper thread, and its worker is freed at
-        the creating thread's next call to this instance; a restart does not
-        wait for it once it is drained, unless that thread holds the worker's
-        lock for its own reasons too, and if that thread has ended, the
-        instance restarts before its next use.
+        the creating thread's next call to this instance. Once it is drained,
+        cleanup() does not wait for it and restart() replaces its worker at
+        once, unless that thread holds the worker's lock for its own reasons
+        too; if that thread has ended, the slot gets a new lock and a new
+        worker.
 
         `kill()` (alias `terminate()`) is the way to interrupt the command:
         workers and their commands run in a session of their own, which no
@@ -2690,7 +3297,7 @@ class Brish:
         there are none (for a fork command, whose subshell has then exited, a
         grace later and only if its end has not shown up). Step 4: SIGKILL to
         the worker, which gives the retcode 9001 with WORKER_DIED_NOTE as the
-        last chunk, and restarts the instance before its next use; before it,
+        last chunk, and has the worker replaced (its slot alone); before it,
         Brish reads up to 128 KiB more of what the pipes hold, looking for the
         end of the reply. The steps stop once the command has ended; each
         comes `kill_grace` seconds (default 2) after the previous step's
@@ -2765,11 +3372,11 @@ class Brish:
                 lock.release()
 
             if outcome is _NEVER_RAN:
-                self._never_ran(p, index)
+                self._never_ran(p, index, lock)
                 continue
             retcode, outb, errb, restart = outcome
             if restart:
-                self._request_restart(p.gen)
+                self._worker_died(p, index)
             return CmdResult.from_bytes(
                 retcode,
                 outb,
@@ -2792,7 +3399,7 @@ class Brish:
         inside the loop that drains both response pipes, so neither side can
         block the other.
         """
-        if w.broken:
+        if w.broken or p.dead[w.index]:
             return _NEVER_RAN
         start = b"\0BRISH3-START:" + nonce + b"\n"
         end = b"\0BRISH3-END:" + nonce + b":"
@@ -2877,10 +3484,10 @@ class Brish:
             elif attempted:
                 #: The worker may hold part of a frame (an interrupt can land
                 #: after a write returned but before `sent` was updated), and
-                #: only a restart recovers from that. Until then nothing may
-                #: reach it, also not from a thread that holds its lock.
+                #: only a new worker recovers from that. Until then nothing
+                #: may reach it, also not from a thread that holds its lock.
                 w.broken = True
-                self._request_restart(p.gen)
+                self._worker_died(p, w.index)
             raise
         finally:
             if writing_registered:
@@ -2935,7 +3542,7 @@ class Brish:
             except BaseException:
                 #: An interrupt leaves a half-written request or a half-read
                 #: reply, and possibly a helper thread that would consume the
-                #: next reply's stderr. Restart before the next use.
+                #: next reply's stderr. The worker is replaced.
                 self._legacy_abandon(p, index)
                 raise
             finally:
@@ -2943,11 +3550,11 @@ class Brish:
                 lock.release()
 
             if outcome is _NEVER_RAN:
-                self._never_ran(p, index)
+                self._never_ran(p, index, lock)
                 continue
             result, restart = outcome
             if restart:
-                self._request_restart(p.gen)
+                self._worker_died(p, index)
             return result
 
         raise BrishWorkerDiedException(
@@ -2957,12 +3564,12 @@ class Brish:
     def _legacy_abandon(self, p, index):
         """A request to legacy worker `index` was cut short, or its reply was
         left half-read. The frozen wire has no marker to resynchronise on, so
-        no request may reach that worker again in this generation (even from
-        a thread that holds its lock: it gets BrishWorkerDiedException), and
-        the instance restarts before its next use."""
+        no request may reach that worker again (even from a thread that holds
+        its lock: it gets BrishWorkerDiedException), and its slot gets a new
+        worker."""
         p.interrupted = True
         p.legacy_stale[index] = True
-        self._request_restart(p.gen)
+        self._worker_died(p, index)
 
     def _legacy_transact(self, p, index, frame, cmd, cmd_stdin):
         """One request/reply exchange with legacy worker `index`.
@@ -2970,10 +3577,10 @@ class Brish:
         Returns _NEVER_RAN if the request could not be written, or
         (CmdResult, restart). See docs/protocol.org, "Legacy mode".
         """
-        if _legacy_busy(p, index):
-            #: An abandoned reply still has a reader on this worker's FIFOs.
-            #: The instance restarts before its next use, but this thread
-            #: holds a worker lock and so got here first.
+        if p.dead[index] or _legacy_busy(p, index):
+            #: The worker takes no request (an abandoned reply may still have
+            #: a reader on its FIFOs). Its slot gets a new worker, but this
+            #: thread holds its lock and so got here first.
             return _NEVER_RAN
         try:
             f = p.brish_stdins[index]
@@ -3013,7 +3620,7 @@ class Brish:
             #: A background job holds the dead worker's stderr open.
             died = True
         if died:
-            #: The caller restarts the instance before its next use.
+            #: The caller has the worker replaced.
             if return_code is None:
                 return_code = RETCODE_WORKER_DIED
             errb = _with_note(errb.decode("latin-1"), WORKER_DIED_NOTE).encode("latin-1")
@@ -3029,41 +3636,92 @@ class Brish:
         return res, died or exited
 
     def cleanup(self):
+        """Stop every worker and close every bootstrap of the instance: the
+        slots' workers, pending replacements, and those still starting
+        (cleanup waits for them to start, then stops them). Waits for each
+        worker lock that a live thread holds, as a command in progress ends
+        first; not for one whose thread has ended, nor for one that only a
+        drained orphan holds (see BrishPopen._orphan)."""
+        self._cleanup(keep_boot_mu=False)
+
+    def _cleanup(self, keep_boot_mu):
+        """cleanup(); with `keep_boot_mu`, return holding _boot_mu, so that
+        init() starts the new workers before any other init or restart."""
         with self.lock:
-            if self.p is None:
-                return
+            self._closing += 1
+        taken = []
+        boot_mu = False
+        try:
             locks = self.locks
-            p = self.p
-            #: A drained orphan (see BrishPopen._orphan) holds its worker
-            #: idle until its owner thread frees it: do not wait for that.
-            taken = _acquire_all(locks, lambda i: i in self._orphan_held(p))
-            try:
-                self.p = None
-                self.locks = []
-                if getattr(p, "binary", False):
-                    self._cleanup_binary(p)
-                else:
-                    self._cleanup_legacy(p)
-            finally:
-                for lock in taken:
-                    lock.release()
+
+            def skip(i):
+                return self._owner_ended(i, locks[i]) or i in self._orphan_held()
+
+            taken = _acquire_all(locks, skip)
+            self._boot_mu.acquire()
+            boot_mu = True
+            self._teardown()
+        except BaseException:
+            if boot_mu:
+                self._boot_mu.release()
+                boot_mu = False
+            raise
+        finally:
+            for lock in reversed(taken):
+                lock.release()
+            with self.lock:
+                self._closing -= 1
+                self._settled.notify_all()
+            if boot_mu and not keep_boot_mu:
+                self._boot_mu.release()
+
+    def _teardown(self):
+        """Under _boot_mu, with every slot lock taken (or skipped): close
+        every bootstrap. Eager replacements still starting are told to give
+        up, and waited for: they close their own bootstraps."""
+        with self.lock:
+            self._slots = None
+            self.p = None
+            self.locks = []
+            warmers = list(self._warmers)
+            for p in self._boots:
+                p.abort = True
+        for t in warmers:
+            t.join()
+        with self.lock:
+            boots = list(self._boots)
+            for p in boots:
+                for i in p.slot_ids:
+                    self._retire_locked(p, i)
+        for p in boots:
+            self._close_boot(p)
 
     @staticmethod
-    def _cleanup_binary(p):
-        #: Stop the workers first, so this never waits for a user command. A
-        #: worker that may still run one (its reply was abandoned, or a
-        #: BrishPopen of this thread still holds it) is stopped with every
-        #: process below it, so that no command outlives the instance; an
-        #: idle worker just exits.
-        busy = [
-            w.pid for w in p.workers
-            if w.pid and (w.stale or w.broken or p.popen_owner[w.index] is not None)
-        ]
-        pids = [w.pid for w in p.workers if w.pid and w.pid not in busy] + _trees(busy)
+    def _cleanup_binary(p, todo, whole):
+        """Stop the binary workers `todo` of bootstrap `p`; with `whole`, it
+        is closing, and these are all that it has left. Stop the workers
+        first, so this never waits for a user command. A worker that may
+        still run one (its reply was abandoned, it is broken, or a
+        BrishPopen holds it) is stopped with every process below it, so that
+        no command outlives it; an idle worker just exits. A worker's PID
+        is signalled only while it is in the bootstrap's process group (a
+        dead worker's PID may be another process's by now). The pipes of a
+        parked worker are left to its BrishPopen (see _retire_locked)."""
+        ws = [p.workers[i] for i in todo if p.workers[i] is not None]
+        busy, idle = [], []
+        for w in ws:
+            if not w.pid or not _in_group(w.pid, p.pid):
+                continue
+            if w.stale or w.broken or p.popen_owner[w.index] is not None or p.parked[w.index]:
+                busy.append(w.pid)
+            else:
+                idle.append(w.pid)
+        pids = idle + _trees(busy)
         _signal_pids(pids, signal.SIGTERM)
-        for w in p.workers:
-            w.close()
-        if p.stdin is not None:
+        for w in ws:
+            if not p.parked[w.index]:
+                w.close()
+        if whole and p.stdin is not None:
             try:
                 p.stdin.close()  # the bootstrap exits when its stdin closes
             except Exception:
@@ -3072,58 +3730,59 @@ class Brish:
         while time.time() < deadline and any(_alive(pid) for pid in pids):
             time.sleep(0.005)
         _signal_pids([pid for pid in pids if _alive(pid)], signal.SIGKILL)
-        try:
-            p.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            p.wait()
+        if whole:
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
 
     @staticmethod
-    def _cleanup_legacy(p):
+    def _cleanup_legacy(p, todo, whole):
+        """Stop the legacy workers `todo` of bootstrap `p` (see
+        _cleanup_binary). A worker that may still run a command (its reply
+        was abandoned, a helper thread still reads it, or a BrishPopen holds
+        it) is stopped first, with every process below it, so that no
+        command outlives it. One that may hold a truncated request must not
+        run it once its FIFO closes either. Without its PID, the bootstrap
+        stops it when it closes: every worker it has left, when Brish closes
+        it, or itself, a second after its stdin closes."""
         def close(f):
+            if f is None:
+                return
             try:
                 f.close()
             except Exception:
                 pass
 
-        #: A worker that may still run a command (its reply was abandoned,
-        #: a helper thread still reads it, or a BrishPopen of this thread
-        #: still holds it) is stopped first, with every process below it, so
-        #: that no command outlives the instance. One that may hold a
-        #: truncated request must not run it once its FIFO closes either.
-        #: Without the workers' PIDs, every worker is stopped so.
-        busy = [
-            i for i in range(p.server_count)
-            if _legacy_busy(p, i) or p.popen_owner[i] is not None
-        ]
+        busy = [i for i in todo if _legacy_busy(p, i) or p.popen_owner[i] is not None]
         if busy:
             _legacy_read_pids(p, 1.0)
             roots = [p.legacy_pids[i] for i in busy]
-            if None in roots:
+            if whole and None in roots:
                 roots = _child_pids(p.pid)
+            else:
+                if None in roots:
+                    p.interrupted = True
+                roots = [r for r in roots if r is not None and _in_group(r, p.pid)]
             _stop_pids(_trees(roots))
-        elif getattr(p, "interrupted", False):
+        elif whole and p.interrupted:
             _stop_pids(_child_pids(p.pid))
 
-        for f in (p.stdout, p.stderr, p.stdin):
-            if f is not None:
+        if whole:
+            for f in (p.stdout, p.stderr, p.stdin):
                 close(f)
-        for f in p.brish_stdins:
-            close(f)
-        out_readers = getattr(p, "out_readers", [])
-        for i, f in enumerate(p.brish_stdouts):
-            reader = out_readers[i] if i < len(out_readers) else None
-            if reader is not None:
-                reader.close_or_hand_over()
-            else:
-                close(f)
-        readers = getattr(p, "err_readers", [])
-        for i, f in enumerate(p.brish_stderrs):
-            reader = readers[i] if i < len(readers) else None
-            if reader is not None:
-                reader.close_or_hand_over()
-            else:
-                close(f)
+        for i in todo:
+            close(p.brish_stdins[i])
+        for i in todo:
+            for readers, files in ((p.out_readers, p.brish_stdouts), (p.err_readers, p.brish_stderrs)):
+                reader = readers[i]
+                if reader is not None:
+                    reader.close_or_hand_over()
+                else:
+                    close(files[i])
+        if not whole:
+            return
         shutil.rmtree(p.tmpdir, ignore_errors=True)
         #: Workers exit once their request FIFO closes, and the bootstrap
         #: once its stdin has, stopping any worker that is still busy a

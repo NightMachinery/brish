@@ -1,10 +1,10 @@
 """Worker locks and restarts.
 
-A thread that holds a worker lock (acquire_lock, or a running BrishPopen) must
-never restart the instance or wait for a restart: restart() takes the instance
-lock and then waits for every worker lock, so such a thread deadlocks with it.
-A pending restart is deferred until the next use by a thread that holds no
-worker lock, and a call that finds its worker dead fails fast instead.
+A thread that holds a worker lock (acquire_lock, or a running BrishPopen)
+keeps that worker until it releases the lock: a dead worker is replaced, and a
+restart swaps in a new one, only at the slot's next fresh acquire. So a call
+that finds its held worker dead fails fast, and neither a restart nor another
+slot's replacement ever waits for a held lock.
 """
 
 from tests.conftest import check
@@ -12,10 +12,10 @@ from tests.conftest import check
 
 def test_a_lock_holder_never_waits_for_a_restart():
     #: Thread A holds worker 0. Thread B's command exits worker 1, so B's next
-    #: call restarts the instance: B takes the instance lock and waits for
-    #: worker 0's lock. Before the fix, A's next call waited for the instance
-    #: lock: a deadlock. Now A's call runs on its worker (the instance cannot
-    #: be replaced while A holds the lock), and B restarts once A releases.
+    #: call on worker 1 gets a new worker. Before slots, B restarted the whole
+    #: instance and waited for worker 0's lock (and A's next call waited for
+    #: B, a deadlock, until the restart was deferred). Now B replaces worker 1
+    #: alone, without waiting for A, and worker 0 keeps its state.
     check(
         r'''
         import faulthandler; faulthandler.dump_traceback_later(25, exit=True)
@@ -25,22 +25,20 @@ def test_a_lock_holder_never_waits_for_a_restart():
         r = b.send_cmd("exit 3", server_index=1)
         assert r.retcode == 3, repr(r)
         got = {}
-        def restarter():
-            got["b"] = b.send_cmd("echo restarted", server_index=1)
-        t = threading.Thread(target=restarter)
+        def replacer():
+            got["b"] = b.send_cmd("echo replaced", server_index=1)
+        t = threading.Thread(target=replacer)
         t.start()
-        time.sleep(0.5)  # B now waits for worker 0's lock inside restart()
-        assert t.is_alive(), "the restart did not wait for the held lock"
+        t.join(15)
+        assert not t.is_alive(), "worker 1's replacement waited for worker 0's lock"
+        assert got["b"].out == "replaced\n", repr(got["b"])
         r = b.send_cmd("print -r -- a-$v", server_index=0)
         assert (r.retcode, r.out) == (0, "a-kept\n"), repr(r)
         r = b.z("print -r -- {'z'}-$v", server_index=0)
         assert r.out == "z-kept\n", repr(r)
         lock.release()
-        t.join(10)
-        assert not t.is_alive(), "the restart did not finish"
-        assert got["b"].out == "restarted\n", repr(got["b"])
         r = b.send_cmd("print -r -- after-$v", server_index=0)
-        assert r.out == "after-\n", repr(r)  # restarted: v is gone
+        assert r.out == "after-kept\n", repr(r)  # worker 0 was never replaced
         b.cleanup()
         ''',
         timeout=40,
@@ -66,10 +64,12 @@ def test_a_dead_worker_fails_fast_while_its_lock_is_held():
             #: The other worker still runs commands for this thread.
             r = b.send_cmd("echo other", server_index=1)
             assert r.out == "other\n", repr(r)
-            #: restart() and %BRISH_RESTART are only scheduled.
+            #: restart() and %BRISH_RESTART replace worker 1 at once, and
+            #: worker 0 only after the release.
             assert b.restart() is False
             r = b.send_cmd("%BRISH_RESTART")
-            assert r.out.startswith("Restart scheduled"), repr(r)
+            assert r.out.startswith("Restarted; ") and "worker 0" in r.out, repr(r)
+            assert "worker 1" not in r.out, repr(r)
         finally:
             lock.release()
         r = b.send_cmd("echo yes", server_index=0)

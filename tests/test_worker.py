@@ -299,8 +299,8 @@ def test_g8_sigint_flood_between_commands():
                 flooder.kill()
             sent = flooder.communicate()[0].strip()
         if hung:
-            #: The documented hang: the worker is gone, the instance
-            #: restarts and works.
+            #: The documented hang: the worker is gone, it is replaced,
+            #: and the instance works.
             assert_ok(b)
             print("the flood hung the worker after", i, "commands")
         else:

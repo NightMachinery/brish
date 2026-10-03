@@ -231,7 +231,8 @@ def test_intended_differences(sources, real_env):
 def test_a_dying_worker_leaves_the_others_alone(sources, python, real_env):
     #: The bootstrap answers only for the worker that died. A busy worker
     #: finishes its own command, and the other workers' next replies are their
-    #: own. "tree" is this tree's own Python. A restart drops the state of
+    #: own. "tree" is this tree's own Python, which replaces the dead worker
+    #: alone; the older ones restart the instance, which drops the state of
     #: every worker, but each reply is still the answer to its own command.
     check(
         r"""
@@ -268,9 +269,9 @@ def test_a_dying_worker_leaves_the_others_alone(sources, python, real_env):
             assert (r.retcode, r.out, r.err) == (0, "busy-kept1\n", ""), (PY, method, repr(r))
             time.sleep(0.3)  # the bootstrap has reaped worker 0
             #: Which Pythons restart the instance (dropping v) at their next
-            #: call: master after a 9001, this tree after any reported death.
+            #: call: master after a 9001. This tree replaces worker 0 alone.
             keep = {"original": True, "master": method != "errexit",
-                    "tree": method == "kill"}[PY]
+                    "tree": True}[PY]
             for k in range(3):
                 for i in (1, 2):
                     r = c(f"print -r -- {k}-$v", server_index=i)
