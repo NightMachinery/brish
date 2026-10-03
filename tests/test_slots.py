@@ -930,3 +930,26 @@ def test_cancelled_is_never_called_under_the_instance_lock():
         assert res["h"] == "h\n" and res["c"], res
         """
     )
+
+
+def test_the_index_offset_check_ignores_the_startup_files_options():
+    #: Startup files that leave sh_glob on (or emulate sh): the worker
+    #: scripts still accept the offset, and its default, 0.
+    run(
+        r"""
+        zd = os.path.join(SCRATCH, "zd-shglob")
+        os.makedirs(zd)
+        with open(os.path.join(zd, ".zshenv"), "w") as f:
+            f.write("setopt sh_glob\n")
+        os.environ["ZDOTDIR"] = zd
+        b = Brish(server_count=2)
+        try:
+            assert b.send_cmd("print -r -- $brish_server_index", server_index=1).out == "2\n"
+            assert b.send_cmd("exit 3", server_index=1).retcode == 3
+            #: The replacement bootstrap gets the offset 1.
+            r = b.send_cmd("print -r -- $brish_server_index", server_index=1)
+            assert (r.retcode, r.out) == (0, "2\n"), r
+        finally:
+            b.cleanup()
+        """
+    )

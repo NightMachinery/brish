@@ -299,7 +299,9 @@ brish3_parse_argv "$@" || builtin exit 64
 #: @duplicateCode/21ca36344d874147ae4ab89e816af523 the offset in brish2.zsh
 typeset -g __brish3_offset=${BRISH_SERVER_INDEX_OFFSET:-0}
 builtin unset BRISH_SERVER_INDEX_OFFSET
-if [[ $__brish3_offset != <-> ]]; then
+#: Checked under zsh's own options, as brish3_parse_argv checks: the startup
+#: files may have left sh_glob (or emulate sh) on, where <-> is no pattern.
+if ! () { builtin emulate -LR zsh; [[ $1 == <-> ]] } "$__brish3_offset"; then
   builtin print -ru2 -- "brish3: bad BRISH_SERVER_INDEX_OFFSET: $__brish3_offset"
   builtin exit 64
 fi

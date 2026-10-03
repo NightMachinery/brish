@@ -139,7 +139,9 @@ function __brish2_write_stdin {
 #: @duplicateCode/21ca36344d874147ae4ab89e816af523 the offset in brish3.zsh
 builtin typeset -g __brish2_offset=${BRISH_SERVER_INDEX_OFFSET:-0}
 builtin unset BRISH_SERVER_INDEX_OFFSET
-if [[ $__brish2_offset != <-> ]]; then
+#: Checked under zsh's own options: the startup files may have left
+#: sh_glob (or emulate sh) on, where <-> is no pattern.
+if ! () { builtin emulate -LR zsh; [[ $1 == <-> ]] } "$__brish2_offset"; then
     builtin print -ru2 -- "brish2: bad BRISH_SERVER_INDEX_OFFSET: $__brish2_offset"
     builtin exit 64
 fi
