@@ -1,6 +1,6 @@
 [project]
 name = "brish"
-version = "0.4.0"
+version = "0.4.1"
 description = "A bridge between zsh and Python."
 authors = [{ name = "NightMachinery", email = "rudiwillalwaysloveyou@gmail.com" }]
 # The patched pytest (9.0.3) needs Python 3.10, and the patched Pygments
