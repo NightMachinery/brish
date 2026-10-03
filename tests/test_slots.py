@@ -883,3 +883,50 @@ def test_send_cmd_costs_what_it_did_in_0_4_0(v040):
         timeout=300,
     )
     print(res.out)
+
+
+def test_cancelled_is_never_called_under_the_instance_lock():
+    #: A cancelled() that takes a lock of the caller's own, held by a thread
+    #: that needs the instance lock (a fresh acquire), while a cleanup runs:
+    #: the call that waits for the cleanup must not hold the instance lock
+    #: while it asks, or the three threads wait for each other for good.
+    run(
+        r"""
+        import faulthandler
+        b = Brish(server_count=2)
+        U = threading.Lock()
+        flag = {"v": False}
+        def cancelled():
+            with U:
+                return flag["v"]
+        ready, go = threading.Event(), threading.Event()
+        res = {}
+        def holder():
+            lock, _ = b.acquire_lock(server_index=0)
+            ready.set()
+            go.wait()
+            with U:
+                time.sleep(0.3)  # the waiter is in cancelled() meanwhile
+                res["h"] = b.send_cmd("print -r -- h", server_index=1).out
+            lock.release()
+        def cleaner():
+            b.cleanup()
+            res["c"] = True
+        def waiter():
+            try:
+                b.send_cmd("true", cancelled=cancelled)
+                res["w"] = "ran"
+            except Exception as e:
+                res["w"] = type(e).__name__
+        th = threading.Thread(target=holder, daemon=True); th.start(); assert ready.wait(30)
+        tc = threading.Thread(target=cleaner, daemon=True); tc.start(); time.sleep(0.3)
+        tw = threading.Thread(target=waiter, daemon=True); tw.start(); time.sleep(0.3)
+        go.set()
+        for t in (th, tc, tw):
+            t.join(20)
+        if any(t.is_alive() for t in (th, tc, tw)):
+            faulthandler.dump_traceback(all_threads=True)
+            os._exit(3)
+        assert res["h"] == "h\n" and res["c"], res
+        """
+    )

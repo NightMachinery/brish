@@ -3200,15 +3200,17 @@ class Brish:
         the cleanup to finish (one that holds one goes on: the cleanup waits
         for it). Starts the workers of a delayed or failed init."""
         holder = self._holds_worker_lock()
-        with self.lock:
-            while self._closing and not holder:
-                if cancelled is None:
-                    self._settled.wait()
-                else:
-                    self._settled.wait(_CANCEL_POLL)
-                    _check_cancelled(cancelled)
-            if self._slots is not None:
-                return
+        while True:
+            with self.lock:
+                if not (self._closing and not holder):
+                    if self._slots is not None:
+                        return
+                    break
+                self._settled.wait(None if cancelled is None else _CANCEL_POLL)
+            #: Outside the instance lock: the caller's callable may block,
+            #: and nothing may wait while holding that lock.
+            if cancelled is not None:
+                _check_cancelled(cancelled)
         with self._boot_mu:
             if self._slots is not None:
                 return
