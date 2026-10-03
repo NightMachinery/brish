@@ -984,3 +984,26 @@ def test_a_restart_shares_only_a_restart_that_began_after_it():
             b.cleanup()
         """
     )
+
+
+def test_brish_restart_checks_cancelled_first():
+    run(
+        r"""
+        b = Brish(server_count=1)
+        try:
+            b.send_cmd("v=kept")
+            for call in (lambda: b.send_cmd("%BRISH_RESTART", cancelled=lambda: True),
+                         lambda: b.popen("%BRISH_RESTART", cancelled=lambda: True)):
+                try:
+                    call()
+                    raise AssertionError("no BrishCancelledException")
+                except bm.BrishCancelledException:
+                    pass
+                assert b.send_cmd("print -r -- ${v-unset}").out == "kept\n"
+            #: Not cancelled: it restarts.
+            assert b.send_cmd("%BRISH_RESTART", cancelled=lambda: False).out == "Restarted succesfully."
+            assert b.send_cmd("print -r -- ${v-unset}").out == "unset\n"
+        finally:
+            b.cleanup()
+        """
+    )

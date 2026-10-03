@@ -296,10 +296,12 @@ class BrishWorkerBusyException(RuntimeError):
 
 
 class BrishCancelledException(RuntimeError):
-    """The `cancelled` callable given to popen, zpopen, send_cmd or z
-    returned true, while the call waited for a worker or just before it
-    would have sent the command: nothing ran, and the worker is free again
-    (a replacement that the call started stays in its slot)."""
+    """The `cancelled` callable given to popen, zpopen, send_cmd, z or
+    acquire_lock returned true, while the call waited for a worker or just
+    before it would have sent the command (or, for acquire_lock, returned
+    the lock); nothing ran, and the worker is free again (a replacement that
+    the call started stays in its slot). %BRISH_RESTART checks it once,
+    before the restart starts."""
 
     pass
 
@@ -1165,7 +1167,7 @@ class BrishPopen:
         if isinstance(cmd, _BYTES_LIKE):
             restart_cmd = bytes(cmd).decode("utf-8", "surrogateescape")
         if restart_cmd == "%BRISH_RESTART":
-            res = b.send_cmd(cmd, cmd_stdin=cmd_stdin)
+            res = b.send_cmd(cmd, cmd_stdin=cmd_stdin, cancelled=cancelled)
             self._finish_without_worker(res.retcode, res.outb, res.errb)
             return
         #: Encode everything first: an encoding error must leave the worker
@@ -3345,7 +3347,10 @@ class Brish:
             restart_cmd = bytes(cmd).decode("utf-8", "surrogateescape")
         if restart_cmd == "%BRISH_RESTART":
             #: Handled before any worker lock is taken: it restarts every
-            #: worker (see restart), and runs on none.
+            #: worker (see restart), and runs on none. `cancelled` is checked
+            #: once, before it starts; a restart under way is not called off.
+            if cancelled is not None:
+                _check_cancelled(cancelled)
             done, busy = self._restart()
             if done:
                 msg = "Restarted succesfully."
