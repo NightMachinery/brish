@@ -2638,47 +2638,48 @@ class Brish:
         it (from another thread, these raise RuntimeError and change nothing);
         a thread that holds the lock (acquire_lock) can pass its
         `server_index`. Calls from the same thread meanwhile skip that busy
-        worker, and never wait: they raise BrishWorkerBusyException when they
-        name it or no other worker is free at once. Use it as a context
-        manager: leaving the block early, by break or by an exception, kills
-        the command, drains its output and frees the worker. An unclosed
-        object collected in another thread is killed with every step and
-        drained in a helper thread, and its worker is freed at the creating
-        thread's next call to this instance; a restart does not wait for it
-        once it is drained, unless that thread holds the worker's lock for its
-        own reasons too, and if that thread has ended, the instance restarts
-        before its next use.
+        worker: they raise BrishWorkerBusyException when they name it, or,
+        with server_index=None, when no other worker is free at once. A call
+        that names another worker waits for its lock as usual (two streaming
+        threads that name each other's workers deadlock), and in binary mode a
+        free but stale worker makes any call wait for its abandoned command.
+        Use it as a context manager: leaving the block early, by break or by
+        an exception, kills the command, drains its output and frees the
+        worker. An unclosed object collected in another thread is killed with
+        every step and drained in a helper thread, and its worker is freed at
+        the creating thread's next call to this instance; a restart does not
+        wait for it once it is drained, unless that thread holds the worker's
+        lock for its own reasons too, and if that thread has ended, the
+        instance restarts before its next use.
 
-        `kill()` (alias `terminate()`) is the only interrupt: workers and
-        their commands run in a session of their own, which no terminal
-        signal (Ctrl-C, Ctrl-Z, the SIGHUP of a closing terminal) and no
-        signal to the caller's process group reaches. A KeyboardInterrupt
-        interrupts Python alone; the command runs on, unless the exception
-        leaves a `with` block that holds the object. kill() works from any
-        thread, is idempotent, and interrupts the command, not the worker.
-        Step 1: SIGINT to the worker, then its descendants (the worker aborts
-        the command as Ctrl-C does in an interactive shell, and its retcode is
-        130 unless the command traps INT). Step 2: SIGINT to the worker again,
-        then SIGTERM to the descendants. Step 3: SIGKILL to the descendants,
-        or step 4 at once if there are none (for a fork command, whose
-        subshell has then exited, a grace later and only if its end has not
-        shown up). Step 4: SIGKILL to the worker, which gives the retcode 9001
-        with WORKER_DIED_NOTE as the last chunk, and restarts the instance
-        before its next use; before it, Brish reads up to 128 KiB more of what
-        the pipes hold, looking for the end of the reply. The steps stop once
-        the command has ended; each comes `kill_grace` seconds (default 2)
-        after the previous step's signals went out when the command has gone
-        quiet, or two graces after them while its output keeps coming. After
-        the first signal Brish reads up to 256 KiB ahead of the caller, so a
-        command that ends at the signal and writes less than that meanwhile is
-        not escalated, however slowly the caller reads. Background jobs of
-        earlier commands are descendants of the worker too, and are stopped by
-        steps 2 to 4.
-        """
-        return BrishPopen(
-            self, cmd, cmd_stdin=cmd_stdin, fork=fork, server_index=server_index,
-            lock_sleep=lock_sleep, buffer=buffer,
-        )
+        `kill()` (alias `terminate()`) is the way to interrupt the command:
+        workers and their commands run in a session of their own, which no
+        terminal signal (Ctrl-C, Ctrl-Z, the SIGHUP of a closing terminal) and
+        no signal to the caller's process group reaches. A KeyboardInterrupt
+        interrupts Python alone, and the command runs on, unless the exception
+        comes inside a read of the object, which abandons it and sends the
+        command one SIGINT, or leaves a `with` block that holds the object,
+        which closes it. kill() works from any thread, is idempotent, and
+        interrupts the command, not the worker. Step 1: SIGINT to the worker,
+        then its descendants (the worker aborts the command as Ctrl-C does in
+        an interactive shell, and its retcode is 130 unless the command traps
+        INT). Step 2: SIGINT to the worker again, then SIGTERM to the
+        descendants. Step 3: SIGKILL to the descendants, or step 4 at once if
+        there are none (for a fork command, whose subshell has then exited, a
+        grace later and only if its end has not shown up). Step 4: SIGKILL to
+        the worker, which gives the retcode 9001 with WORKER_DIED_NOTE as the
+        last chunk, and restarts the instance before its next use; before it,
+        Brish reads up to 128 KiB more of what the pipes hold, looking for the
+        end of the reply. The steps stop once the command has ended; each
+        comes `kill_grace` seconds (default 2) after the previous step's
+        signals went out when the command has gone quiet, or two graces after
+        them while its output keeps coming. After the first signal Brish reads
+        up to 256 KiB ahead of the caller, so a command that ends at the
+        signal and writes less than that meanwhile is not escalated, however
+        slowly the caller reads. Background jobs of earlier commands are
+        descendants of the worker too, and are stopped by steps 2 to 4. """
+        return BrishPopen( self, cmd, cmd_stdin=cmd_stdin, fork=fork,
+        server_index=server_index, lock_sleep=lock_sleep, buffer=buffer, )
 
     def zpopen(self, template, locals_=None, getframe=2, **kwargs):
         """popen() of `zstring(template)`, as z() is send_cmd() of it."""
