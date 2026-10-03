@@ -30,16 +30,20 @@ builtin unset BRISH_SESSION
 #: acts only deeper than itself, that is inside the command's function.
 builtin typeset -g __brish_trapfile=${${(%):-%x}:A:h}/trapint.zsh
 builtin typeset -g __brish_trap= __brish_trap_arg= __brish_int= __brish_pb= __brish_pb0= __brish_tb=
-builtin typeset -g __brish_trapid= __brish_trapref= __brish_level=0 __brish_depth=1
+builtin typeset -g __brish_trapid= __brish_trapref= __brish_tbref= __brish_level=0 __brish_depth=1
 #: The worker tells its own TRAPINT from one that a command defined by the
 #: file the function came from, $functions_source[TRAPINT] (zsh 5.4 and
 #: later). Reading $functions[TRAPINT] instead turns the body back into text
 #: every time, which made each command about 4 us slower. Older zsh compare
-#: the body.
+#: the body. In the same way, __brish_tbref tells whether the command's
+#: function still exists (a command may remove it itself); older zsh go by
+#: __brish_tb, set when the function was defined.
 if (( ${+functions_source} )); then
     __brish_trapref='functions_source[TRAPINT]'
+    __brish_tbref='functions_source[tmp_block_8182782]'
 else
     __brish_trapref='functions[TRAPINT]'
+    __brish_tbref=__brish_tb
 fi
 
 IFS= builtin read -r -d "$__brish2_nul" BRISH_STDIN
@@ -183,7 +187,7 @@ for brish_server_index in {1..${#stdins}} ; do
                 #: set while POSIX_TRAPS was off, if a command turned it on and a
                 #: later command exits from inside a function.
                 builtin trap '__brish2_on_exit $?' EXIT
-                __brish2_inreq=1 __brish2_ret= __brish_int= __brish_pb= __brish_pb0=
+                __brish2_inreq=1 __brish2_ret= __brish_int= __brish_pb= __brish_pb0= __brish_tb=
                 [[ -o posix_builtins ]] && __brish_pb0=1
                 {
                     #: SIGINT, which only BrishPopen.kill() sends (the
@@ -273,11 +277,10 @@ for brish_server_index in {1..${#stdins}} ; do
                     #: `unfunction` frees the body with signals held back;
                     #: redefining it in the next eval would free it where a
                     #: SIGINT can run the trap, and zsh crashes when a trap
-                    #: runs inside free() (see trapint.zsh).
-                    if [[ -n $__brish_tb ]]; then
-                        __brish_tb=
-                        builtin unfunction tmp_block_8182782
-                    fi
+                    #: runs inside free() (see trapint.zsh). Only while it
+                    #: exists: a command may have removed it (see
+                    #: __brish_tbref).
+                    [[ -z ${(P)__brish_tbref-} ]] || builtin unfunction tmp_block_8182782
                 }
             done
             if [[ -z $__brish2_inreq ]]; then

@@ -26,16 +26,20 @@ typeset -g BRISH3_CMD= BRISH3_RET=0 brish_stdin= cmd=
 typeset -g __brish_trapfile=${${(%):-%x}:A:h}/trapint.zsh
 [[ -r $__brish_trapfile ]] || { builtin print -ru2 -- "brish3: cannot read $__brish_trapfile"; builtin exit 70 }
 typeset -g __brish_trap= __brish_trap_arg= __brish_int= __brish_pb= __brish_pb0= __brish_tb=
-typeset -g __brish_trapid= __brish_trapref= __brish_level=0 __brish_depth=3
+typeset -g __brish_trapid= __brish_trapref= __brish_tbref= __brish_level=0 __brish_depth=3
 #: The worker tells its own TRAPINT from one that a command defined by the
 #: file the function came from, $functions_source[TRAPINT] (zsh 5.4 and
 #: later). Reading $functions[TRAPINT] instead turns the body back into text
 #: every time, which made each command about 4 us slower. Older zsh compare
-#: the body.
+#: the body. In the same way, __brish_tbref tells whether the command's
+#: function still exists (a command may remove it itself); older zsh go by
+#: __brish_tb, set when the function was defined.
 if (( ${+functions_source} )); then
   __brish_trapref='functions_source[TRAPINT]'
+  __brish_tbref='functions_source[tmp_block_8182782]'
 else
   __brish_trapref='functions[TRAPINT]'
+  __brish_tbref=__brish_tb
 fi
 typeset -g __brish3_req= __brish3_out= __brish3_err= __brish3_empty=
 typeset -g __brish3_nul= __brish3_nl= __brish3_startp= __brish3_endp=
@@ -183,7 +187,7 @@ function brish3_write_stdin {
 #: (returning through a function turns it into 1). A command may set its own
 #: INT trap, which lasts until the command ends.
 function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data)
-  BRISH3_NONCE= __brish_int= __brish_pb= __brish_pb0=
+  BRISH3_NONCE= __brish_int= __brish_pb= __brish_pb0= __brish_tb=
   [[ -o posix_builtins ]] && __brish_pb0=1
   {
     repeat 1 do  # absorbs a bare break or continue
@@ -242,11 +246,9 @@ function brish3_run {  # $1 nonce, $2 fork (0|1), $3 stdin mode (empty|null|data
     [[ ${(P)__brish_trapref-} == "$__brish_trapid" ]] || brish3_deftrap
     #: `unfunction` frees the body with signals held back; redefining it
     #: in the next eval would free it where a SIGINT can run the trap, and
-    #: zsh crashes when a trap runs inside free() (see trapint.zsh).
-    if [[ -n $__brish_tb ]]; then
-      __brish_tb=
-      builtin unfunction tmp_block_8182782
-    fi
+    #: zsh crashes when a trap runs inside free() (see trapint.zsh). Only
+    #: while it exists: a command may have removed it (see __brish_tbref).
+    [[ -z ${(P)__brish_tbref-} ]] || builtin unfunction tmp_block_8182782
   }
   builtin true  # a failing status must not reach the user's ZERR trap here
 }

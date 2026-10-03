@@ -115,6 +115,24 @@ def test_g7_syntax_error_does_not_rerun_the_previous_command():
     )
 
 
+def test_g7_a_command_may_remove_its_own_function():
+    #: The worker removes a non-fork command's function after it ends,
+    #: unless the command removed it itself (before, the worker's
+    #: `unfunction` then wrote an error to the command's stderr).
+    wcheck(
+        r'''
+        b = Brish(server_count=1)
+        for c in ("unfunction tmp_block_8182782; print -r ok", "unfunction -m 'tmp_*'; print -r ok", "print -r ok"):
+            r = b.send_cmd(c)
+            assert (r.retcode, r.out, r.err) == (0, "ok\n", ""), repr(r)
+            r = b.send_cmd("print -r -- ${+functions[tmp_block_8182782]}", fork=True)
+            assert (r.retcode, r.out, r.err) == (0, "0\n", ""), (c, repr(r))
+        b.cleanup()
+        ''',
+        timeout=60,
+    )
+
+
 def test_g7_death_while_a_background_job_holds_the_streams():
     #: The job keeps the reply streams open after the worker is gone, so no
     #: EOF arrives. The result must not wait for the job.
