@@ -272,6 +272,42 @@ def test_without_the_trap_file_a_commands_int_trap_ends_with_it():
     )
 
 
+def test_replies_without_syswrite():
+    #: A command that unloads zsh/system or disables syswrite: the worker
+    #: then writes its replies, and a command's stdin, with print, which it
+    #: chooses by whether the builtin exists (before, the reply went
+    #: unwritten and send_cmd waited for good). Later commands keep the
+    #: worker's state, kill() still interrupts, and `exit` is reported.
+    check(
+        r'''
+        def call(b, *a, **kw):
+            got = {}
+            th = threading.Thread(target=lambda: got.update(r=b.send_cmd(*a, **kw)), daemon=True)
+            th.start()
+            th.join(30)
+            assert not th.is_alive(), ("hung", a)
+            return got["r"]
+        for c in ("zmodload -u zsh/system", "disable syswrite"):
+            b = Brish(server_count=1)
+            r = call(b, "v=kept; " + c + "; print -r ok")
+            assert (r.retcode, r.out) == (0, "ok\n"), (c, repr(r))
+            r = call(b, "print -r -- next-$v")
+            assert (r.retcode, r.out, r.err) == (0, "next-kept\n", ""), (c, repr(r))
+            for fork in (False, True):
+                r = call(b, "cat", cmd_stdin="in\n", fork=fork)
+                assert (r.retcode, r.out, r.err) == (0, "in\n", ""), (c, fork, repr(r))
+            with b.popen("zmodload zsh/zselect; print -r x; zselect -t 1000; print -r no") as p:
+                threading.Timer(0.3, p.kill).start()
+                out = b"".join(ch for s, ch in p if s == "out")
+            assert (p.retcode, out) == (130, b"x\n"), (c, p.retcode, out)
+            r = call(b, "print -r -- $v; exit 3")
+            assert (r.retcode, r.out) == (3, "kept\n"), (c, repr(r))
+            b.cleanup()
+        ''',
+        timeout=120,
+    )
+
+
 #: Prints "LEAK n" for every open fd of a fresh process that is this
 #: worker's request FIFO, then "checked".
 FD_PROBE = (

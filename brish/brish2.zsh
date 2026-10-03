@@ -65,7 +65,7 @@ function __brish2_on_exit {  # $1: exit status
   __brish_trap= __brish_trap_arg=  # a SIGINT must not cut this short
   if [[ -n $__brish2_inreq ]] && (( ZSH_SUBSHELL == __brish_level )); then
     __brish2_inreq=
-    if [[ -n $__brish2_sw ]]; then
+    if (( ${+builtins[syswrite]} )); then  # see the worker's reply
       builtin syswrite -- "$__brish2_dl+$1"$'\n'
     else
       builtin print -rn -- "$__brish2_dl+$1"$'\n'
@@ -116,14 +116,13 @@ function __brish2_deftrap {
 #: read its stdin still reports its own status, also under pipefail. It
 #: replaces its stdin and stderr with /dev/null by `exec`: a redirection of a
 #: group would keep a saved copy of the worker's fd 0, the request FIFO.
-#: Without zsh/system it uses print: the worker then has no trap, and
-#: ignores SIGINT.
+#: Without syswrite it uses print, as the worker's reply does (see there).
 #: @duplicateCode/0a4f05830c0a4ae7ba6009411f60fdbe brish3_write_stdin in brish3.zsh
 function __brish2_write_stdin {
   __brish_trap= __brish_trap_arg=
   builtin exec </dev/null 2>/dev/null
   builtin trap '' PIPE
-  if [[ -n $__brish2_sw ]]; then
+  if (( ${+builtins[syswrite]} )); then
     builtin syswrite -- "$brish_stdin" || builtin true
   else
     builtin print -rn -- "$brish_stdin" || builtin true
@@ -168,8 +167,13 @@ for brish_server_index in {1..${#stdins}} ; do
             while {
                 if [[ -n $__brish2_inreq ]]; then
                     #: syswrite, which goes on after a SIGINT that the trap
-                    #: ignores; print gives up.
-                    if [[ -n $__brish2_sw ]]; then
+                    #: ignores; print gives up. A command may have unloaded
+                    #: zsh/system or disabled syswrite: then print, with
+                    #: which a SIGINT of kill() can cut the reply short (and
+                    #: kill() then ends at step 4). Chosen by whether the
+                    #: builtin exists, never by syswrite's failure, which
+                    #: can follow a partial write.
+                    if (( ${+builtins[syswrite]} )); then
                         builtin syswrite -- "$__brish2_dl$__brish2_ret"$'\n'
                         builtin syswrite -o 2 -- "$__brish2_dl"
                     else
