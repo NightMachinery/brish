@@ -77,7 +77,10 @@ function __brish2_on_exit {  # $1: exit status
 #: this function. What tells this trap from a command's own is kept (see
 #: __brish_trapref). Without syswrite (zsh/system) or the trap file, the
 #: worker ignores SIGINT instead, as workers did before TRAPINT: it writes
-#: its replies with `print`, which a SIGINT trap would cut short.
+#: its replies with `print`, which a SIGINT trap would cut short. A
+#: command's own trap string is no function either, so it cannot be told
+#: from that: the id is then NUL, which nothing matches, and `always`
+#: ignores SIGINT again after every command.
 #: @duplicateCode/9834d1f0406a4c3eb2f9b672e929d810 brish3_deftrap in brish3.zsh
 function __brish2_deftrap {
   builtin emulate -L zsh
@@ -87,6 +90,7 @@ function __brish2_deftrap {
     __brish_trapid=${(P)__brish_trapref-}
   else
     builtin trap '' INT
+    __brish_trapid=$'\0'
   fi
 }
 

@@ -244,6 +244,34 @@ def test_status_9001_is_the_commands_own():
     )
 
 
+def test_without_the_trap_file_a_commands_int_trap_ends_with_it():
+    #: A worker that cannot read trapint.zsh (or load syswrite) ignores
+    #: SIGINT instead. A command's own INT trap, a trap string or a TRAPINT
+    #: function, still ends with the command.
+    check(
+        r'''
+        import shutil
+        d = os.path.join(SCRATCH, "no-trap-file")
+        os.mkdir(d)
+        w = os.path.join(d, "brish2.zsh")
+        shutil.copy(os.path.join(ROOT, "brish", "brish2.zsh"), w)
+        b = Brish(server_count=1, defaultShell=[w, "--", "BR" + "I" * 2048 + "SH"])
+        def int_trap(cmd="true"):
+            r = b.send_cmd(cmd + "; trap")
+            assert r.retcode == 0, repr(r)
+            return [l for l in r.out.splitlines() if l.endswith(" INT") or l.startswith("TRAPINT")]
+        ignored = ["trap -- '' INT"]
+        assert int_trap() == ignored, int_trap()
+        assert int_trap("trap 'print -r caught' INT") == ["trap -- 'print -r caught' INT"]
+        assert int_trap() == ignored, int_trap()
+        assert int_trap("function TRAPINT { print -r caught }") == ["TRAPINT () {"]
+        assert int_trap() == ignored, int_trap()
+        b.cleanup()
+        ''',
+        timeout=60,
+    )
+
+
 #: Prints "LEAK n" for every open fd of a fresh process that is this
 #: worker's request FIFO, then "checked".
 FD_PROBE = (
