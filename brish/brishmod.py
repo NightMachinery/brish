@@ -2204,16 +2204,27 @@ class Brish:
                         lock, index = locks[i], i
                         break
                 if lock is None:
-                    free = [i for i in range(len(locks)) if busy[i] != me]
-                    if not free:
+                    mine = [i for i in range(len(locks)) if busy[i] == me]
+                    if len(mine) == len(locks):
                         raise BrishWorkerBusyException(
                             "every worker is streaming a BrishPopen of this thread; "
                             "read one to its end or close it first"
                         )
+                    if mine:
+                        #: Waiting here would hold the streaming worker while
+                        #: waiting for another one: two threads that do this
+                        #: on each other's workers would wait forever.
+                        raise BrishWorkerBusyException(
+                            f"worker {mine[0]} is streaming a BrishPopen of this thread, "
+                            "and every other worker is taken; this thread cannot wait for "
+                            "one, since another thread that streams and waits the same way "
+                            "would deadlock with it: make the call after the BrishPopen "
+                            "has been read to its end or closed"
+                        )
                     if lock_sleep is not None:
                         time.sleep(lock_sleep)
                         continue
-                    index = random.choice(free)
+                    index = random.randrange(len(locks))
             else:
                 index = server_index
                 try:
@@ -2302,12 +2313,12 @@ class Brish:
         made it (from another thread, these raise RuntimeError and change
         nothing); a thread that holds the lock (acquire_lock) can pass its
         `server_index`. Calls from the same thread meanwhile skip that busy
-        worker, or raise BrishWorkerBusyException when they name it or every
-        worker is busy that way. Use it as a context manager: leaving the
-        block early, by break or by an exception, kills the command, drains
-        its output and frees the worker. An unclosed object that is collected
-        in another thread is killed, and its worker is freed only at the
-        creating thread's next call to this instance.
+        worker, and never wait: they raise BrishWorkerBusyException when
+        they name it or no other worker is free at once. Use it as a context
+        manager: leaving the block early, by break or by an exception, kills
+        the command, drains its output and frees the worker. An unclosed
+        object that is collected in another thread is killed, and its worker
+        is freed only at the creating thread's next call to this instance.
 
         `kill()` (alias `terminate()`) works from any thread, is idempotent,
         and interrupts the command, not the worker. Step 1: SIGINT to the

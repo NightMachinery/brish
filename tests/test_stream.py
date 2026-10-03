@@ -752,6 +752,10 @@ def test_same_thread_calls_skip_a_streaming_worker():
     #: Inside the loop over a BrishPopen, the worker it streams from belongs
     #: to the same thread (an RLock), so a call that took it would write into
     #: a busy worker. Calls skip it, or refuse at once, and nothing restarts.
+    #: A refusal is checked only while the popen still runs: Brish may read
+    #: the end, and free the worker, a few chunks before the last one is
+    #: handed out (a loaded machine delays the loop body enough for that),
+    #: and the owner reads nothing while its loop body runs.
     run(
         r'''
         Busy = bm.BrishWorkerBusyException
@@ -764,6 +768,9 @@ def test_same_thread_calls_skip_a_streaming_worker():
                 assert time.monotonic() - t0 < 1, "not at once"
                 return True
             return False
+        def refused_while(p, call):
+            """refused(call), or p ended before the loop body ran."""
+            return p.retcode is not None or refused(call)
         b = Brish(server_count=2)
         for i in (0, 1):
             b.send_cmd(f"v=kept{i}", server_index=i)
@@ -782,12 +789,12 @@ def test_same_thread_calls_skip_a_streaming_worker():
                         if first:
                             first = False
                             #: Both workers are this thread's now.
-                            assert refused(lambda: b.send_cmd("true"))
-                            assert refused(lambda: b.popen("true"))
+                            assert refused_while(q, lambda: b.send_cmd("true"))
+                            assert refused_while(q, lambda: b.popen("true"))
                 assert q.retcode == 0
-                assert refused(lambda: b.send_cmd("true", server_index=0))
-                assert refused(lambda: b.popen("true", server_index=0))
-                assert refused(lambda: b.acquire_lock(server_index=0))
+                assert refused_while(p, lambda: b.send_cmd("true", server_index=0))
+                assert refused_while(p, lambda: b.popen("true", server_index=0))
+                assert refused_while(p, lambda: b.acquire_lock(server_index=0))
         assert (p.retcode, b"".join(got)) == (7, b"a\nb\n"), (p.retcode, got)
         #: Nothing was restarted, and both workers take commands again.
         same_server_ok(b, 0, "kept0")
@@ -797,7 +804,7 @@ def test_same_thread_calls_skip_a_streaming_worker():
         try:
             with b.popen("print -r x; sleep 0.3", server_index=i) as p:
                 for _ in p:
-                    assert refused(lambda: b.send_cmd("true", server_index=i))
+                    assert refused_while(p, lambda: b.send_cmd("true", server_index=i))
             same_server_ok(b, i, f"kept{i}")
         finally:
             lock.release()
@@ -807,10 +814,56 @@ def test_same_thread_calls_skip_a_streaming_worker():
         b.send_cmd("v=kept")
         with b.popen("print -r x; sleep 0.3; print -r y") as p:
             for _ in p:
-                assert refused(lambda: b.send_cmd("true"))
-                assert refused(lambda: b.popen("true"))
+                assert refused_while(p, lambda: b.send_cmd("true"))
+                assert refused_while(p, lambda: b.popen("true"))
         assert p.retcode == 0
         same_server_ok(b, 0)
+        b.cleanup()
+        '''
+    )
+
+
+def test_nested_calls_of_two_streaming_threads_never_wait_for_each_other():
+    #: Two threads stream on the only two workers, and each makes one call
+    #: with server_index=None inside its loop. Waiting there would hold the
+    #: streaming worker while waiting for the other thread's (before: both
+    #: waited for good, in both modes). The call is refused at once instead,
+    #: and after the loop it works.
+    run(
+        r'''
+        import faulthandler; faulthandler.dump_traceback_later(50, exit=True)
+        Busy = bm.BrishWorkerBusyException
+        b = Brish(server_count=2)
+        both = threading.Barrier(2, timeout=20)
+        out = {}
+        def job(k):
+            lock, i = b.acquire_lock(server_index=None, lock_sleep=0.05)
+            try:
+                with b.popen("print -r a; sleep 0.5; print -r b", server_index=i) as p:
+                    for n, (s, c) in enumerate(p):
+                        if n == 0:
+                            both.wait()  # both threads stream now
+                            t0 = time.monotonic()
+                            try:
+                                b.z("print -r -- {k}")
+                                out[k] = "ran"
+                            except Busy as e:
+                                out[k] = ("busy", time.monotonic() - t0, str(e))
+                after = b.z("print -r -- after-{k}")
+                out[k, "after"] = (p.retcode, after.out)
+            finally:
+                lock.release()
+        ts = [threading.Thread(target=job, args=(k,)) for k in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(30)
+            assert not t.is_alive(), ("a thread hung", out)
+        for k in range(2):
+            got = out[k]
+            assert got[0] == "busy" and got[1] < 1, out
+            assert "another thread" in got[2], got
+            assert out[k, "after"] == (0, f"after-{k}\n"), out
         b.cleanup()
         '''
     )
