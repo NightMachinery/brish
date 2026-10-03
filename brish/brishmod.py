@@ -1514,9 +1514,10 @@ class BrishPopen:
                 already = self._finished
                 self._finished = True
                 if not already:
-                    _signal_pids(pids, signal.SIGINT)
+                    #: The worker first: see _interrupt.
                     if pid:
                         _signal_pids([pid], signal.SIGINT)
+                    _signal_pids(pids, signal.SIGINT)
         finally:
             restart = False
             if p.binary:
@@ -1693,11 +1694,11 @@ class BrishPopen:
                 self._stage = stage
                 self._stage_t = time.monotonic()
                 if stage == 2:
-                    _signal_pids(pids, signal.SIGTERM)
                     #: Again, in case the first one landed before the
-                    #: command started.
+                    #: command started; the worker first (see _interrupt).
                     if pid:
                         _signal_pids([pid], signal.SIGINT)
+                    _signal_pids(pids, signal.SIGTERM)
                 elif stage == 3 and pids:
                     _signal_pids(pids, signal.SIGKILL)
                 else:
@@ -1743,9 +1744,16 @@ class BrishPopen:
         with self._mu:
             if self._finished:
                 return
-            _signal_pids(pids, signal.SIGINT)
+            #: The worker before its descendants. zsh runs the worker's trap
+            #: once the foreground child it waits for has exited, so the trap
+            #: then sees the child die of the signal. The other way round,
+            #: if this thread is held up between the two (the GIL, the OS),
+            #: the worker may reap the child and go on before its own SIGINT
+            #: arrives: the command then runs on, or under set -e the
+            #: child's 130 exits the worker.
             if pid:
                 _signal_pids([pid], signal.SIGINT)
+            _signal_pids(pids, signal.SIGINT)
             self._signalled()
 
     def __iter__(self):
@@ -2576,11 +2584,11 @@ class Brish:
         interrupts Python alone; the command runs on, unless the exception
         leaves a `with` block that holds the object. kill() works from any
         thread, is idempotent, and interrupts the command, not the worker.
-        Step 1: SIGINT to the worker and its descendants (the worker aborts
+        Step 1: SIGINT to the worker, then its descendants (the worker aborts
         the command as Ctrl-C does in an interactive shell, and its retcode
-        is 130 unless the command traps INT). Step 2: SIGTERM to the descendants and SIGINT to the
-        worker. Step 3: SIGKILL to the descendants, or step 4 at once if
-        there are none. Step 4: SIGKILL to the worker, which gives the
+        is 130 unless the command traps INT). Step 2: SIGINT to the worker
+        again, then SIGTERM to the descendants. Step 3: SIGKILL to the
+        descendants, or step 4 at once if there are none. Step 4: SIGKILL to the worker, which gives the
         retcode 9001 with WORKER_DIED_NOTE as the last chunk, and restarts
         the instance before its next use. The steps stop once the command
         has ended; each comes `kill_grace` seconds (default 2) after the

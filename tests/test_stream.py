@@ -249,6 +249,39 @@ def test_kill_an_in_shell_loop_and_a_fork():
     )
 
 
+def test_kill_signals_the_worker_before_its_descendants():
+    #: zsh runs the worker's trap only once the foreground child it waits
+    #: for has exited, so a SIGINT to the worker first and to the child
+    #: second makes the trap see the child die of it. The other way round, a
+    #: kill thread held up between the two batches (here 50 ms after each,
+    #: as the GIL or the OS can do) let the worker reap the child and go on
+    #: before its own SIGINT arrived: the command ran on, or under set -e
+    #: the child's 130 exited the worker (9001, and a restart).
+    run(
+        r'''
+        real = bm._signal_pids
+        def held_up(pids, sig):
+            real(pids, sig)
+            if pids:
+                time.sleep(0.05)
+        bm._signal_pids = held_up
+        b = Brish(server_count=1)
+        child = "zsh -fc 'zmodload zsh/zselect; zselect -t 10000'"
+        for cmd in ("set -e; print -r x; " + child + "; print -r after",
+                    "print -r x; " + child + "; print -r after"):
+            for i in range(3):
+                b.send_cmd("v=kept")
+                with b.popen(cmd) as p:
+                    kill_later(p, 0.3)
+                    evs = collect(p)
+                assert (p.retcode, p._stage, joined(evs)) == (130, 1, b"x\n"), (cmd, i, p.retcode, p._stage, evs)
+                same_server_ok(b, 0)
+        b.cleanup()
+        ''',
+        timeout=120,
+    )
+
+
 def test_kill_under_errexit_and_sh_emulation():
     #: zsh exits instead of unwinding when an interrupt meets err_exit (or
     #: err_return at the legacy worker's top level), or a special builtin
