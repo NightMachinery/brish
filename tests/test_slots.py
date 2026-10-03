@@ -953,3 +953,34 @@ def test_the_index_offset_check_ignores_the_startup_files_options():
             b.cleanup()
         """
     )
+
+
+def test_a_restart_shares_only_a_restart_that_began_after_it():
+    #: A restart that was already starting its workers when restart() was
+    #: called may have read the startup files before a change the caller
+    #: made: the call must start its own set, not return that one's.
+    run(
+        r"""
+        cfg = os.path.join(SCRATCH, "cfg")
+        zd = os.path.join(SCRATCH, "zd-slow")
+        os.makedirs(zd)
+        with open(os.path.join(zd, ".zshenv"), "w") as f:
+            f.write('probe_cfg=$(<$PROBE_CFG); [[ -n $PROBE_SLOW ]] && sleep 1.5\n')
+        open(cfg, "w").write("old")
+        os.environ.update(ZDOTDIR=zd, PROBE_CFG=cfg)
+        b = Brish(server_count=2)
+        try:
+            os.environ["PROBE_SLOW"] = "1"
+            got = {}
+            t = threading.Thread(target=lambda: got.setdefault("x", b.restart()))
+            t.start()
+            time.sleep(0.6)  # that restart's bootstrap has read "old" and sleeps
+            open(cfg, "w").write("new")
+            assert b.restart() in (True, False)
+            t.join(30)
+            outs = [b.send_cmd("print -r -- $probe_cfg", server_index=i).out for i in range(2)]
+            assert outs == ["new\n", "new\n"], outs
+        finally:
+            b.cleanup()
+        """
+    )

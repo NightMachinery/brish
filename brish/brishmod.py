@@ -2235,9 +2235,12 @@ class Brish:
         #: worker lock waits (on _settled) before it takes one.
         self._closing = 0
         self._settled = threading.Condition(self.lock)
-        #: Finished restarts, and the outcome of the last one: a restart
-        #: that had to wait for another returns that one's outcome.
-        self._restart_commits = 0
+        #: Restarts started so far, and the number and outcome of the last
+        #: one that finished: a call that had to wait for a restart which
+        #: started after the call began returns that one's outcome (its
+        #: workers loaded the startup files after the call began).
+        self._restart_starts = 0
+        self._restart_done = 0
         self._restart_result = (True, [])
         #: Threads that boot an eager replacement (see _warm).
         self._warmers = set()
@@ -2910,16 +2913,21 @@ class Brish:
     def _restart(self):
         """restart(): (done, the slots that wait for a release)."""
         self._reap_orphans()
-        seen = self._restart_commits
+        seen = self._restart_starts
         with self._boot_mu:
             if self._slots is None:
                 self.delayed_init = False
                 self._init_locked()
                 return True, []
-            if self._restart_commits != seen:
-                #: Another restart finished while this one waited for it: it
-                #: started its workers after this call began waiting.
+            if self._restart_done > seen:
+                #: A restart that started after this call began (while it
+                #: waited for _boot_mu) has finished: share its outcome. One
+                #: that was already under way when the call began may have
+                #: loaded the startup files before a change the caller made
+                #: just before calling, so it is not shared.
                 return self._restart_result
+            self._restart_starts += 1
+            number = self._restart_starts
             n = len(self._slots)
             p = self._spawn(range(n), n, None, False)
             try:
@@ -2944,7 +2952,7 @@ class Brish:
                 self._retire(retire)
             result = (not busy, busy)
             with self.lock:
-                self._restart_commits += 1
+                self._restart_done = number
                 self._restart_result = result
             return result
 
