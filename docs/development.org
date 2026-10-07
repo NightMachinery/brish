@@ -50,3 +50,10 @@ poetry run pip-audit -r "${TMPDIR:-/tmp}/brish-lock-pins.txt" --no-deps --disabl
 #+end_example
 
 Running =pip-audit= with no arguments audits the whole virtualenv instead. That also reports the =pip= that seeded the virtualenv, which is not in the lock; upgrade it with =python -m pip install -U pip=.
+
+* Interpolation namespace compatibility
+=get_locals= merges the caller's globals and locals when no explicit namespace is supplied. Explicit dicts keep their identity and the existing =eval= behavior, including assignment expressions and insertion of =__builtins__=. Other mappings are shallow-copied into dicts: Python 3.13 changed optimized frames' =f_locals= to a =FrameLocalsProxy=, which cannot be passed as =eval='s globals. Using a separate locals mapping with empty globals would leave names inaccessible inside nested expressions, so normalization uses one dict namespace.
+
+=zstring=, the deprecated =zstring_old= and =z_background= share this normalization. =z= and =zpopen= go through =zstring=. =tests/test_namespaces.py= covers explicit frame locals, read-only mappings, nested expression scope, dynamic format specs, empty namespaces, dict compatibility and the shell/background entry points in both transport modes. Wrappers that hand work to another thread may still snapshot a dict themselves to choose when its bindings are captured.
+
+The legacy and binary compatibility tests that execute archived Python interpolation code are skipped on Python 3.14 and later, because those historical snapshots use the removed =ast.Constant.s= attribute. Run those comparisons on an older supported interpreter; current-code interpolation and the worker protocol tests still run on Python 3.14.

@@ -493,6 +493,8 @@ my_own_brish.z("echo $PWD")
 /Users/evar/tmp
 #+end_example
 
+Interpolation uses the caller's globals and locals by default. Pass =locals_= to supply an explicit namespace to =zstring=, =z=, =zpopen= or =z_background=. It accepts a dict or another mapping, including =sys._getframe().f_locals= on Python 3.13 and later. Non-dict mappings are copied to a dict before evaluation, so nested expressions can resolve their names and evaluation does not write into the original mapping. The copy is shallow. An explicit dict is used as supplied, preserving evaluation side effects; an empty namespace never falls back to the caller's variables.
+
 ~Brish.z~ itself is sugar around ~Brish.zstring~ and ~Brish.send_cmd~:
 #+begin_src python :session p1 :results value :exports both
 cmd_str = my_own_brish.zstring("echo zstring constructs the command string that will be sent to zsh. It interpolates the Pythonic variables: {python_var} {alist}")

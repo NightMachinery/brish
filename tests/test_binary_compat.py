@@ -9,6 +9,7 @@ do not use the library under test, so they run in binary mode only.
 
 import stat
 import subprocess
+import sys
 
 import pytest
 
@@ -85,6 +86,10 @@ def loaders(sources):
     return LOADERS.replace("@SRC@", repr(str(sources)))
 
 
+@pytest.mark.skipif(
+    sys.version_info >= (3, 14),
+    reason="the historical templates read ast.Constant.s, which Python 3.14 removed",
+)
 @pytest.mark.parametrize("real_env", [pytest.param(False, id="empty-zdotdir"), pytest.param(True, id="real-env")])
 def test_master_python_on_this_worker(sources, real_env):
     check(

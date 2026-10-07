@@ -100,6 +100,10 @@ def get_locals(
             # Julia runs Python in an embedded mode with no stack frame.
             pass
 
+    # eval's globals must be a dict. Python 3.13+ frame locals and other
+    # mappings need a snapshot; preserve existing explicit dict semantics.
+    if locals_ is not None and not isinstance(locals_, dict):
+        locals_ = dict(locals_)
     return locals_
 
 
@@ -3962,12 +3966,7 @@ class Brish:
     def zstring_old(self, template, locals_=None):
         #: DEPRECATED
         ##
-        if locals_ is None:
-            previous_frame = sys._getframe(1)
-            previous_frame_locals = previous_frame.f_locals
-            locals_ = dict(previous_frame.f_globals, **previous_frame_locals)
-            # https://stackoverflow.com/questions/1041639/get-a-dict-of-all-variables-currently-in-scope-and-their-values
-            # We will still miss the closure variables.
+        locals_ = get_locals(locals_=locals_)
         result = []
         parts = Formatter().parse(template)
         for part in parts:

@@ -15,6 +15,7 @@ BRISH_SOAK_SECS sets the soak's length (default 60 seconds).
 import os
 import stat
 import subprocess
+import sys
 
 import pytest
 
@@ -804,6 +805,10 @@ def loaders(d):
     return LOADERS.replace("@SRC@", repr(str(d)))
 
 
+@pytest.mark.skipif(
+    sys.version_info >= (3, 14),
+    reason="the 0.4.0 templates read ast.Constant.s, which Python 3.14 removed",
+)
 def test_0_4_0_python_runs_these_worker_scripts_as_its_own(v040):
     #: 0.4.0's Python spawns the worker scripts next to its file. With this
     #: tree's scripts (which read the index offset only when it is set, and
