@@ -49,7 +49,7 @@ zb = z_background
 def zn(*a, getframe=3, **kw):
     "Runs only if night.sh is installed"
 
-    if isNight:
+    if isNight():
         return z(*a, **kw, getframe=getframe)
 
     else:

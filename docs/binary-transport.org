@@ -161,6 +161,6 @@ For a process that opted in through the environment, rollback is unsetting =BRIS
 - Linux verification: the design was probed on macOS. Tests that would need non-UTF-8 file names are not included, because APFS rejects such names.
 
 * Follow-ups
-- =brish.zn= tests the function object =isNight= instead of calling it, so it is always true; =z_background= never cleans up its per-call instance.
+- =z_background= never cleans up its per-call instance. (=brish.zn= tested the function object =isNight= instead of calling it, so it ran its command even without night.sh; fixed in 2026-10.)
 - Per-worker respawn instead of recycling every worker of an instance.
 - Report the =(q+)= mis-escaping to zsh upstream.
